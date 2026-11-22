@@ -32,6 +32,7 @@ mod prompt;
 mod rollout_trace;
 mod schedules;
 mod status_budget;
+mod turn_timing;
 mod workspace_state;
 mod workspaces;
 pub mod worktree;
@@ -46,6 +47,31 @@ const REPEAT_READ_LIMIT: usize = 4;
 const REPEAT_WRITE_LIMIT: usize = 5;
 const MAX_CONSECUTIVE_ERRORS: usize = 24;
 const ERROR_NUDGE_INTERVAL: usize = 6;
+/// After a `finish_reason`, keep the stream open briefly so the final
+/// usage-only chunk (OpenAI `stream_options.include_usage`) is recorded.
+/// `[DONE]` usually arrives immediately and ends the wait.
+const STREAM_DRAIN_GRACE: Duration = Duration::from_millis(500);
+const MAX_EMPTY_TOOL_CALL_RETRIES: usize = 3;
+/// Live `AppState` bounds. Totals stay complete and the rollout keeps every
+/// record; only the per-`state`-event clone is trimmed.
+const MAX_LIVE_THOUGHTS: usize = 64;
+const MAX_LIVE_USAGE_CALLS: usize = 500;
+
+fn trim_live_thoughts(thoughts: &mut BTreeMap<String, String>) {
+    while thoughts.len() > MAX_LIVE_THOUGHTS {
+        if let Some(first) = thoughts.keys().next().cloned() {
+            thoughts.remove(&first);
+        } else {
+            break;
+        }
+    }
+}
+
+fn trim_live_usage_calls(calls: &mut Vec<Value>) {
+    while calls.len() > MAX_LIVE_USAGE_CALLS {
+        calls.remove(0);
+    }
+}
 
 static AGENT_CANCELS: OnceLock<Mutex<HashMap<String, CancellationToken>>> = OnceLock::new();
 
@@ -127,6 +153,22 @@ pub fn cancel_child_run(chat_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Cancels every delegated child run. Called during server shutdown so child
+/// agents do not keep writing rollouts after the parent has stopped.
+pub fn cancel_all_child_runs() -> usize {
+    let Ok(runs) = child_runs().lock() else {
+        return 0;
+    };
+    for handle in runs.values() {
+        handle.cancel.cancel();
+    }
+    runs.len()
+}
+
+pub fn child_run_count() -> usize {
+    child_runs().lock().map(|runs| runs.len()).unwrap_or(0)
+}
+
 struct ChildRunGuard(String);
 
 impl Drop for ChildRunGuard {
@@ -157,6 +199,17 @@ pub fn cancel_agent_run(agent_id: &str) -> bool {
             true
         })
         .unwrap_or(false)
+}
+
+/// Cancels every durable agent run registered by the scheduler.
+pub fn cancel_all_agent_runs() -> usize {
+    let Ok(cancels) = agent_cancels().lock() else {
+        return 0;
+    };
+    for token in cancels.values() {
+        token.cancel();
+    }
+    cancels.len()
 }
 
 #[derive(Debug, Error)]
@@ -393,8 +446,13 @@ fn is_internal_followup(prompt: &str) -> bool {
         || trimmed.starts_with("[GROUP RESULT]")
 }
 
-async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError> {
-    crate::status_budget::begin_turn(&ctx.chat_id);
+async fn run_agent_inner(
+    ctx: RunContext,
+    prompt: String,
+    timing: &mut turn_timing::TurnTiming,
+) -> Result<(), RunError> {
+    // Guard removal covers every early return and abort below.
+    let _turn_guard = crate::status_budget::begin_turn(&ctx.chat_id);
     let history = ctx
         .store
         .history(&ctx.chat_id, HISTORY_LIMIT)
@@ -418,7 +476,7 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
 
     // Canonical trace: one rollout file per chat. Open (or resume) first so
     // every subsequent event is recorded, even when the provider fails.
-    let mut rollout = stark_store::rollout::RolloutWriter::open(
+    let mut rollout = match stark_store::rollout::RolloutWriter::open(
         ctx.store.harness_root(),
         &ctx.chat_id,
         &ctx.workspace_id,
@@ -426,7 +484,19 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
         &ctx.model,
     )
     .await
-    .ok();
+    {
+        Ok(writer) => Some(writer),
+        // Another writer means the canonical trace would fork or lose
+        // ordinals. Fail the run instead of silently continuing untraced.
+        Err(error @ StoreError::Locked(_)) => return Err(error.into()),
+        Err(error) => {
+            tracing::warn!(
+                "rollout writer unavailable for chat {}: {error}",
+                ctx.chat_id
+            );
+            None
+        }
+    };
     if let Some(writer) = rollout.as_mut() {
         let relative = writer.relative_path(ctx.store.harness_root());
         let _ = ctx
@@ -643,7 +713,15 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
         messages.push(ChatMessage::user_with_images(&prompt, ctx.images.clone()));
     }
     let affinity = ctx.affinity().await;
-    maybe_compact(&ctx, &mut messages, &affinity, None, rollout.as_mut()).await;
+    maybe_compact(
+        &ctx,
+        &mut messages,
+        &affinity,
+        None,
+        rollout.as_mut(),
+        timing,
+    )
+    .await;
 
     let mut state = AppState {
         active_node: "agent".to_string(),
@@ -672,7 +750,8 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
     .with_mode(mode.clone())
     .with_depth(ctx.depth)
     .with_allowed_tools(ctx.config.as_ref().and_then(|config| config.tools.clone()))
-    .with_mcp_servers(ctx.config.as_ref().and_then(|config| config.mcp.clone()));
+    .with_mcp_servers(ctx.config.as_ref().and_then(|config| config.mcp.clone()))
+    .with_cancel(ctx.cancel.clone());
     if let Some(checkpoint) = &ctx.checkpoint {
         tools = tools.with_checkpoint(checkpoint.clone());
     }
@@ -694,13 +773,21 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
         compaction::CompactionPolicy::from_env(&ctx.scope, &ctx.model).hard_limit_tokens as u64;
     state.context_window = context_window;
     let mut consecutive_errors = 0usize;
+    // Failure-shaped repeat guard: identical failing calls are pure waste, so
+    // they escalate sooner than the generic repeat limit. Reset by any success.
+    let mut last_failure: Option<(String, String)> = None;
+    let mut failure_repeat = 0usize;
     // Provider output-cap recovery: a text response cut by `finish_reason:
     // length` is incomplete, not an answer. Ask the model to continue instead
     // of silently ending the run (this truncated real work before).
     let mut length_continuations = 0usize;
+    // A provider that announces `finish_reason: tool_calls` but delivers no
+    // parseable call produced a broken turn, not an answer. Bounded nudge.
+    let mut empty_tool_call_retries = 0usize;
     let mut carried_text = String::new();
     let mut stream_retries = 0u64;
     let stream_budget = stark_providers::stream_max_retries();
+    let mut previous_tool_count: Option<usize> = None;
 
     'turn_loop: loop {
         if ctx.cancel.is_cancelled() {
@@ -747,6 +834,10 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                 .and_then(|config| config.tools.as_deref()),
             ctx.config.as_ref().and_then(|config| config.mcp.as_deref()),
         );
+        if previous_tool_count.is_some_and(|previous| previous != tool_specs.len()) {
+            timing.record_tools_change();
+        }
+        previous_tool_count = Some(tool_specs.len());
 
         if last_continuous_screen.is_none_or(|last| last.elapsed() >= Duration::from_secs(15))
             && let Some(image) = stark_tools::latest_continuous_image()
@@ -764,6 +855,7 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
         let mut stream: EventStream = {
             let max_attempts = stark_providers::stream_max_retries();
             let mut attempt = 0u64;
+            timing.begin_phase(turn_timing::Phase::Sampling);
             loop {
                 match ctx
                     .provider
@@ -781,9 +873,17 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                 {
                     Ok(stream) => break stream,
                     Err(error) => {
+                        timing.record_sampling_retry();
                         if !overflow_recovered && is_context_overflow(&error) {
                             overflow_recovered = true;
-                            if force_compact(&ctx, &mut messages, &affinity, rollout.as_mut()).await
+                            if force_compact(
+                                &ctx,
+                                &mut messages,
+                                &affinity,
+                                rollout.as_mut(),
+                                timing,
+                            )
+                            .await
                             {
                                 // Compaction rewrote history; restart the
                                 // turn with the checkpoint instead of
@@ -830,17 +930,26 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                         } else {
                             fail(&ctx, &mut state, error.to_string()).await;
                         }
+                        timing.end_phase(turn_timing::Phase::Sampling);
                         return Err(RunError::Provider(error));
                     }
                 }
             }
         };
 
+        // Sampling covers the whole response stream. The phase ends on every
+        // exit below (completion, drain, retry, or terminal error), matching
+        // Codex where the sampling guard drops at each return site.
+
         let mut text = String::new();
         let mut reasoning = String::new();
         let mut calls: BTreeMap<usize, PartialCall> = BTreeMap::new();
         let mut finish_reason: Option<String> = None;
         let mut retry_after_compaction = false;
+        // True once the provider reported finish_reason/[DONE]. The stream is
+        // still drained briefly for the trailing usage chunk, then endings
+        // after this point are accepted instead of retried.
+        let mut completion_seen = false;
         // Watchdog: a provider that stops emitting (dead socket, stalled
         // gateway) must not hang a run forever and burn wall-clock. Reset on
         // every event; 0 disables it.
@@ -852,10 +961,12 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
         loop {
             let event = tokio::select! {
                 _ = ctx.cancel.cancelled() => {
+                    timing.end_phase(turn_timing::Phase::Sampling);
                     finish_aborted(&ctx, &mut state, rollout.as_mut(), &text, &reasoning, Some(&turn_id)).await;
                     return Ok(());
                 }
                 _ = tokio::time::sleep(Duration::from_secs(idle_timeout)), if idle_timeout > 0 => {
+                    timing.end_phase(turn_timing::Phase::Sampling);
                     ctx.emit_state(&mut state);
                     let message = format!(
                         "run stalled: no provider output for {idle_timeout}s (set STARK_RUN_IDLE_TIMEOUT_SEC to change)"
@@ -867,6 +978,9 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                     }
                     return Err(RunError::Message(message));
                 }
+                _ = tokio::time::sleep(STREAM_DRAIN_GRACE), if completion_seen => {
+                    break;
+                }
                 event = stream.next() => event,
             };
             let Some(event) = event else {
@@ -874,10 +988,12 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
             };
             match event {
                 Ok(ProviderEvent::Text(chunk)) => {
+                    timing.record_first_token();
                     text.push_str(&chunk);
                     ctx.emit_delta(Delta::text(chunk).with_agent(agent_label.clone()));
                 }
                 Ok(ProviderEvent::Reasoning(chunk)) => {
+                    timing.record_first_token();
                     reasoning.push_str(&chunk);
                     ctx.emit_delta(Delta::reasoning(chunk).with_agent(agent_label.clone()));
                 }
@@ -915,6 +1031,10 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                         "where": agent_label,
                     });
                     state.token_usage.calls.push(call.clone());
+                    // Live state is cloned into every `state` event; keep the
+                    // newest calls for the UI and let totals carry the history.
+                    // The rollout keeps the full per-call record.
+                    trim_live_usage_calls(&mut state.token_usage.calls);
                     ctx.emit_delta(Delta::usage(call.to_string()).with_agent(agent_label.clone()));
                     if let Some(writer) = rollout.as_mut() {
                         rollout_trace::record_usage(
@@ -937,6 +1057,7 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                     name,
                     arguments,
                 }) => {
+                    timing.record_first_token();
                     let call = calls.entry(index).or_default();
                     if let Some(id) = id {
                         call.id = Some(id);
@@ -951,15 +1072,33 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                 Ok(ProviderEvent::Done {
                     finish_reason: reason,
                 }) => {
-                    finish_reason = reason;
-                    break;
+                    if let Some(reason) = reason {
+                        finish_reason = Some(reason);
+                        completion_seen = true;
+                    } else {
+                        // `[DONE]` or an explicit end marker.
+                        break;
+                    }
                 }
                 Err(error) => {
+                    // A drain error after the provider already completed is
+                    // not a failed response; keep the completed output.
+                    if completion_seen {
+                        timing.end_phase(turn_timing::Phase::Sampling);
+                        break;
+                    }
+                    // Codex records a bounded guidance fragment before the
+                    // retry decision so the next sample knows what happened
+                    // (`core/src/context/content_filter_guidance.rs`).
+                    if error.is_content_filter() {
+                        messages.push(ChatMessage::user(content_filter_guidance()));
+                    }
                     // A context-window rejection is recoverable: compact hard
                     // and retry once instead of killing the run.
                     if !overflow_recovered && is_context_overflow(&error) {
                         overflow_recovered = true;
                         retry_after_compaction = true;
+                        timing.end_phase(turn_timing::Phase::Sampling);
                         break;
                     }
                     // Transient mid-stream failures retry the turn with a
@@ -967,6 +1106,7 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                     // discarded (never recorded) and rebuilt on retry.
                     if error.is_retryable() && stream_retries < stream_budget {
                         stream_retries += 1;
+                        timing.record_sampling_retry();
                         let delay = error
                             .retry_delay(stream_retries)
                             .unwrap_or_else(|| stark_providers::backoff_delay(stream_retries));
@@ -983,7 +1123,8 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                         }
                         ctx.emit_delta(
                             Delta::text(format!(
-                                "_Reconnecting ({stream_retries}/{stream_budget})…_"
+                                "_Reconnecting ({stream_retries}/{stream_budget}) in {}s…_",
+                                delay.as_secs().max(1)
                             ))
                             .with_agent(agent_label.clone()),
                         );
@@ -991,6 +1132,7 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                         // Discard this attempt and restart the turn. The
                         // per-turn locals are dropped; the next iteration
                         // rebuilds them from the same messages.
+                        timing.end_phase(turn_timing::Phase::Sampling);
                         continue 'turn_loop;
                     }
                     if let Some(writer) = rollout.as_mut() {
@@ -1008,9 +1150,20 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                     } else {
                         fail(&ctx, &mut state, error.to_string()).await;
                     }
+                    timing.end_phase(turn_timing::Phase::Sampling);
                     return Err(RunError::Provider(error));
                 }
             }
+            // Normal stream end: close sampling here; every other exit above
+            // already closed it (`end_phase` is idempotent).
+            timing.end_phase(turn_timing::Phase::Sampling);
+        }
+
+        // A completed response earns a fresh stream-retry budget. Codex keeps
+        // this state per sampling request, not for the whole run.
+        stream_retries = 0;
+        if !text.trim().is_empty() || !reasoning.trim().is_empty() {
+            timing.record_first_message();
         }
 
         if ctx.cancel.is_cancelled() {
@@ -1027,7 +1180,7 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
         }
 
         if retry_after_compaction {
-            if force_compact(&ctx, &mut messages, &affinity, rollout.as_mut()).await {
+            if force_compact(&ctx, &mut messages, &affinity, rollout.as_mut(), timing).await {
                 continue;
             }
             let message = "Provider rejected the context size and compaction could not reduce it."
@@ -1050,7 +1203,53 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
             return Err(RunError::Message(message));
         }
 
+        // A completed step means the next context overflow is a new event, not
+        // a repeat of the one already compacted for.
+        overflow_recovered = false;
+
         if calls.is_empty() {
+            // `finish_reason: tool_calls` with no delivered call is a broken
+            // turn, not an answer. This path used to persist the partial text
+            // and end the run successfully.
+            if finish_reason.as_deref() == Some("tool_calls") {
+                empty_tool_call_retries += 1;
+                if empty_tool_call_retries > MAX_EMPTY_TOOL_CALL_RETRIES {
+                    let message = format!(
+                        "Run stopped: the provider announced tool calls but delivered none {MAX_EMPTY_TOOL_CALL_RETRIES} times in a row."
+                    );
+                    if let Some(writer) = rollout.as_mut() {
+                        fail_with_trace(
+                            &ctx,
+                            &mut state,
+                            writer,
+                            &turn_id,
+                            message.clone(),
+                            &text,
+                            &reasoning,
+                            None,
+                        )
+                        .await;
+                    } else {
+                        fail(&ctx, &mut state, message.clone()).await;
+                    }
+                    return Err(RunError::Message(message));
+                }
+                let combined = format!("{carried_text}{text}");
+                carried_text.clear();
+                if !combined.trim().is_empty() {
+                    messages.push(ChatMessage::assistant(&combined));
+                }
+                messages.push(ChatMessage::user(
+                    "Your previous response ended with finish_reason=tool_calls but delivered no tool call, so nothing ran. Retry the tool call with valid JSON arguments, or answer in plain text if no tool is needed.",
+                ));
+                ctx.emit_delta(
+                    Delta::text(format!(
+                        "_The provider returned an empty tool-call turn; retrying ({empty_tool_call_retries}/{MAX_EMPTY_TOOL_CALL_RETRIES})…_"
+                    ))
+                    .with_agent(agent_label.clone()),
+                );
+                continue 'turn_loop;
+            }
             if !text.trim().is_empty()
                 && matches!(
                     finish_reason.as_deref(),
@@ -1233,6 +1432,13 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                 )
             })
             .collect();
+        // Parse arguments once, before any batch planning or dispatch. A
+        // malformed payload becomes a typed Args result below instead of
+        // silently becoming `{}` and running a tool with defaults.
+        let parsed_arguments: Vec<Result<Value, String>> = tool_calls
+            .iter()
+            .map(|call| parse_tool_arguments(&call.function.arguments))
+            .collect();
 
         // A continuation text burst followed by a tool call belongs to the
         // same assistant turn in history.
@@ -1243,6 +1449,52 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
         };
         carried_text.clear();
         length_continuations = 0;
+
+        // `finish_reason: tool_calls` with no named call means the provider
+        // broke the turn. Never persist it as a final answer (the old path
+        // silently ended the run with partial output).
+        if finish_reason.as_deref() == Some("tool_calls")
+            && tool_calls
+                .iter()
+                .all(|call| call.function.name.trim().is_empty())
+        {
+            empty_tool_call_retries += 1;
+            if empty_tool_call_retries > MAX_EMPTY_TOOL_CALL_RETRIES {
+                let message = format!(
+                    "Run stopped: the provider announced tool calls but delivered none {MAX_EMPTY_TOOL_CALL_RETRIES} times in a row."
+                );
+                if let Some(writer) = rollout.as_mut() {
+                    fail_with_trace(
+                        &ctx,
+                        &mut state,
+                        writer,
+                        &turn_id,
+                        message.clone(),
+                        &assistant_text,
+                        &reasoning,
+                        None,
+                    )
+                    .await;
+                } else {
+                    fail(&ctx, &mut state, message.clone()).await;
+                }
+                return Err(RunError::Message(message));
+            }
+            if !assistant_text.trim().is_empty() {
+                messages.push(ChatMessage::assistant(&assistant_text));
+            }
+            messages.push(ChatMessage::user(
+                "Your previous response ended with finish_reason=tool_calls but delivered no tool call, so nothing ran. Retry the tool call with valid JSON arguments, or answer in plain text if no tool is needed.",
+            ));
+            ctx.emit_delta(
+                Delta::text(format!(
+                    "_The provider returned an empty tool-call turn; retrying ({empty_tool_call_retries}/{MAX_EMPTY_TOOL_CALL_RETRIES})…_"
+                ))
+                .with_agent(agent_label.clone()),
+            );
+            continue 'turn_loop;
+        }
+        empty_tool_call_retries = 0;
         if !reasoning.trim().is_empty()
             && let Some(writer) = rollout.as_mut()
         {
@@ -1296,9 +1548,10 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
         if !assistant_text.is_empty() {
             assistant_blocks.push(json!({"type": "text", "text": assistant_text}));
         }
-        for call in &tool_calls {
-            let arguments = serde_json::from_str::<Value>(&call.function.arguments)
-                .unwrap_or_else(|_| json!({}));
+        for (call, arguments) in tool_calls.iter().zip(&parsed_arguments) {
+            let arguments = arguments
+                .clone()
+                .unwrap_or_else(|_| json!({"_raw": call.function.arguments}));
             assistant_blocks.push(json!({
                 "type": "toolCall",
                 "id": call.id,
@@ -1365,25 +1618,35 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
         // order, so parallel edits cannot race. Shell, subagents, groups and
         // long-running work stay sequential.
         let parallel_batch = tool_calls.len() > 1
-            && tool_calls.iter().all(|call| {
-                let args: Value =
-                    serde_json::from_str(&call.function.arguments).unwrap_or_else(|_| json!({}));
-                call_supports_parallel(&call.function.name, &args)
-            });
+            && parsed_arguments.iter().all(|args| args.is_ok())
+            && tool_calls
+                .iter()
+                .zip(&parsed_arguments)
+                .all(|(call, args)| {
+                    let args = args
+                        .as_ref()
+                        .expect("parallel batch requires valid arguments");
+                    call_supports_parallel(&call.function.name, args)
+                });
+        // Tool-blocking covers dispatch below. Precomputed parallel results
+        // already ran, so their elapsed time is measured from here.
+        let batch_started = Instant::now();
+        timing.begin_phase(turn_timing::Phase::ToolBlocking);
         let mut precomputed: Vec<Option<ToolOutcome>> =
             (0..tool_calls.len()).map(|_| None).collect();
         if parallel_batch {
             let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
             for (index, call) in tool_calls.iter().enumerate() {
-                let args: Value =
-                    serde_json::from_str(&call.function.arguments).unwrap_or_else(|_| json!({}));
-                let args_text = serde_json::to_string(&args).unwrap_or_default();
+                let args = parsed_arguments[index]
+                    .as_ref()
+                    .expect("parallel batch requires valid arguments");
+                let args_text = serde_json::to_string(args).unwrap_or_default();
                 ctx.emit_delta(
                     Delta::tool_started(&call.function.name, &args_text)
                         .with_agent(agent_label.clone()),
                 );
                 groups
-                    .entry(resource_key(&call.function.name, &args, index))
+                    .entry(resource_key(&call.function.name, args, index))
                     .or_default()
                     .push(index);
             }
@@ -1393,8 +1656,10 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                 for index in indices {
                     let call = &tool_calls[index];
                     let name = call.function.name.clone();
-                    let args: Value = serde_json::from_str(&call.function.arguments)
-                        .unwrap_or_else(|_| json!({}));
+                    let args = parsed_arguments[index]
+                        .as_ref()
+                        .expect("parallel batch requires valid arguments")
+                        .clone();
                     work.push((index, name, args));
                 }
                 let tools_ctx = tools.clone();
@@ -1415,13 +1680,18 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
 
         for (call_index, call) in tool_calls.into_iter().enumerate() {
             if ctx.cancel.is_cancelled() {
+                timing.end_phase(turn_timing::Phase::ToolBlocking);
                 finish_aborted(&ctx, &mut state, rollout.as_mut(), "", "", Some(&turn_id)).await;
                 return Ok(());
             }
 
-            let args: Value =
-                serde_json::from_str(&call.function.arguments).unwrap_or_else(|_| json!({}));
-            let args_text = serde_json::to_string(&args).unwrap_or_default();
+            let args_result = parsed_arguments[call_index].clone();
+            let args = args_result.as_ref().cloned().unwrap_or_else(|_| json!({}));
+            let args_text = if args_result.is_ok() {
+                serde_json::to_string(&args).unwrap_or_default()
+            } else {
+                call.function.arguments.clone()
+            };
             let ready = precomputed[call_index].is_some();
             if !ready {
                 ctx.emit_delta(
@@ -1488,7 +1758,14 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
             }
 
             let started = Instant::now();
-            let outcome = if let Some(outcome) = precomputed[call_index].take() {
+            let outcome = if let Err(error) = args_result {
+                ToolOutcome::err_class(
+                    stark_tools::ToolErrorClass::Args,
+                    format!(
+                        "Error: {error}. The tool was not executed; re-send valid JSON arguments."
+                    ),
+                )
+            } else if let Some(outcome) = precomputed[call_index].take() {
                 outcome
             } else if call.function.name == "call_subagent" {
                 if let Some(reason) =
@@ -1578,7 +1855,27 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
             } else {
                 stark_tools::dispatch(&call.function.name, &args, &tools).await
             };
-            let elapsed = started.elapsed().as_millis() as u64;
+            // Cancel-safe tools return as soon as the token fires. End the
+            // turn through the abort path instead of persisting a partial
+            // result as a tool failure.
+            if ctx.cancel.is_cancelled() {
+                timing.end_phase(turn_timing::Phase::ToolBlocking);
+                finish_aborted(
+                    &ctx,
+                    &mut state,
+                    rollout.as_mut(),
+                    &text,
+                    &reasoning,
+                    Some(&turn_id),
+                )
+                .await;
+                return Ok(());
+            }
+            let elapsed = if precomputed[call_index].is_some() {
+                batch_started.elapsed().as_millis() as u64
+            } else {
+                started.elapsed().as_millis() as u64
+            };
             let preview: String = outcome.content.chars().take(300).collect();
             ctx.emit_delta(
                 Delta::tool_finished(
@@ -1596,7 +1893,23 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                 ctx.emit_state(&mut state);
             }
 
-            messages.push(ChatMessage::tool(&call.id, &outcome.content));
+            // Persist the tool result with harness-side repair guidance so the
+            // next sample (or a post-compaction one) still sees why it failed
+            // and what to change instead of re-sending the same call.
+            let mut tool_content = outcome.content.clone();
+            if outcome.is_error {
+                let signature = (call.function.name.clone(), args_text.clone());
+                if let Some(extra) =
+                    failure_repair(&outcome, &signature, &mut last_failure, &mut failure_repeat)
+                {
+                    tool_content.push_str(&extra);
+                }
+            } else {
+                failure_repeat = 0;
+                last_failure = None;
+            }
+
+            messages.push(ChatMessage::tool(&call.id, &tool_content));
             let _ = ctx
                 .store
                 .append_session_entry_for(
@@ -1609,7 +1922,7 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                         "tool_call_id": call.id,
                         "tool_name": call.function.name,
                         "is_error": outcome.is_error,
-                        "content": outcome.content,
+                        "content": tool_content.clone(),
                     }),
                 )
                 .await;
@@ -1620,7 +1933,7 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                     &ctx.chat_id,
                     &call.id,
                     &call.function.name,
-                    &outcome.content,
+                    &tool_content,
                     outcome.is_error,
                 )
                 .await;
@@ -1656,9 +1969,11 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                 } else {
                     fail(&ctx, &mut state, message.clone()).await;
                 }
+                timing.end_phase(turn_timing::Phase::ToolBlocking);
                 return Err(RunError::Message(message));
             }
         }
+        timing.end_phase(turn_timing::Phase::ToolBlocking);
 
         let images = stark_tools::drain_images(&ctx.chat_id);
         if !images.is_empty() {
@@ -1679,6 +1994,8 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
             state
                 .thoughts
                 .insert(format!("step-{}", state.state_version), reasoning);
+            // Older thinking is in the rollout; live state keeps the newest.
+            trim_live_thoughts(&mut state.thoughts);
         }
         maybe_compact(
             &ctx,
@@ -1686,6 +2003,7 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
             &affinity,
             measured_tokens,
             rollout.as_mut(),
+            timing,
         )
         .await;
     }
@@ -1705,14 +2023,25 @@ pub fn run_agent(
     prompt: String,
 ) -> Pin<Box<dyn Future<Output = Result<(), RunError>> + Send>> {
     if ctx.depth == 0 {
-        return Box::pin(run_agent_inner(ctx, prompt));
+        return Box::pin(run_agent_timed(ctx, prompt));
     }
     register_child_run(&ctx);
     let chat_id = ctx.chat_id.clone();
     Box::pin(async move {
         let _live = ChildRunGuard(chat_id);
-        run_agent_inner(ctx, prompt).await
+        run_agent_timed(ctx, prompt).await
     })
+}
+
+/// One timing profile per run, emitted after the run finishes (success, error,
+/// or abort). This wrapper keeps every early return covered.
+async fn run_agent_timed(ctx: RunContext, prompt: String) -> Result<(), RunError> {
+    let mut timing = turn_timing::TurnTiming::new();
+    let tx = ctx.tx.clone();
+    let result = run_agent_inner(ctx, prompt, &mut timing).await;
+    let report = timing.complete();
+    let _ = tx.send(ServerEvent::new("delta", Delta::status(report.as_json())));
+    result
 }
 
 /// Tools that may run inside a parallel batch. Same-path calls are grouped and
@@ -1727,8 +2056,6 @@ fn parallel_safe(name: &str) -> bool {
             | "glob"
             | "grep"
             | "search_code"
-            | "web_search"
-            | "web_fetch"
             | "skill"
             | "memory"
             | "read_pdf"
@@ -1782,8 +2109,6 @@ fn is_read_only_tool(name: &str) -> bool {
             | "job"
             | "list_agents"
             | "wait_agent"
-            | "web_search"
-            | "web_fetch"
             | "skill"
             | "read_pdf"
             | "look_at_screen"
@@ -1808,13 +2133,76 @@ fn is_context_overflow(error: &impl std::fmt::Display) -> bool {
         || text.contains("context_length_exceeded")
 }
 
+/// Codex records a bounded developer fragment after every content-filter
+/// block (`core/src/context/content_filter_guidance.rs`) so the next sample
+/// knows why the previous attempt produced nothing. Chat Completions has no
+/// developer role here, so the same markers travel as a user message.
+fn content_filter_guidance() -> String {
+    let text = std::env::var("STARK_CONTENT_FILTER_GUIDANCE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            "Your previous response was blocked by the provider's content filter. Offer a permitted alternative."
+                .to_string()
+        });
+    format!("<content_filter_guidance>\n{text}\n</content_filter_guidance>")
+}
+
+/// Parse a provider tool-call argument string once. A non-object or malformed
+/// payload must become a typed argument failure, never `{}` silently.
+fn parse_tool_arguments(raw: &str) -> Result<Value, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(json!({}));
+    }
+    match serde_json::from_str::<Value>(raw) {
+        Ok(Value::Object(map)) => Ok(Value::Object(map)),
+        Ok(Value::Null) => Ok(json!({})),
+        Ok(other) => Err(format!("tool arguments must be a JSON object, got {other}")),
+        Err(error) => Err(format!("tool arguments are not valid JSON: {error}")),
+    }
+}
+
+/// Repair text appended to a failed tool result. Two parts: the failure
+/// class's hint (why this class fails and what actually helps), and an
+/// escalation when the *identical* call fails again — the cheapest way to
+/// stop a model burning steps on the same broken request.
+fn failure_repair(
+    outcome: &ToolOutcome,
+    signature: &(String, String),
+    last_failure: &mut Option<(String, String)>,
+    failure_repeat: &mut usize,
+) -> Option<String> {
+    let mut extra = String::new();
+    if let Some(class) = outcome.class {
+        extra.push_str("\n[REPAIR] ");
+        extra.push_str(class.hint());
+    }
+    if last_failure.as_ref() == Some(signature) {
+        *failure_repeat += 1;
+    } else {
+        *failure_repeat = 1;
+        *last_failure = Some(signature.clone());
+    }
+    if *failure_repeat >= 2 {
+        extra.push_str(&format!(
+            "\n[REPAIR] This exact call has now failed {} times. Change the arguments, the tool, or the approach; do not send it again unchanged.",
+            *failure_repeat
+        ));
+    }
+    (!extra.is_empty()).then_some(extra)
+}
+
 /// Compact unconditionally (reactive recovery from a context-window 400).
 async fn force_compact(
     ctx: &RunContext,
     messages: &mut Vec<ChatMessage>,
     affinity: &str,
     writer: Option<&mut stark_store::rollout::RolloutWriter>,
+    timing: &mut turn_timing::TurnTiming,
 ) -> bool {
+    let _guard_active = timing.begin_phase(turn_timing::Phase::Compaction);
     let policy = compaction::CompactionPolicy::from_env(&ctx.scope, &ctx.model);
     ctx.emit_delta(Delta::status(json!({
         "kind": "compaction_started",
@@ -1834,6 +2222,7 @@ async fn force_compact(
             "kind": "compaction_failed",
             "reason": "context-overflow",
         })));
+        timing.end_phase(turn_timing::Phase::Compaction);
         return false;
     };
     if compaction::estimate_tokens(&outcome.messages) >= compaction::estimate_tokens(messages) {
@@ -1841,6 +2230,7 @@ async fn force_compact(
             "kind": "compaction_failed",
             "reason": "no-reduction",
         })));
+        timing.end_phase(turn_timing::Phase::Compaction);
         return false;
     }
     *messages = outcome.messages;
@@ -1894,6 +2284,7 @@ async fn force_compact(
         "input_tokens": outcome.input_tokens,
         "output_tokens": outcome.output_tokens,
     })));
+    timing.end_phase(turn_timing::Phase::Compaction);
     true
 }
 
@@ -1903,6 +2294,7 @@ async fn maybe_compact(
     affinity: &str,
     measured_tokens: Option<usize>,
     writer: Option<&mut stark_store::rollout::RolloutWriter>,
+    timing: &mut turn_timing::TurnTiming,
 ) {
     let policy = compaction::CompactionPolicy::from_env(&ctx.scope, &ctx.model);
     // Provider-reported usage beats the character estimate whenever we have it.
@@ -1919,6 +2311,7 @@ async fn maybe_compact(
     if !compaction::should_compact_with(messages, &policy, tokens) {
         return;
     }
+    let _guard_active = timing.begin_phase(turn_timing::Phase::Compaction);
     ctx.emit_delta(Delta::status(json!({
         "kind": "compaction_started",
         "reason": "context-limit",
@@ -1938,6 +2331,7 @@ async fn maybe_compact(
             "kind": "compaction_failed",
             "reason": "summarize-failed",
         })));
+        timing.end_phase(turn_timing::Phase::Compaction);
         return;
     };
     if compaction::estimate_tokens(&outcome.messages) >= policy.trigger_tokens {
@@ -1950,6 +2344,7 @@ async fn maybe_compact(
             "reason": "no-reduction",
             "tokens_before": tokens,
         })));
+        timing.end_phase(turn_timing::Phase::Compaction);
         return;
     }
     *messages = outcome.messages;
@@ -2012,6 +2407,7 @@ async fn maybe_compact(
         "input_tokens": outcome.input_tokens,
         "output_tokens": outcome.output_tokens,
     })));
+    timing.end_phase(turn_timing::Phase::Compaction);
 }
 
 #[derive(Default)]
@@ -2227,7 +2623,7 @@ async fn run_subagent_tool(ctx: &RunContext, args: &Value) -> ToolOutcome {
                     Err(error) => Err(error.to_string()),
                 }
             } else {
-                agents_tools::wait_for(&store, child_id, wait).await
+                agents_tools::wait_for(&store, child_id, wait, &ctx.cancel).await
             };
             match result {
                 Ok(text) => ToolOutcome::ok(text),
@@ -2634,6 +3030,91 @@ mod tests {
 
     use super::*;
     use stark_providers::ProviderConfig;
+    use stark_providers::ProviderError;
+
+    #[test]
+    fn repair_hints_name_the_class_and_escalate_repeats() {
+        let mut last = None;
+        let mut repeat = 0usize;
+        let signature = ("bash".to_string(), "{\"command\":\"false\"}".to_string());
+
+        // First failure: class hint only, no repeat warning.
+        let first = stark_tools::ToolOutcome::err_class(
+            stark_tools::ToolErrorClass::Exec,
+            "boom\n[exit code: 1]",
+        );
+        let extra = failure_repair(&first, &signature, &mut last, &mut repeat).unwrap();
+        assert!(extra.contains("exited non-zero"), "{extra}");
+        assert!(!extra.contains("failed 1 times"), "{extra}");
+        assert_eq!(repeat, 1);
+
+        // Identical failure again: escalate.
+        let extra = failure_repair(&first, &signature, &mut last, &mut repeat).unwrap();
+        assert!(extra.contains("failed 2 times"), "{extra}");
+        assert!(extra.contains("do not send it again unchanged"), "{extra}");
+
+        // A different failing signature restarts the count.
+        let other = ("read".to_string(), "{\"file_path\":\"x\"}".to_string());
+        let read =
+            stark_tools::ToolOutcome::err_class(stark_tools::ToolErrorClass::Args, "missing");
+        let extra = failure_repair(&read, &other, &mut last, &mut repeat).unwrap();
+        assert!(extra.contains("Fix the argument"), "{extra}");
+        assert_eq!(repeat, 1);
+    }
+
+    #[test]
+    fn tool_arguments_must_be_a_json_object() {
+        assert!(parse_tool_arguments(r#"{"file_path":"a.txt"}"#).is_ok());
+        assert!(parse_tool_arguments("").is_ok());
+        assert!(parse_tool_arguments("null").is_ok());
+        assert!(parse_tool_arguments("[]").is_err());
+        assert!(parse_tool_arguments(r#"{"file_path": "#).is_err());
+    }
+
+    #[test]
+    fn live_state_trim_keeps_the_newest_entries() {
+        let mut thoughts = BTreeMap::new();
+        for index in 0..(MAX_LIVE_THOUGHTS + 10) {
+            thoughts.insert(format!("step-{index}"), "thinking".to_string());
+        }
+        trim_live_thoughts(&mut thoughts);
+        assert_eq!(thoughts.len(), MAX_LIVE_THOUGHTS);
+        assert!(thoughts.contains_key(&format!("step-{}", MAX_LIVE_THOUGHTS + 9)));
+        assert!(!thoughts.contains_key("step-0"));
+
+        let mut calls = Vec::new();
+        for index in 0..(MAX_LIVE_USAGE_CALLS + 10) {
+            calls.push(json!(index));
+        }
+        trim_live_usage_calls(&mut calls);
+        assert_eq!(calls.len(), MAX_LIVE_USAGE_CALLS);
+        assert_eq!(calls.first(), Some(&json!(10)));
+    }
+
+    #[test]
+    fn content_filter_guidance_uses_codex_markers() {
+        let guidance = content_filter_guidance();
+        assert!(
+            guidance.starts_with("<content_filter_guidance>"),
+            "{guidance}"
+        );
+        assert!(
+            guidance.ends_with("</content_filter_guidance>"),
+            "{guidance}"
+        );
+        assert!(guidance.contains("permitted alternative"), "{guidance}");
+    }
+
+    #[test]
+    fn untyped_errors_still_get_repeat_escalation() {
+        let mut last = None;
+        let mut repeat = 0usize;
+        let signature = ("glob".to_string(), "{}".to_string());
+        let bare = stark_tools::ToolOutcome::err("Error: nothing matched");
+        assert!(failure_repair(&bare, &signature, &mut last, &mut repeat).is_none());
+        let extra = failure_repair(&bare, &signature, &mut last, &mut repeat).unwrap();
+        assert!(extra.contains("failed 2 times"), "{extra}");
+    }
 
     async fn mock_provider(
         axum::extract::State(counter): axum::extract::State<Arc<AtomicUsize>>,
@@ -2656,6 +3137,108 @@ mod tests {
             body.push_str(&format!("data: {item}\n\n"));
         }
         body.push_str("data: [DONE]\n\n");
+        Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    async fn mock_usage_after_finish_provider(
+        axum::extract::State(_counter): axum::extract::State<Arc<AtomicUsize>>,
+        Json(_body): Json<Value>,
+    ) -> Response {
+        // OpenAI's include_usage contract: the usage-only chunk arrives
+        // after the finish_reason chunk and before [DONE].
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Done\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7,\"total_tokens\":18}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    async fn mock_truncated_stream_provider() -> Response {
+        // No finish_reason and no [DONE]: the provider closed mid-response.
+        let body = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"echo hi\\\"}\"}}]},\"finish_reason\":null}]}\n\n";
+        Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    async fn mock_usage_limit_provider() -> Response {
+        Response::builder()
+            .status(429)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"error":{"type":"usage_limit_reached","message":"out of credits"}}"#,
+            ))
+            .unwrap()
+    }
+
+    async fn mock_invalid_tool_args_provider(
+        axum::extract::State(counter): axum::extract::State<Arc<AtomicUsize>>,
+        Json(_body): Json<Value>,
+    ) -> Response {
+        let turn = counter.fetch_add(1, Ordering::SeqCst);
+        let payload = if turn == 0 {
+            vec![
+                // Truncated JSON: the harness must answer with an Args error
+                // and must not execute a tool with `{}`.
+                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"bash","arguments":"{\"command\": "}}]},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+            ]
+        } else {
+            vec![
+                json!({"choices":[{"delta":{"content":"Done"}}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            ]
+        };
+        let mut body = String::new();
+        for item in payload {
+            body.push_str(&format!("data: {item}\n\n"));
+        }
+        body.push_str("data: [DONE]\n\n");
+        Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    async fn mock_retry_reset_provider(
+        axum::extract::State(counter): axum::extract::State<Arc<AtomicUsize>>,
+        Json(_body): Json<Value>,
+    ) -> Response {
+        let request = counter.fetch_add(1, Ordering::SeqCst);
+        let success_index = request / 2;
+        let payload = if request.is_multiple_of(2) {
+            // One transient failure per turn. Without a per-step reset the
+            // sixth failure exhausts the five-retry budget.
+            vec![json!({"choices":[{"delta":{"content":"partial"},"finish_reason":null}]})]
+        } else if success_index < 6 {
+            let arguments =
+                format!(r#"{{"plan":[{{"step":"step-{success_index}","status":"in_progress"}}]}}"#);
+            vec![
+                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":format!("c{success_index}"),"function":{"name":"update_plan","arguments":arguments}}]},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+            ]
+        } else {
+            vec![
+                json!({"choices":[{"delta":{"content":"Done"}}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            ]
+        };
+        let mut body = String::new();
+        for item in payload {
+            body.push_str(&format!("data: {item}\n\n"));
+        }
+        if !request.is_multiple_of(2) {
+            body.push_str("data: [DONE]\n\n");
+        }
         Response::builder()
             .header(header::CONTENT_TYPE, "text/event-stream")
             .body(Body::from(body))
@@ -2710,6 +3293,35 @@ mod tests {
         } else {
             vec![
                 json!({"choices":[{"delta":{"content":"Planned"}}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            ]
+        };
+        let mut body = String::new();
+        for item in payload {
+            body.push_str(&format!("data: {item}\n\n"));
+        }
+        body.push_str("data: [DONE]\n\n");
+        Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    /// Replays the same failing `read` twice, then answers: proves the harness
+    /// escalates an identical failing call instead of letting it loop.
+    async fn mock_repeated_failure_provider(
+        axum::extract::State(counter): axum::extract::State<Arc<AtomicUsize>>,
+        Json(_body): Json<Value>,
+    ) -> Response {
+        let turn = counter.fetch_add(1, Ordering::SeqCst);
+        let payload = if turn < 2 {
+            vec![
+                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":format!("c{turn}"),"function":{"name":"read","arguments":"{\"file_path\":\"missing.txt\"}"}}]},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+            ]
+        } else {
+            vec![
+                json!({"choices":[{"delta":{"content":"Gave up on the missing file"}}]}),
                 json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
             ]
         };
@@ -2834,6 +3446,77 @@ mod tests {
             .header(header::CONTENT_TYPE, "text/event-stream")
             .body(Body::from(body))
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn repeated_failing_call_gets_repair_escalation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/chat/completions", post(mock_repeated_failure_provider))
+            .with_state(counter.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        let provider = Provider::new(ProviderConfig {
+            mode: "deepseek".to_string(),
+            base_url: format!("http://{address}"),
+            api_key: "test".to_string(),
+            model: "mock".to_string(),
+        })
+        .unwrap();
+        let (tx, _rx) = broadcast::channel(256);
+        let ctx = RunContext {
+            chat_id: "repair-chat".to_string(),
+            workspace_id: "_general".to_string(),
+            workspace: dir.path().to_path_buf(),
+            role: Some("General".to_string()),
+            scope: "general".to_string(),
+            depth: 0,
+            file_access: crate::FileAccess::Write,
+            model: "mock".to_string(),
+            temperature: 0.0,
+            images: Vec::new(),
+            provider,
+            store: store.clone(),
+            questions: Arc::new(QuestionBroker::new()),
+            tx,
+            latest: Arc::new(Mutex::new(None)),
+            steering: Arc::new(Mutex::new(VecDeque::new())),
+            follow_up: Arc::new(Mutex::new(VecDeque::new())),
+            checkpoint: None,
+            cancel: CancellationToken::new(),
+            config: None,
+            on_job_done: None,
+        };
+        run_agent(ctx, "read the missing file".to_string())
+            .await
+            .unwrap();
+
+        let entries = store
+            .read_session_entries("_general", dir.path(), "repair-chat")
+            .await
+            .unwrap();
+        let results: Vec<String> = entries
+            .iter()
+            .filter(|entry| entry["role"] == "toolResult")
+            .map(|entry| entry["content"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(results.len(), 2, "{results:?}");
+        assert!(
+            results[1].contains("[REPAIR]"),
+            "second failure needs guidance: {}",
+            results[1]
+        );
+        assert!(
+            results[1].contains("failed 2 times"),
+            "repeat escalation missing: {}",
+            results[1]
+        );
     }
 
     #[tokio::test]
@@ -3547,6 +4230,593 @@ mod tests {
                 .join("chat.jsonl")
                 .exists()
         );
+    }
+
+    #[tokio::test]
+    async fn records_usage_after_finish_reason() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/chat/completions", post(mock_usage_after_finish_provider))
+            .with_state(counter.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        let provider = Provider::new(ProviderConfig {
+            mode: "deepseek".to_string(),
+            base_url: format!("http://{address}"),
+            api_key: "test".to_string(),
+            model: "mock".to_string(),
+        })
+        .unwrap();
+        let (tx, _) = broadcast::channel(256);
+        let latest = Arc::new(Mutex::new(None));
+        let ctx = RunContext {
+            chat_id: "chat".to_string(),
+            workspace_id: "_general".to_string(),
+            workspace: dir.path().to_path_buf(),
+            role: None,
+            scope: "agent".to_string(),
+            depth: 0,
+            file_access: crate::FileAccess::Write,
+            model: "mock".to_string(),
+            temperature: 0.0,
+            images: Vec::new(),
+            provider,
+            store,
+            questions: Arc::new(QuestionBroker::new()),
+            tx,
+            latest: latest.clone(),
+            steering: Arc::new(Mutex::new(VecDeque::new())),
+            follow_up: Arc::new(Mutex::new(VecDeque::new())),
+            checkpoint: None,
+            cancel: CancellationToken::new(),
+            config: None,
+            on_job_done: None,
+        };
+
+        run_agent(ctx, "hi".to_string()).await.unwrap();
+        let state = latest.lock().unwrap().clone().unwrap();
+        assert_eq!(state.outputs["agent_report"], "Done");
+        assert_eq!(state.token_usage.total_input_tokens, 11);
+        assert_eq!(state.token_usage.total_output_tokens, 7);
+        assert_eq!(state.token_usage.calls.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_emits_a_turn_timing_profile() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/chat/completions", post(mock_usage_after_finish_provider))
+            .with_state(counter.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        let provider = Provider::new(ProviderConfig {
+            mode: "deepseek".to_string(),
+            base_url: format!("http://{address}"),
+            api_key: "test".to_string(),
+            model: "mock".to_string(),
+        })
+        .unwrap();
+        let (tx, mut rx) = broadcast::channel(256);
+        let latest = Arc::new(Mutex::new(None));
+        let ctx = RunContext {
+            chat_id: "chat".to_string(),
+            workspace_id: "_general".to_string(),
+            workspace: dir.path().to_path_buf(),
+            role: None,
+            scope: "agent".to_string(),
+            depth: 0,
+            file_access: crate::FileAccess::Write,
+            model: "mock".to_string(),
+            temperature: 0.0,
+            images: Vec::new(),
+            provider,
+            store,
+            questions: Arc::new(QuestionBroker::new()),
+            tx,
+            latest: latest.clone(),
+            steering: Arc::new(Mutex::new(VecDeque::new())),
+            follow_up: Arc::new(Mutex::new(VecDeque::new())),
+            checkpoint: None,
+            cancel: CancellationToken::new(),
+            config: None,
+            on_job_done: None,
+        };
+
+        run_agent(ctx, "hi".to_string()).await.unwrap();
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        let timing = events.iter().find(|event| {
+            event.event == "delta"
+                && event
+                    .data
+                    .get("status")
+                    .and_then(|status| status.get("kind"))
+                    .and_then(Value::as_str)
+                    == Some("turn_timing")
+        });
+        let timing = timing.expect("turn_timing delta");
+        let status = timing.data.get("status").expect("status payload");
+        assert!(status.get("sampling_request_count").is_some());
+        assert!(status.get("tool_blocking_ms").is_some());
+        assert!(status.get("total_ms").is_some());
+    }
+
+    async fn mock_empty_tool_call_then_done(
+        axum::extract::State(counter): axum::extract::State<Arc<AtomicUsize>>,
+        Json(_body): Json<Value>,
+    ) -> Response {
+        let turn = counter.fetch_add(1, Ordering::SeqCst);
+        let payload = if turn == 0 {
+            vec![
+                json!({"choices":[{"delta":{"content":"thinking..."},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+            ]
+        } else {
+            vec![
+                json!({"choices":[{"delta":{"content":"Recovered"}}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            ]
+        };
+        let mut body = String::new();
+        for item in payload {
+            body.push_str(&format!("data: {item}\n\n"));
+        }
+        body.push_str("data: [DONE]\n\n");
+        Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    async fn mock_content_filter_then_done(
+        axum::extract::State(requests): axum::extract::State<Arc<Mutex<Vec<Value>>>>,
+        Json(body): Json<Value>,
+    ) -> Response {
+        let turn = {
+            let mut requests = requests.lock().unwrap();
+            requests.push(body);
+            requests.len() - 1
+        };
+        let payload = if turn == 0 {
+            vec![
+                json!({"choices":[{"delta":{"content":"blocked"},"finish_reason":"content_filter"}]}),
+            ]
+        } else {
+            vec![
+                json!({"choices":[{"delta":{"content":"Allowed"}}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            ]
+        };
+        let mut body = String::new();
+        for item in payload {
+            body.push_str(&format!("data: {item}\n\n"));
+        }
+        body.push_str("data: [DONE]\n\n");
+        Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn empty_tool_call_turn_is_retried_not_accepted() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/chat/completions", post(mock_empty_tool_call_then_done))
+            .with_state(counter.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        let provider = Provider::new(ProviderConfig {
+            mode: "deepseek".to_string(),
+            base_url: format!("http://{address}"),
+            api_key: "test".to_string(),
+            model: "mock".to_string(),
+        })
+        .unwrap();
+        let (tx, _) = broadcast::channel(256);
+        let latest = Arc::new(Mutex::new(None));
+        let ctx = RunContext {
+            chat_id: "chat".to_string(),
+            workspace_id: "_general".to_string(),
+            workspace: dir.path().to_path_buf(),
+            role: None,
+            scope: "agent".to_string(),
+            depth: 0,
+            file_access: crate::FileAccess::Write,
+            model: "mock".to_string(),
+            temperature: 0.0,
+            images: Vec::new(),
+            provider,
+            store,
+            questions: Arc::new(QuestionBroker::new()),
+            tx,
+            latest: latest.clone(),
+            steering: Arc::new(Mutex::new(VecDeque::new())),
+            follow_up: Arc::new(Mutex::new(VecDeque::new())),
+            checkpoint: None,
+            cancel: CancellationToken::new(),
+            config: None,
+            on_job_done: None,
+        };
+
+        run_agent(ctx, "hi".to_string()).await.unwrap();
+        let state = latest.lock().unwrap().clone().unwrap();
+        // The broken turn was not persisted as the final answer.
+        assert_eq!(state.active_node, "done");
+        assert_eq!(state.outputs["agent_report"], "Recovered");
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    async fn mock_nameless_tool_call_then_done(
+        axum::extract::State(counter): axum::extract::State<Arc<AtomicUsize>>,
+        Json(_body): Json<Value>,
+    ) -> Response {
+        let turn = counter.fetch_add(1, Ordering::SeqCst);
+        let payload = if turn == 0 {
+            // A tool-call entry with arguments but no function name: the call
+            // cannot be dispatched and must not end the run.
+            vec![
+                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"arguments":"{}"}}]},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+            ]
+        } else {
+            vec![
+                json!({"choices":[{"delta":{"content":"Recovered"}}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            ]
+        };
+        let mut body = String::new();
+        for item in payload {
+            body.push_str(&format!("data: {item}\n\n"));
+        }
+        body.push_str("data: [DONE]\n\n");
+        Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn nameless_tool_call_turn_is_retried_not_dispatched() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/chat/completions", post(mock_nameless_tool_call_then_done))
+            .with_state(counter.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        let provider = Provider::new(ProviderConfig {
+            mode: "deepseek".to_string(),
+            base_url: format!("http://{address}"),
+            api_key: "test".to_string(),
+            model: "mock".to_string(),
+        })
+        .unwrap();
+        let (tx, _) = broadcast::channel(256);
+        let latest = Arc::new(Mutex::new(None));
+        let ctx = RunContext {
+            chat_id: "chat".to_string(),
+            workspace_id: "_general".to_string(),
+            workspace: dir.path().to_path_buf(),
+            role: None,
+            scope: "agent".to_string(),
+            depth: 0,
+            file_access: crate::FileAccess::Write,
+            model: "mock".to_string(),
+            temperature: 0.0,
+            images: Vec::new(),
+            provider,
+            store,
+            questions: Arc::new(QuestionBroker::new()),
+            tx,
+            latest: latest.clone(),
+            steering: Arc::new(Mutex::new(VecDeque::new())),
+            follow_up: Arc::new(Mutex::new(VecDeque::new())),
+            checkpoint: None,
+            cancel: CancellationToken::new(),
+            config: None,
+            on_job_done: None,
+        };
+
+        run_agent(ctx, "hi".to_string()).await.unwrap();
+        let state = latest.lock().unwrap().clone().unwrap();
+        assert_eq!(state.active_node, "done");
+        assert_eq!(state.outputs["agent_report"], "Recovered");
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn content_filter_retry_records_codex_guidance() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/chat/completions", post(mock_content_filter_then_done))
+            .with_state(requests.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        let provider = Provider::new(ProviderConfig {
+            mode: "deepseek".to_string(),
+            base_url: format!("http://{address}"),
+            api_key: "test".to_string(),
+            model: "mock".to_string(),
+        })
+        .unwrap();
+        let (tx, _) = broadcast::channel(256);
+        let latest = Arc::new(Mutex::new(None));
+        let ctx = RunContext {
+            chat_id: "chat".to_string(),
+            workspace_id: "_general".to_string(),
+            workspace: dir.path().to_path_buf(),
+            role: None,
+            scope: "agent".to_string(),
+            depth: 0,
+            file_access: crate::FileAccess::Write,
+            model: "mock".to_string(),
+            temperature: 0.0,
+            images: Vec::new(),
+            provider,
+            store,
+            questions: Arc::new(QuestionBroker::new()),
+            tx,
+            latest: latest.clone(),
+            steering: Arc::new(Mutex::new(VecDeque::new())),
+            follow_up: Arc::new(Mutex::new(VecDeque::new())),
+            checkpoint: None,
+            cancel: CancellationToken::new(),
+            config: None,
+            on_job_done: None,
+        };
+
+        run_agent(ctx, "hi".to_string()).await.unwrap();
+        let state = latest.lock().unwrap().clone().unwrap();
+        assert_eq!(state.outputs["agent_report"], "Allowed");
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "filtered turn must be retried once");
+        let second = requests[1].to_string();
+        assert!(
+            second.contains("<content_filter_guidance>"),
+            "guidance missing from retry: {second}"
+        );
+        assert!(
+            second.contains("permitted alternative"),
+            "guidance text missing: {second}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_without_completion_is_a_retryable_provider_error() {
+        use futures_util::StreamExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route("/chat/completions", post(mock_truncated_stream_provider));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let provider = Provider::new(ProviderConfig {
+            mode: "deepseek".to_string(),
+            base_url: format!("http://{address}"),
+            api_key: "test".to_string(),
+            model: "mock".to_string(),
+        })
+        .unwrap();
+        let mut stream = provider
+            .stream_chat_for_session(
+                &[ChatMessage::user("hi")],
+                &[],
+                0.0,
+                ProviderSession {
+                    session_id: "chat",
+                    affinity: "chat",
+                    reasoning_effort: None,
+                },
+            )
+            .await
+            .unwrap();
+        let mut failure = None;
+        while let Some(event) = stream.next().await {
+            if let Err(error) = event {
+                failure = Some(error);
+                break;
+            }
+        }
+        let error = failure.expect("truncated stream must fail");
+        assert!(
+            matches!(&error, ProviderError::Stream { message, .. } if message.contains("stream disconnected before completion")),
+            "{error:?}"
+        );
+        assert!(error.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn usage_limit_429_is_terminal() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route("/chat/completions", post(mock_usage_limit_provider));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let provider = Provider::new(ProviderConfig {
+            mode: "deepseek".to_string(),
+            base_url: format!("http://{address}"),
+            api_key: "test".to_string(),
+            model: "mock".to_string(),
+        })
+        .unwrap();
+        let error = match provider
+            .stream_chat_for_session(
+                &[ChatMessage::user("hi")],
+                &[],
+                0.0,
+                ProviderSession {
+                    session_id: "chat",
+                    affinity: "chat",
+                    reasoning_effort: None,
+                },
+            )
+            .await
+        {
+            Ok(_) => panic!("usage limit should not return a stream"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(&error, ProviderError::UsageLimit(message) if message.contains("out of credits")),
+            "{error:?}"
+        );
+        assert!(!error.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn invalid_tool_arguments_are_an_args_error_not_an_execution() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/chat/completions", post(mock_invalid_tool_args_provider))
+            .with_state(counter.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        let provider = Provider::new(ProviderConfig {
+            mode: "deepseek".to_string(),
+            base_url: format!("http://{address}"),
+            api_key: "test".to_string(),
+            model: "mock".to_string(),
+        })
+        .unwrap();
+        let (tx, mut rx) = broadcast::channel(256);
+        let latest = Arc::new(Mutex::new(None));
+        let ctx = RunContext {
+            chat_id: "chat".to_string(),
+            workspace_id: "_general".to_string(),
+            workspace: dir.path().to_path_buf(),
+            role: None,
+            scope: "agent".to_string(),
+            depth: 0,
+            file_access: crate::FileAccess::Write,
+            model: "mock".to_string(),
+            temperature: 0.0,
+            images: Vec::new(),
+            provider,
+            store,
+            questions: Arc::new(QuestionBroker::new()),
+            tx,
+            latest: latest.clone(),
+            steering: Arc::new(Mutex::new(VecDeque::new())),
+            follow_up: Arc::new(Mutex::new(VecDeque::new())),
+            checkpoint: None,
+            cancel: CancellationToken::new(),
+            config: None,
+            on_job_done: None,
+        };
+
+        run_agent(ctx, "hi".to_string()).await.unwrap();
+        let state = latest.lock().unwrap().clone().unwrap();
+        assert_eq!(state.outputs["agent_report"], "Done");
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert!(
+            events.iter().any(|event| {
+                event.event == "delta"
+                    && event.data["kind"] == "tool_finished"
+                    && event.data["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("not valid JSON"))
+            }),
+            "missing typed argument failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_retry_budget_resets_after_each_completed_step() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/chat/completions", post(mock_retry_reset_provider))
+            .with_state(counter.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        let provider = Provider::new(ProviderConfig {
+            mode: "deepseek".to_string(),
+            base_url: format!("http://{address}"),
+            api_key: "test".to_string(),
+            model: "mock".to_string(),
+        })
+        .unwrap();
+        let (tx, _) = broadcast::channel(256);
+        let latest = Arc::new(Mutex::new(None));
+        let ctx = RunContext {
+            chat_id: "chat".to_string(),
+            workspace_id: "_general".to_string(),
+            workspace: dir.path().to_path_buf(),
+            role: None,
+            scope: "agent".to_string(),
+            depth: 0,
+            file_access: crate::FileAccess::Write,
+            model: "mock".to_string(),
+            temperature: 0.0,
+            images: Vec::new(),
+            provider,
+            store,
+            questions: Arc::new(QuestionBroker::new()),
+            tx,
+            latest: latest.clone(),
+            steering: Arc::new(Mutex::new(VecDeque::new())),
+            follow_up: Arc::new(Mutex::new(VecDeque::new())),
+            checkpoint: None,
+            cancel: CancellationToken::new(),
+            config: None,
+            on_job_done: None,
+        };
+
+        run_agent(ctx, "hi".to_string()).await.unwrap();
+        let state = latest.lock().unwrap().clone().unwrap();
+        assert_eq!(state.outputs["agent_report"], "Done");
+        // Seven transient failures across seven steps; the per-run budget
+        // would have died on the sixth.
+        assert_eq!(counter.load(Ordering::SeqCst), 14);
     }
 
     #[tokio::test]

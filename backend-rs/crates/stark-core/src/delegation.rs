@@ -269,7 +269,7 @@ pub(crate) async fn delegation_status(ctx: &RunContext, args: &Value) -> ToolOut
                 Err(error) => Err(error.to_string()),
             }
         } else {
-            agents_tools::wait_for(&store, id, wait).await
+            agents_tools::wait_for(&store, id, wait, &ctx.cancel).await
         };
         return match detail {
             Ok(text) => ToolOutcome::ok(text),

@@ -1,7 +1,7 @@
 {
-  "contract_version": 4,
+  "contract_version": 6,
   "source": "DeepSeek Harness standard core (f3803c9) + Codex multi-agent v2 (79be2e2); Developer Pi-simplified v3 surface; workspace registry v4",
-  "tool_count": 57,
+  "tool_count": 49,
   "tools": [
     {
       "name": "bash",
@@ -331,51 +331,6 @@
       "doc": "Load the full instructions for a skill. Call it before acting on a task that names or clearly matches a skill in the session skill catalog."
     },
     {
-      "name": "web_search",
-      "description": "Search the web for current information. Returns an optional summary answer and a list of source URLs.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "queries": {
-            "type": "array",
-            "description": "1\u20134 search queries; their results are merged.",
-            "items": {
-              "type": "string"
-            }
-          }
-        },
-        "required": [
-          "queries"
-        ]
-      },
-      "exposed": true,
-      "required": [
-        "queries"
-      ],
-      "doc": "Search the web for current information. Returns an optional summary answer and a list of source URLs."
-    },
-    {
-      "name": "web_fetch",
-      "description": "Fetch the content of a specific HTTP(S) URL and return it decoded to text.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "url": {
-            "type": "string",
-            "description": "The HTTP(S) URL to fetch."
-          }
-        },
-        "required": [
-          "url"
-        ]
-      },
-      "exposed": true,
-      "required": [
-        "url"
-      ],
-      "doc": "Fetch the content of a specific HTTP(S) URL and return it decoded to text."
-    },
-    {
       "name": "spawn_agent",
       "description": "Spawns an agent to work on the specified task. If your current task is `/root/task1` and you spawn_agent with task_name \"task_3\" the agent will have canonical task name `/root/task1/task_3`.\nYou are then able to refer to this agent as `task_3` or `/root/task1/task_3` interchangeably. However an agent `/root/task2/task_3` would only be able to communicate with this agent via its canonical name `/root/task1/task_3`.\nThe spawned agent will have the same tools as you and the ability to spawn its own subagents.\n\nIt will be able to send you and other running agents messages, and its final answer will be provided to you when it finishes.\nThe new agent's canonical task name will be provided to it along with the message.\n\nNote that passing `fork_turns=\"none\"` will not pass any surrounding context to the spawned subagent, which may cause the agent to lack the context it needs to complete its task, whereas `fork_turns=\"all\"` will provide the subagent with all surrounding context.",
       "parameters": {
@@ -603,65 +558,6 @@
       "doc": "create_xlsx(file_path, headers, rows) \u2014 Create an Excel spreadsheet (.xlsx)."
     },
     {
-      "name": "ast_search",
-      "description": "Structural search over Python files (stdlib AST, no text matching). Warehouse tool: not assigned to any agent scope yet; enable per specialist. Results are workspace-relative and bounded like search_code.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "rule": {
-            "type": "string",
-            "enum": [
-              "call",
-              "import",
-              "class_bases",
-              "decorator",
-              "bare_except",
-              "long_function",
-              "many_params",
-              "no_docstring"
-            ],
-            "description": "Structural query. call/import/class_bases/decorator require name; long_function/many_params use min_lines/max_params."
-          },
-          "name": {
-            "type": "string",
-            "description": "Function/method/module/class/decorator name for name-based rules (dotted names allowed)."
-          },
-          "path": {
-            "type": "string",
-            "description": "Directory or single file to search (default: workspace root)."
-          },
-          "glob": {
-            "type": "string",
-            "description": "Comma-separated file filters, '!' excludes. Python files only."
-          },
-          "min_lines": {
-            "type": "integer",
-            "minimum": 1,
-            "description": "long_function threshold in lines (default 60)."
-          },
-          "max_params": {
-            "type": "integer",
-            "minimum": 0,
-            "description": "many_params threshold; functions above it are reported (default 5)."
-          },
-          "max_results": {
-            "type": "integer",
-            "minimum": 1,
-            "maximum": 1000,
-            "description": "Matches shown inline (default 100)."
-          }
-        },
-        "required": [
-          "rule"
-        ]
-      },
-      "exposed": false,
-      "required": [
-        "rule"
-      ],
-      "doc": "ast_search(rule, name?, path?, glob?, min_lines?, max_params?, max_results?) \u2014 Structural search over Python (call/import/class_bases/decorator/bare_except/long_function/many_params/no_docstring)."
-    },
-    {
       "name": "browser_act",
       "description": "Browser automation: navigate, click, fill, type, press, extract, screenshot, read, a11y, record, network, close. Selector = CSS or @ref from the navigate snapshot. read returns agent-readable Markdown; a11y runs an axe-core WCAG audit; record captures WebM/MP4 with record_action=start|stop|restart; network inspects or mocks requests with network_action=requests|request|har_start|har_stop|route|unroute. Start servers with run_command(background=true) first.",
       "parameters": {
@@ -802,81 +698,6 @@
       "doc": "browser_act(action, selector?, text?, key?, what?, path?) \u2014 click / fill / type / press / extract / screenshot / close."
     },
     {
-      "name": "browser_navigate",
-      "description": "Open a URL in a headless Chromium browser and return the page content as an accessibility snapshot with @ref selectors. Handles JavaScript-rendered pages, SPAs, complex web apps. Returns interactive element tree for use with other browser tools. Slower than a plain GET but handles everything.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "url": {
-            "type": "string",
-            "description": "The full URL to navigate to."
-          },
-          "wait_ms": {
-            "type": "integer",
-            "description": "Optional. Milliseconds to wait for page load (default 5000)."
-          }
-        },
-        "required": [
-          "url"
-        ]
-      },
-      "exposed": false,
-      "required": [
-        "url"
-      ],
-      "doc": "browser_navigate(url, wait_ms?) \u2014 Open URL in headless Chromium, returns snapshot with @ref selectors."
-    },
-    {
-      "name": "browser_extract",
-      "description": "Extract content from the current browser page. Use after browser_navigate. Can extract text, HTML, attribute values, page title, or URL. Uses @ref selectors from the accessibility snapshot.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "what": {
-            "type": "string",
-            "description": "What to extract: 'text' (default), 'html', 'value', 'title', 'url', 'attr name'."
-          },
-          "selector": {
-            "type": "string",
-            "description": "Optional CSS selector or @ref from snapshot. Empty = entire page."
-          }
-        },
-        "required": []
-      },
-      "exposed": false,
-      "required": [],
-      "doc": "browser_extract(what?, selector?) \u2014 Extract text/html/value from current browser page."
-    },
-    {
-      "name": "browser_screenshot",
-      "description": "Take a screenshot of the current browser page. Saves to a temp file and returns the path. Use for visual verification of pages.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "path": {
-            "type": "string",
-            "description": "Optional file path to save the screenshot. Auto-named if empty."
-          }
-        },
-        "required": []
-      },
-      "exposed": false,
-      "required": [],
-      "doc": "browser_screenshot(path?) \u2014 Screenshot of current browser page."
-    },
-    {
-      "name": "browser_close",
-      "description": "Close the current browser session and free all resources (memory, Chrome process). Call when done with web research to avoid resource leaks.",
-      "parameters": {
-        "type": "object",
-        "properties": {},
-        "required": []
-      },
-      "exposed": false,
-      "required": [],
-      "doc": "browser_close() \u2014 Close browser session and free resources."
-    },
-    {
       "name": "look_at_screen",
       "description": "Capture the user's live screen RIGHT NOW and attach it inline (vision). Use when the answer depends on what the user is currently viewing: a highlighted passage, a chart, a page, an error, or when they say 'this'/'here'/'what I'm looking at'. Turns the overlay's screen sharing on if it is off. The frame reaches you as an image before your next reply.",
       "parameters": {
@@ -969,48 +790,6 @@
         "value"
       ],
       "doc": null
-    },
-    {
-      "name": "github_apply_gate",
-      "description": "Create a repo and/or install the tiered CI/security gate: T1 fast-checks / T2 staging / T3 release workflows + .harness-ci.json, dev/staging/prod branch ladder, waits for first run, enforces prod branch protection. Non-destructive otherwise; stack auto-detected. Confirms first (gate=ask).",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "repo": {
-            "type": "string",
-            "description": "'owner/name' (plain name when create=true)."
-          },
-          "stack": {
-            "type": "string",
-            "description": "'auto'(default) | python | node | go | php | generic."
-          },
-          "create": {
-            "type": "boolean"
-          },
-          "private": {
-            "type": "boolean"
-          },
-          "description": {
-            "type": "string"
-          },
-          "gate": {
-            "type": "string",
-            "description": "'ask'(default) | 'yes' | 'no'."
-          },
-          "update_levels": {
-            "type": "boolean",
-            "description": "Re-render level-owned files after a branch rename."
-          }
-        },
-        "required": [
-          "repo"
-        ]
-      },
-      "exposed": false,
-      "required": [
-        "repo"
-      ],
-      "doc": "github_apply_gate(repo, stack?, codeql_on?, create?, private?, description?, gate?) \u2014 The ONE gate tool: create the repo (create=True) and/or install the security/perf gate (seed + branch protection). Confirms with the user (gate: ask|yes|no)."
     },
     {
       "name": "workspace",
@@ -2268,8 +2047,6 @@
       "update_plan",
       "ask_user_question",
       "skill",
-      "web_search",
-      "web_fetch",
       "spawn_agent",
       "message_agent",
       "wait_agent",
@@ -2287,8 +2064,6 @@
       "update_plan",
       "ask_user_question",
       "skill",
-      "web_search",
-      "web_fetch",
       "spawn_agent",
       "message_agent",
       "wait_agent",
@@ -2312,8 +2087,6 @@
       "set_screen_share",
       "agent",
       "memory",
-      "web_fetch",
-      "web_search",
       "skill",
       "tool_search",
       "personal_os"

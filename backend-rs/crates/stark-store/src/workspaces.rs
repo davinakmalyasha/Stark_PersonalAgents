@@ -9,6 +9,100 @@ use uuid::Uuid;
 /// completely different folder layout.
 pub const PROJECTS_ROOT_TOKEN: &str = "%PROJECTS_ROOT%";
 
+/// Rejects repository URLs that can be interpreted as command-line options or
+/// Git remote helpers. `git clone` runs on the host, so `ext::`/`--upload-pack`
+/// inputs must never reach it.
+pub fn validate_repo_url(repo: &str) -> Result<(), String> {
+    let repo = repo.trim();
+    if repo.is_empty() {
+        return Err("repository URL is empty".to_string());
+    }
+    if repo.starts_with('-') {
+        return Err(format!("repository URL cannot start with '-': {repo}"));
+    }
+    if let Some((helper, _)) = repo.split_once("::")
+        && !helper.contains("://")
+        && !helper.contains('@')
+        && helper.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
+        })
+    {
+        return Err("Git remote helpers (scheme::address) are not allowed".to_string());
+    }
+    if repo
+        .chars()
+        .any(|character| character.is_control() || character == '\0')
+    {
+        return Err("repository URL contains control characters".to_string());
+    }
+    Ok(())
+}
+
+/// Git branch name check for values that reach `git clone --branch` or
+/// `git branch`.
+pub fn validate_branch_name(branch: &str) -> Result<(), String> {
+    let branch = branch.trim();
+    if branch.is_empty() {
+        return Err("branch name is empty".to_string());
+    }
+    if branch.starts_with('-') {
+        return Err(format!("branch name cannot start with '-': {branch}"));
+    }
+    if branch.chars().any(|character| {
+        character.is_control()
+            || character.is_whitespace()
+            || matches!(character, '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+    }) || branch.contains("..")
+        || branch.ends_with('/')
+        || branch.starts_with('/')
+    {
+        return Err(format!("invalid branch name: {branch}"));
+    }
+    Ok(())
+}
+
+/// Workspace ids become registry keys and can be used in on-disk paths by
+/// callers; keep them a single safe component.
+pub fn validate_workspace_id(id: &str) -> Result<(), String> {
+    let id = id.trim();
+    if id.is_empty() {
+        return Err("workspace id is required".to_string());
+    }
+    if id == "." || id == ".." || id.contains("..") {
+        return Err(format!("invalid workspace id: {id}"));
+    }
+    if id
+        .chars()
+        .any(|character| character.is_control() || matches!(character, '/' | '\\' | ':'))
+    {
+        return Err(format!("invalid workspace id: {id}"));
+    }
+    Ok(())
+}
+
+/// Converts a package/manifest relative path into a path that cannot escape
+/// the projects root. Returns `None` for absolute paths, drive letters, `.`,
+/// `..`, empty components, or control characters.
+pub fn safe_relative_path(value: &str) -> Option<PathBuf> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.starts_with('/')
+        || value.starts_with('\\')
+        || value.contains(':')
+        || value.chars().any(char::is_control)
+    {
+        return None;
+    }
+    let mut path = PathBuf::new();
+    for part in value.split(['/', '\\']) {
+        if part.is_empty() || part == "." || part == ".." {
+            return None;
+        }
+        path.push(part);
+    }
+    Some(path)
+}
+
 /// Root that project folders live under on this machine.
 ///
 /// `STARK_PROJECTS_ROOT` wins. Platform defaults keep the old Windows layout
@@ -185,6 +279,10 @@ impl WorkspaceRegistry {
         repo: &str,
         branch: Option<&str>,
     ) -> Result<WorkspaceRecord, String> {
+        validate_repo_url(repo)?;
+        if let Some(branch) = branch.filter(|branch| !branch.trim().is_empty()) {
+            validate_branch_name(branch)?;
+        }
         let mut record = self.add(folder_path, name)?;
         let mut registry = self.load();
         if let Some(stored) = registry
@@ -223,8 +321,17 @@ impl WorkspaceRegistry {
     /// memory keep pointing at the same project on every machine. The path is
     /// resolved for this machine from `root`/`rel` when portable.
     pub fn upsert_record(&self, record: WorkspaceRecord) -> Result<WorkspaceRecord, String> {
-        if record.id.trim().is_empty() {
-            return Err("workspace id is required".to_string());
+        validate_workspace_id(&record.id)?;
+        if let Some(repo) = record.repo.as_deref() {
+            validate_repo_url(repo)?;
+        }
+        if let Some(branch) = record.branch.as_deref() {
+            validate_branch_name(branch)?;
+        }
+        if let Some(rel) = record.rel.as_deref()
+            && safe_relative_path(rel).is_none()
+        {
+            return Err(format!("invalid workspace relative path: {rel}"));
         }
         let mut registry = self.load();
         if let Some(stored) = registry
@@ -400,5 +507,39 @@ mod tests {
             Path::new("/srv/stark-projects"),
         );
         assert_eq!(rebased.path, r"D:\Other\app");
+    }
+
+    #[test]
+    fn repo_and_branch_validation_rejects_option_and_helper_injection() {
+        assert!(validate_repo_url("https://github.com/owner/repo.git").is_ok());
+        assert!(validate_repo_url("git@github.com:owner/repo.git").is_ok());
+        assert!(validate_repo_url("https://[::1]/owner/repo.git").is_ok());
+        assert!(validate_repo_url("--upload-pack=calc").is_err());
+        assert!(validate_repo_url("ext::sh -c calc").is_err());
+        assert!(validate_branch_name("feature/test").is_ok());
+        assert!(validate_branch_name("--upload-pack=calc").is_err());
+        assert!(validate_branch_name("bad branch").is_err());
+    }
+
+    #[test]
+    fn relative_paths_cannot_escape_the_projects_root() {
+        assert_eq!(
+            safe_relative_path("app/demo"),
+            Some(PathBuf::from("app/demo"))
+        );
+        assert!(safe_relative_path("../escape").is_none());
+        assert!(safe_relative_path("app/../../escape").is_none());
+        assert!(safe_relative_path("/absolute").is_none());
+        assert!(safe_relative_path(r"C:\absolute").is_none());
+        assert!(safe_relative_path("app\\demo").is_some());
+    }
+
+    #[test]
+    fn workspace_ids_reject_path_separators() {
+        assert!(validate_workspace_id("ws-1234").is_ok());
+        assert!(validate_workspace_id("_general").is_ok());
+        assert!(validate_workspace_id("../escape").is_err());
+        assert!(validate_workspace_id("a/b").is_err());
+        assert!(validate_workspace_id(r"a\b").is_err());
     }
 }

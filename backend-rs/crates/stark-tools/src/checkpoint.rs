@@ -92,14 +92,29 @@ pub struct Checkpoint {
 }
 
 impl Checkpoint {
-    pub fn begin(chat_id: impl Into<String>, workspace: impl Into<PathBuf>) -> Arc<Self> {
-        let chat_id = chat_id.into();
-        let workspace = workspace.into();
-        let run_id = format!(
+    /// Generate the run identity without creating a snapshot directory. Run
+    /// admission uses this so a rejected claim does not leave an orphan
+    /// checkpoint, and the accepted run keeps the same ID throughout.
+    pub fn next_run_id() -> String {
+        format!(
             "run-{}-{}",
             chrono::Utc::now().timestamp_millis(),
             &Uuid::new_v4().simple().to_string()[..8]
-        );
+        )
+    }
+
+    pub fn begin(chat_id: impl Into<String>, workspace: impl Into<PathBuf>) -> Arc<Self> {
+        Self::begin_with_run_id(chat_id, workspace, Self::next_run_id())
+    }
+
+    pub fn begin_with_run_id(
+        chat_id: impl Into<String>,
+        workspace: impl Into<PathBuf>,
+        run_id: impl Into<String>,
+    ) -> Arc<Self> {
+        let chat_id = chat_id.into();
+        let workspace = workspace.into();
+        let run_id = run_id.into();
         let dir = workspace
             .join(".deep_agents")
             .join("snapshots")

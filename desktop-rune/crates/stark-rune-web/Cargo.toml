@@ -1,0 +1,21 @@
+[package]
+name = "stark-rune-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+stark-rune-app = { path = "../stark-rune-app", default-features = false, features = ["rune-real"] }
+
+[dependencies.rune]
+path = "../../vendor/rune/crates/rune"
+package = "rune"
+default-features = false
+# Web has no system-font discovery: bundle Inter + Plex Mono.
+features = ["embedded-fonts"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "=0.2.129"

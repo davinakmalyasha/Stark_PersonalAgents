@@ -6,7 +6,7 @@
 
 use serde_json::Value;
 
-use crate::{ToolContext, ToolOutcome};
+use crate::{ToolContext, ToolErrorClass, ToolOutcome};
 
 fn selected_text(value: &Value) -> String {
     match value {
@@ -23,23 +23,38 @@ fn selected_text(value: &Value) -> String {
 
 pub async fn ask_user_question(ctx: &ToolContext, args: &Value) -> ToolOutcome {
     if ctx.depth > 0 {
-        return ToolOutcome::err(
+        return ToolOutcome::err_class(
+            ToolErrorClass::Blocked,
             "[BLOCKED] Subagents run non-interactively; ask the parent to resolve this.",
         );
     }
     let Some(questions) = args.get("questions").and_then(Value::as_array) else {
-        return ToolOutcome::err("Error: ask_user_question requires questions");
+        return ToolOutcome::err_class(
+            ToolErrorClass::Args,
+            "Error: ask_user_question requires questions",
+        );
     };
     if questions.is_empty() {
-        return ToolOutcome::err("Error: ask_user_question requires at least one question");
+        return ToolOutcome::err_class(
+            ToolErrorClass::Args,
+            "Error: ask_user_question requires at least one question",
+        );
     }
     let answers = match ctx
         .questions
-        .ask(&ctx.chat_id, questions.clone(), 600)
+        .ask_cancellable(&ctx.chat_id, questions.clone(), 600, &ctx.cancel)
         .await
     {
         Ok(answers) => answers,
-        Err(error) => return ToolOutcome::err(format!("Error: ask_user_question {error}")),
+        Err(error) if error.contains("cancelled by the user") => {
+            return crate::cancelled_outcome("ask_user_question");
+        }
+        Err(error) => {
+            return ToolOutcome::err_class(
+                ToolErrorClass::Tool,
+                format!("Error: ask_user_question {error}"),
+            );
+        }
     };
     let mut lines = vec!["[USER ANSWERS]".to_string()];
     for answer in &answers {

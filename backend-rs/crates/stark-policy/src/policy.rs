@@ -97,6 +97,28 @@ impl Policy {
         &self.network_rules
     }
 
+    /// Last matching network rule wins; `default_decision` applies when the
+    /// host/protocol pair has no rule. The default is deliberately a caller
+    /// input so the same policy can enforce "network off" or "network on".
+    pub fn check_network(
+        &self,
+        host: &str,
+        protocol: NetworkRuleProtocol,
+        default_decision: Decision,
+    ) -> crate::PolicyDecision {
+        let normalized = normalize_network_rule_host(host)
+            .unwrap_or_else(|_| host.trim().trim_end_matches('.').to_ascii_lowercase());
+        let mut decision = default_decision;
+        let mut reason = None;
+        for rule in &self.network_rules {
+            if rule.protocol == protocol && rule.host == normalized {
+                decision = rule.decision;
+                reason = rule.justification.clone();
+            }
+        }
+        crate::PolicyDecision { decision, reason }
+    }
+
     pub fn host_executables(&self) -> &HashMap<String, Arc<[PathBuf]>> {
         &self.host_executables_by_name
     }

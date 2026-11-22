@@ -1,8 +1,8 @@
 # Builds the Linux deploy unit for the VPS runner: the stark-server binary
-# (x86_64, glibc matched to the deploy OS) plus the frontend dist it serves.
-# The VPS never compiles — it downloads this artifact and runs it.
+# (x86_64, glibc matched to the deploy OS). The VPS never compiles — it
+# downloads this artifact and runs it.
 #
-# Trigger: manual, or pushes to master that touch backend/frontend.
+# Trigger: manual, or pushes to master that touch the backend.
 # Runner is Ubuntu 24.04: its glibc is older than the VPS's 26.04, and glibc
 # is forward-compatible — so the binary runs on 26.04. (Building on 26.04
 # would break the other way.) 24.04 is also the guaranteed runner label.
@@ -15,11 +15,6 @@ on:
     branches: [master]
     paths:
       - 'backend-rs/**'
-      - 'frontend/src/**'
-      - 'frontend/package.json'
-      - 'frontend/package-lock.json'
-      - 'frontend/vite.config.*'
-      - 'frontend/index.html'
       - '.github/workflows/build-linux.yml'
 
 jobs:
@@ -40,7 +35,7 @@ jobs:
       - name: System deps (Linux audio headers)
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
 
-      - name: Contract sanity (frozen v4 tool contract)
+      - name: Contract sanity (frozen v6 tool contract)
         working-directory: backend-rs
         run: cargo test -p stark-contract
 
@@ -48,25 +43,11 @@ jobs:
         working-directory: backend-rs
         run: cargo build --release -p stark-server
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
-
-      - name: Build frontend dist
-        working-directory: frontend
-        run: |
-          npm ci
-          npm run build
-          test -f dist/index.html
-
       - name: Package deploy unit
         run: |
-          mkdir -p pkg/opt/stark pkg/opt/stark-frontend
+          mkdir -p pkg/opt/stark
           cp backend-rs/target/release/stark-server pkg/opt/stark/stark-server
           chmod +x pkg/opt/stark/stark-server
-          cp -r frontend/dist/. pkg/opt/stark-frontend/
           tar -czf stark-linux-x86_64.tar.gz -C pkg opt
           tar -tzf stark-linux-x86_64.tar.gz | head -8
           ls -la stark-linux-x86_64.tar.gz

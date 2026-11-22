@@ -191,21 +191,19 @@ impl AgentStore {
         )
         .execute(&self.pool)
         .await?;
-        let _ = sqlx::query("ALTER TABLE agents ADD COLUMN result TEXT DEFAULT ''")
-            .execute(&self.pool)
-            .await;
-        for column in [
-            "ALTER TABLE agents ADD COLUMN access TEXT DEFAULT ''",
-            "ALTER TABLE agents ADD COLUMN repo_root TEXT DEFAULT ''",
-            "ALTER TABLE agents ADD COLUMN workspace_subdir TEXT DEFAULT ''",
-            "ALTER TABLE agents ADD COLUMN worktree_path TEXT DEFAULT ''",
-            "ALTER TABLE agents ADD COLUMN worktree_branch TEXT DEFAULT ''",
-            "ALTER TABLE agents ADD COLUMN worktree_base TEXT DEFAULT ''",
-            "ALTER TABLE agents ADD COLUMN worktree_state TEXT DEFAULT ''",
-            "ALTER TABLE agents ADD COLUMN worktree_diff_json TEXT DEFAULT '{}'",
-            "ALTER TABLE agents ADD COLUMN worktree_error TEXT DEFAULT ''",
+        for (column, declaration) in [
+            ("result", "TEXT DEFAULT ''"),
+            ("access", "TEXT DEFAULT ''"),
+            ("repo_root", "TEXT DEFAULT ''"),
+            ("workspace_subdir", "TEXT DEFAULT ''"),
+            ("worktree_path", "TEXT DEFAULT ''"),
+            ("worktree_branch", "TEXT DEFAULT ''"),
+            ("worktree_base", "TEXT DEFAULT ''"),
+            ("worktree_state", "TEXT DEFAULT ''"),
+            ("worktree_diff_json", "TEXT DEFAULT '{}'"),
+            ("worktree_error", "TEXT DEFAULT ''"),
         ] {
-            let _ = sqlx::query(column).execute(&self.pool).await;
+            crate::migrate::ensure_column(&self.pool, "agents", column, declaration).await?;
         }
         sqlx::query("CREATE INDEX IF NOT EXISTS ix_agents_parent ON agents(parent_id, status)")
             .execute(&self.pool)
@@ -237,6 +235,7 @@ impl AgentStore {
         )
         .execute(&self.pool)
         .await?;
+        crate::migrate::baseline(&self.pool, "agents").await?;
         Ok(())
     }
 

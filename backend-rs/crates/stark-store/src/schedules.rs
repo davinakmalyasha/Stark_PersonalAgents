@@ -77,6 +77,7 @@ impl ScheduleStore {
         )
         .execute(&self.pool)
         .await?;
+        crate::migrate::baseline(&self.pool, "schedules").await?;
         Ok(())
     }
 

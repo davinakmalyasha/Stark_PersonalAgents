@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/stark-theme",
+    "crates/stark-kit",
+    "crates/stark-rune-app",
+    "crates/stark-rune-web",
+    "crates/stark-launcher",
+]
+# stark-rune-web links only for wasm32 (MinGW ld cannot link its cdylib on
+# Windows-GNU): host builds/tests skip it unless named with `-p`.
+default-members = [
+    "crates/stark-theme",
+    "crates/stark-kit",
+    "crates/stark-rune-app",
+]
+exclude = ["vendor"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "2.6.4"

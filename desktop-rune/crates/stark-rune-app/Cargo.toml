@@ -1,0 +1,96 @@
+[package]
+name = "stark-rune-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "stark-rune"
+path = "src/main.rs"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+stark-theme = { path = "../stark-theme" }
+stark-kit = { path = "../stark-kit" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+cpal = "0.18"
+sha2 = "0.10"
+zip = { version = "9", default-features = false, features = ["deflate"] }
+minisign-verify = "0.3"
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
+rodio = { version = "0.23", default-features = false, features = ["playback", "mp3", "mp4", "flac", "vorbis", "wav"] }
+# Backend-assisted dictation: stream captured PCM to `stark-server`'s
+# `/api/voice/ws` (the pre-rewrite split). Pure Rust, works on GNU + MSVC.
+tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "=0.2.129"
+wasm-bindgen-futures = "=0.4.79"
+js-sys = "=0.3.106"
+web-sys = { version = "=0.3.106", features = [
+    "Blob",
+    "Document",
+    "Element",
+    "File",
+    "FileList",
+    "FormData",
+    "Headers",
+    "History",
+    "HtmlAnchorElement",
+    "HtmlAudioElement",
+    "HtmlElement",
+    "HtmlMediaElement",
+    "HtmlInputElement",
+    "Location",
+    "Node",
+    "Request",
+    "RequestInit",
+    "RequestMode",
+    "Response",
+    "ReadableStream",
+    "ReadableStreamDefaultReader",
+    "Storage",
+    "Url",
+    "Window",
+] }
+
+[features]
+# Native browser app: the attach button opens the real picker. The web crate
+# disables default features (Rune rejects `native-file-dialog` on wasm32).
+default = ["native-file-dialog"]
+# GPU-free and offline. Enable once the pinned `dev` checkout is fetched:
+# `cargo test -p stark-rune-app --features rune-real`
+rune-real = ["dep:rune", "dep:rune-kit"]
+# Weak dependency feature: only reaches Rune when `rune-real` is on.
+native-file-dialog = ["rune?/native-file-dialog"]
+# Streaming speech-to-text (Moonshine ONNX, MSVC-only prebuilt on Windows).
+voice-stt = ["dep:moonshine-rs"]
+
+[dependencies.rune]
+path = "../../vendor/rune/crates/rune"
+package = "rune"
+default-features = false
+# embedded-fonts: web has no system-font discovery; bundle Inter + Plex Mono
+# so glyphs render in the browser (native keeps working unchanged).
+features = ["embedded-fonts"]
+optional = true
+
+# OpenCode's syntax scanners and diff engine, reused without its skin or block
+# layout: Stark renders every margin/line box itself to match React exactly.
+[dependencies.rune-kit]
+path = "../../vendor/rune/crates/rune-kit"
+package = "rune-kit"
+default-features = false
+optional = true
+
+# Streaming speech-to-text over the Moonshine ONNX runtime. The native
+# libmoonshine prebuilt is MSVC-only on Windows (same gate as the backend's
+# stark-voice `stt` feature); other targets keep an honest stub and the
+# feature compiles to meter-only instead of failing on bindgen/link.
+[target.'cfg(target_env = "msvc")'.dependencies]
+moonshine-rs = { version = "0.2.6", optional = true }

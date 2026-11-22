@@ -43,7 +43,7 @@ mod imp {
             let dir = models_dir.join("stt").join(dirname);
             if !dir.is_dir() {
                 anyhow::bail!(
-                    "Moonshine medium-streaming model missing at {}; run prepare-voice-models.mjs",
+                    "Moonshine medium-streaming model missing at {}; install the voice model bundle",
                     dir.display()
                 );
             }

@@ -6,7 +6,7 @@ use serde_json::Value;
 use zip::write::SimpleFileOptions;
 
 use crate::paths::resolve_workspace_path;
-use crate::{ToolContext, ToolOutcome};
+use crate::{ToolContext, ToolErrorClass, ToolOutcome};
 
 const MAX_PDF_PAGE_CHARS: usize = 3_000;
 const MAX_PDF_CHARS: usize = 50_000;
@@ -18,25 +18,38 @@ pub async fn read_pdf(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         .unwrap_or("")
         .trim();
     if file_path.is_empty() {
-        return ToolOutcome::err("Error: file_path is required");
+        return ToolOutcome::err_class(ToolErrorClass::Args, "Error: file_path is required");
     }
     let path = match input_path(ctx, file_path) {
         Ok(path) => path,
-        Err(error) => return ToolOutcome::err(format!("Error: {error}")),
+        Err(error) => {
+            return ToolOutcome::err_class(ToolErrorClass::Args, format!("Error: {error}"));
+        }
     };
     if !path.is_file() {
-        return ToolOutcome::err(format!("Error: File not found: {file_path}"));
+        return ToolOutcome::err_class(
+            ToolErrorClass::Args,
+            format!("Error: File not found: {file_path}"),
+        );
     }
     if !path
         .extension()
         .and_then(|value| value.to_str())
         .is_some_and(|value| value.eq_ignore_ascii_case("pdf"))
     {
-        return ToolOutcome::err(format!("Error: Not a PDF file: {file_path}"));
+        return ToolOutcome::err_class(
+            ToolErrorClass::Args,
+            format!("Error: Not a PDF file: {file_path}"),
+        );
     }
     let pages = match pdf_extract::extract_text_by_pages(&path) {
         Ok(pages) => pages,
-        Err(error) => return ToolOutcome::err(format!("Error reading PDF: {error}")),
+        Err(error) => {
+            return ToolOutcome::err_class(
+                ToolErrorClass::Tool,
+                format!("Error reading PDF: {error}"),
+            );
+        }
     };
     let page_numbers = args
         .get("page_numbers")
@@ -54,7 +67,7 @@ pub async fn read_pdf(ctx: &ToolContext, args: &Value) -> ToolOutcome {
     } else {
         match parse_pages(page_numbers) {
             Ok(pages) => pages,
-            Err(error) => return ToolOutcome::err(error),
+            Err(error) => return ToolOutcome::err_class(ToolErrorClass::Args, error),
         }
     };
     let mut output = vec![format!(
@@ -110,16 +123,18 @@ pub async fn create_docx(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         .unwrap_or("")
         .trim();
     if file_path.is_empty() {
-        return ToolOutcome::err("Error: file_path is required");
+        return ToolOutcome::err_class(ToolErrorClass::Args, "Error: file_path is required");
     }
     let path = match resolve_workspace_path(&ctx.workspace, file_path) {
         Ok(path) => path,
-        Err(error) => return ToolOutcome::err(format!("Error: {error}")),
+        Err(error) => {
+            return ToolOutcome::err_class(ToolErrorClass::Args, format!("Error: {error}"));
+        }
     };
     if let Some(parent) = path.parent()
         && let Err(error) = std::fs::create_dir_all(parent)
     {
-        return ToolOutcome::err(format!("Error: {error}"));
+        return ToolOutcome::err_class(ToolErrorClass::Tool, format!("Error: {error}"));
     }
     let title = args
         .get("title")
@@ -153,7 +168,10 @@ pub async fn create_docx(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         ("word/document.xml", document),
     ];
     if let Err(error) = write_zip(&path, &entries) {
-        return ToolOutcome::err(format!("Error creating document: {error}"));
+        return ToolOutcome::err_class(
+            ToolErrorClass::Tool,
+            format!("Error creating document: {error}"),
+        );
     }
     ToolOutcome::ok(format!("Created Word document: {}", path.to_string_lossy()))
 }
@@ -165,16 +183,18 @@ pub async fn create_xlsx(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         .unwrap_or("")
         .trim();
     if file_path.is_empty() {
-        return ToolOutcome::err("Error: file_path is required");
+        return ToolOutcome::err_class(ToolErrorClass::Args, "Error: file_path is required");
     }
     let path = match resolve_workspace_path(&ctx.workspace, file_path) {
         Ok(path) => path,
-        Err(error) => return ToolOutcome::err(format!("Error: {error}")),
+        Err(error) => {
+            return ToolOutcome::err_class(ToolErrorClass::Args, format!("Error: {error}"));
+        }
     };
     if let Some(parent) = path.parent()
         && let Err(error) = std::fs::create_dir_all(parent)
     {
-        return ToolOutcome::err(format!("Error: {error}"));
+        return ToolOutcome::err_class(ToolErrorClass::Tool, format!("Error: {error}"));
     }
     let headers = args
         .get("headers")
@@ -209,7 +229,10 @@ pub async fn create_xlsx(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         ("xl/worksheets/sheet1.xml", document),
     ];
     if let Err(error) = write_zip(&path, &entries) {
-        return ToolOutcome::err(format!("Error creating spreadsheet: {error}"));
+        return ToolOutcome::err_class(
+            ToolErrorClass::Tool,
+            format!("Error creating spreadsheet: {error}"),
+        );
     }
     ToolOutcome::ok(format!(
         "Created Excel: {} ({} cols, {} rows)",

@@ -2,7 +2,7 @@
 
 //!
 
-//! The Tauri voice overlay owns the desktop capture stream and the single `/api/voice/ws`
+//! A desktop voice overlay owns the capture stream and the single `/api/voice/ws`
 
 //! connection. Agent tools run inside the server and need to reach into that overlay:
 

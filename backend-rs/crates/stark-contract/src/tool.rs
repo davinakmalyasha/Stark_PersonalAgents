@@ -159,11 +159,11 @@ mod tests {
     fn frozen_contract_loads_and_validates() {
         let file = ToolSpecFile::load(fixture()).expect("tool contract");
 
-        assert_eq!(file.contract_version, 4);
-        assert_eq!(file.tool_count, 57);
-        assert_eq!(file.tools.len(), 57);
+        assert_eq!(file.contract_version, 6);
+        assert_eq!(file.tool_count, 49);
+        assert_eq!(file.tools.len(), 49);
         assert_eq!(file.scope_map.len(), 9);
-        assert_eq!(file.exposed_tools().count(), 49);
+        assert_eq!(file.exposed_tools().count(), 47);
 
         let hidden: BTreeSet<&str> = file
             .tools
@@ -173,16 +173,7 @@ mod tests {
             .collect();
         assert_eq!(
             hidden,
-            BTreeSet::from([
-                "ast_search",
-                "browser_navigate",
-                "browser_extract",
-                "browser_screenshot",
-                "browser_close",
-                "github_apply_gate",
-                "update_feature",
-                "update_project_meta",
-            ])
+            BTreeSet::from(["update_feature", "update_project_meta"])
         );
 
         assert_eq!(
@@ -192,10 +183,10 @@ mod tests {
         assert_eq!(file.orphan_docs, vec!["browser_click", "browser_fill"]);
         assert!(file.tool("propose_plan").is_none());
 
-        assert_eq!(file.scope_map["developer"].len(), 17);
-        assert_eq!(file.scope_map["coder"].len(), 18);
+        assert_eq!(file.scope_map["developer"].len(), 15);
+        assert_eq!(file.scope_map["coder"].len(), 16);
         assert!(file.scope_map["coder"].contains(&"run_code".to_string()));
-        assert_eq!(file.scope_map["general"].len(), 20);
+        assert_eq!(file.scope_map["general"].len(), 18);
         assert_eq!(file.scope_map["house"].len(), 12);
         assert_eq!(file.scope_map["dfd"].len(), 9);
         assert_eq!(file.scope_map["orchestrator"].len(), 16);

@@ -23,7 +23,9 @@ mod plan;
 mod processes;
 mod questions;
 mod read;
+pub mod retention;
 mod screen;
+pub mod search;
 mod skills;
 mod truncate;
 mod verify;
@@ -35,6 +37,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::{Value, json};
 use stark_contract::{PlanItem, ToolSpecFile};
+use tokio_util::sync::CancellationToken;
 
 pub use approvals::ApprovalCache;
 pub use checkpoint::{Checkpoint, RestoreReport, SnapshotGroup};
@@ -68,15 +71,16 @@ pub use mcp::{McpManager, ServerConfig as McpServerConfig, init as init_mcp, sea
 pub use plan::{PlanError, PlanStore, update_plan};
 pub use processes::{ProcessManager, ProcessStatus};
 pub use questions::QuestionBroker;
+pub use retention::{RetentionPolicy, RetentionReport, free_bytes, sweep_harness};
 pub use screen::{
     PendingImage, ScreenBridge, drain_images, latest_continuous_image, queue_image, screen_bridge,
 };
 pub use skills::{catalog_block_for, catalog_block_for_agent};
 pub use verify::{AcceptanceVerdict, CriterionStatus, CriterionVerdict, evaluate_acceptance};
 
-/// Tool membership and guard flags now live in [`inventory`]: one `ToolMeta`
-/// entry per tool derives the implemented set, the plan-write guard, the
-/// read-only guard, and the frontend labels. The frozen wire schema stays in
+/// Tool membership and guard flags live in [`inventory`]: one `ToolMeta`
+/// entry per tool derives the implemented set, the plan-write guard, and the
+/// read-only guard. The frozen wire schema stays in
 /// `backend-rs/specs/tool-specs.json`.
 pub const MCP_EAGER_LIMIT: usize = 8;
 
@@ -116,6 +120,11 @@ pub struct ToolContext {
     /// shaped `mcp__<server>__<tool>`.
     pub mcp_servers: Option<Arc<HashSet<String>>>,
     pub code_delta: Option<Arc<dyn Fn(stark_contract::Delta) + Send + Sync>>,
+    /// Cancels cancel-safe tools when the user stops the run. Tools that
+    /// mutate files are deliberately not wrapped: Stop must never leave a
+    /// half-written file. Codex kills the process group of a cancelled exec
+    /// (`core/src/exec.rs`); this is the same contract for Stark tools.
+    pub cancel: CancellationToken,
 }
 
 impl ToolContext {
@@ -145,6 +154,7 @@ impl ToolContext {
             allowed_tools: None,
             mcp_servers: None,
             code_delta: None,
+            cancel: CancellationToken::new(),
         }
     }
 
@@ -212,6 +222,13 @@ impl ToolContext {
         self
     }
 
+    /// Share the run's cancellation token. Direct dispatch and tests keep a
+    /// fresh, never-cancelled token.
+    pub fn with_cancel(mut self, cancel: CancellationToken) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
     fn tool_allowed(&self, name: &str) -> bool {
         // MCP tools are governed by the server allowlist, not the tool list:
         // `tools: ["read"]` + `mcp: ["github"]` must still expose GitHub tools.
@@ -270,6 +287,62 @@ impl ToolContext {
     }
 }
 
+/// Why a call failed, so the harness can append the right repair hint instead
+/// of one generic nudge. Mirrors Codex's split between argument rejection,
+/// policy denial, exec failure, and transport failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolErrorClass {
+    /// Wrong or missing arguments: retry with corrected arguments.
+    Args,
+    /// Unknown, removed, or unimplemented tool.
+    Unknown,
+    /// Policy/scope/approval denial: retrying unchanged fails identically.
+    Blocked,
+    /// Timed out: narrow the work or resume the session/job.
+    Timeout,
+    /// Transport or process failure below the tool (MCP stdio, CLI, network).
+    Transport,
+    /// Command ran and exited non-zero: read the output, fix the command.
+    Exec,
+    /// Tool ran and reported a failure: read the message before retrying.
+    Tool,
+    /// The user stopped the run. The turn ends; do not retry the call.
+    Cancelled,
+}
+
+impl ToolErrorClass {
+    /// One-line, model-actionable repair guidance. Codex keeps this in the
+    /// tool result so the next sample sees it even after compaction.
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::Args => {
+                "Fix the argument names/values against the schema and retry; the same call will fail the same way."
+            }
+            Self::Unknown => {
+                "This tool does not exist in this scope. Use tool_search for MCP tools or pick a listed built-in; do not call it again."
+            }
+            Self::Blocked => {
+                "A policy blocked this call. Changing the arguments will not help unless the request itself changes; ask the user once, or work another way."
+            }
+            Self::Timeout => {
+                "Timed out. Reduce the work size, raise timeoutMs, or resume the existing session/job instead of repeating the call."
+            }
+            Self::Transport => {
+                "The layer below the tool failed, not the request. Retry once; if it fails again, check the server/process status and report it."
+            }
+            Self::Exec => {
+                "The command exited non-zero. Read the output above, fix the command or environment, and change what you run next."
+            }
+            Self::Tool => {
+                "The tool reported a failure. Read the message before retrying; repeating the identical call is not a retry strategy."
+            }
+            Self::Cancelled => {
+                "The user stopped this run. Do not retry the call; wait for their next instruction."
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ToolOutcome {
     pub content: String,
@@ -277,6 +350,8 @@ pub struct ToolOutcome {
     pub exit_code: Option<i32>,
     pub plan: Option<BTreeMap<String, Vec<PlanItem>>>,
     pub children: Vec<Value>,
+    /// Failure class for harness-side repair guidance (`None` on success).
+    pub class: Option<ToolErrorClass>,
 }
 
 impl ToolOutcome {
@@ -287,6 +362,7 @@ impl ToolOutcome {
             exit_code: None,
             plan: None,
             children: Vec::new(),
+            class: None,
         }
     }
 
@@ -297,6 +373,19 @@ impl ToolOutcome {
             exit_code: None,
             plan: None,
             children: Vec::new(),
+            class: None,
+        }
+    }
+
+    /// Typed failure: the harness can append the class's repair hint.
+    pub fn err_class(class: ToolErrorClass, content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            is_error: true,
+            exit_code: None,
+            plan: None,
+            children: Vec::new(),
+            class: Some(class),
         }
     }
 
@@ -307,7 +396,13 @@ impl ToolOutcome {
             exit_code,
             plan: None,
             children: Vec::new(),
+            class: None,
         }
+    }
+
+    pub fn with_class(mut self, class: ToolErrorClass) -> Self {
+        self.class = Some(class);
+        self
     }
 
     pub fn with_plan(mut self, plan: BTreeMap<String, Vec<PlanItem>>) -> Self {
@@ -318,6 +413,36 @@ impl ToolOutcome {
     pub fn with_children(mut self, children: Vec<Value>) -> Self {
         self.children = children;
         self
+    }
+}
+
+/// A tool stopped by the user. The run loop notices `ctx.cancel` and ends the
+/// turn through its abort path, so this result is only visible to callers that
+/// dispatch a tool directly.
+pub fn cancelled_outcome(tool: &str) -> ToolOutcome {
+    ToolOutcome::err_class(
+        ToolErrorClass::Cancelled,
+        format!("[CANCELLED] {tool} stopped because the run was cancelled."),
+    )
+}
+
+/// Race a cancel-safe tool against the run's cancellation token.
+///
+/// Only use this for tools whose future can be dropped without corrupting
+/// state: shell jobs (killed explicitly), the browser CLI and MCP calls
+/// (`kill_on_drop` / server survives), and status waits. File writes and patch
+/// application are never wrapped.
+pub(crate) async fn cancelable<F>(ctx: &ToolContext, tool: &str, future: F) -> ToolOutcome
+where
+    F: std::future::Future<Output = ToolOutcome>,
+{
+    if ctx.cancel.is_cancelled() {
+        return cancelled_outcome(tool);
+    }
+    tokio::select! {
+        biased;
+        _ = ctx.cancel.cancelled() => cancelled_outcome(tool),
+        outcome = future => outcome,
     }
 }
 
@@ -708,28 +833,16 @@ fn argument_matches(value: &Value, kind: &str) -> bool {
 
 pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcome {
     if !ctx.tool_allowed(name) {
-        return ToolOutcome::err(format!(
-            "[BLOCKED] Tool '{name}' is not enabled for this agent. Change the agent's tools config or continue without it."
-        ));
-    }
-    // Enforce the frozen scope contract at dispatch, not only when
-    // advertising. Without this a hallucinated legacy name (read_file,
-    // run_command, ...) skipped the v2 permission gates.
-    if !name.starts_with("mcp__")
-        && let Some(allowed) = contract().scope_map.get(&ctx.scope)
-        && !allowed.iter().any(|tool| tool == name)
-    {
-        return ToolOutcome::err(format!(
-            "[BLOCKED] Tool '{name}' is not in the '{}' scope contract. Use one of: {}",
-            ctx.scope,
-            allowed.join(", ")
-        ));
-    }
-    if ctx.depth > 0 && matches!(name, "ask_user_question" | "ask_user") {
-        return ToolOutcome::err(
-            "[BLOCKED] Subagents run non-interactively: the user cannot answer here. Do not ask questions. Decide with the information you have, or report the decision/blocker to your parent in your final message.",
+        return ToolOutcome::err_class(
+            ToolErrorClass::Blocked,
+            format!(
+                "[BLOCKED] Tool '{name}' is not enabled for this agent. Change the agent's tools config or continue without it."
+            ),
         );
     }
+    // Removed tools answer with their replacement first: a legacy name is not
+    // a scope problem, and telling the model to "use a listed tool" hides the
+    // exact rename it needs.
     const LEGACY_REPLACEMENTS: &[(&str, &str)] = &[
         ("read_file", "read"),
         ("edit_file", "edit"),
@@ -743,9 +856,43 @@ pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcom
         .iter()
         .find(|(legacy, _)| *legacy == name)
     {
-        return ToolOutcome::err(format!(
-            "[BLOCKED] Tool '{legacy}' was removed. Use '{replacement}' instead."
-        ));
+        return ToolOutcome::err_class(
+            ToolErrorClass::Unknown,
+            format!("[BLOCKED] Tool '{legacy}' was removed. Use '{replacement}' instead."),
+        );
+    }
+    // Enforce the frozen scope contract at dispatch, not only when
+    // advertising. Without this a hallucinated legacy name (read_file,
+    // run_command, ...) skipped the v2 permission gates.
+    if !name.starts_with("mcp__")
+        && let Some(allowed) = contract().scope_map.get(&ctx.scope)
+        && !allowed.iter().any(|tool| tool == name)
+    {
+        // A name that is not in the frozen contract at all is a hallucination,
+        // not a policy denial: say so, and list what exists.
+        if contract().tool(name).is_none() {
+            return ToolOutcome::err_class(
+                ToolErrorClass::Unknown,
+                format!(
+                    "Error: tool '{name}' does not exist in this harness. Use tool_search to find MCP tools, or one of: {}",
+                    allowed.join(", ")
+                ),
+            );
+        }
+        return ToolOutcome::err_class(
+            ToolErrorClass::Blocked,
+            format!(
+                "[BLOCKED] Tool '{name}' is not in the '{}' scope contract. Use one of: {}",
+                ctx.scope,
+                allowed.join(", ")
+            ),
+        );
+    }
+    if ctx.depth > 0 && matches!(name, "ask_user_question" | "ask_user") {
+        return ToolOutcome::err_class(
+            ToolErrorClass::Blocked,
+            "[BLOCKED] Subagents run non-interactively: the user cannot answer here. Do not ask questions. Decide with the information you have, or report the decision/blocker to your parent in your final message.",
+        );
     }
     if let Some(tool) = contract().tool(name)
         && let Some(required) = tool.required.iter().find(|required| {
@@ -766,9 +913,12 @@ pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcom
             .get(required.as_str())
             .map(Value::to_string)
             .unwrap_or_else(|| "nothing".to_string());
-        return ToolOutcome::err(format!(
-            "Error: {name} requires '{required}' ({kind}). Got: {received}. {hint} Retry with corrected arguments."
-        ));
+        return ToolOutcome::err_class(
+            ToolErrorClass::Args,
+            format!(
+                "Error: {name} requires '{required}' ({kind}). Got: {received}. {hint} Retry with corrected arguments."
+            ),
+        );
     }
     if let Some(tool) = contract().tool(name) {
         for required in &tool.required {
@@ -783,28 +933,32 @@ pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcom
                 continue;
             };
             if !argument_matches(value, kind) {
-                return ToolOutcome::err(format!(
-                    "Error: {name}.{required} must be {kind}, got {}. Retry with corrected arguments.",
-                    value
-                ));
+                return ToolOutcome::err_class(
+                    ToolErrorClass::Args,
+                    format!(
+                        "Error: {name}.{required} must be {kind}, got {}. Retry with corrected arguments.",
+                        value
+                    ),
+                );
             }
         }
     }
     if let Some(reason) = plan_mode_denial(&ctx.mode, name, args) {
-        return ToolOutcome::err(reason);
+        return ToolOutcome::err_class(ToolErrorClass::Blocked, reason);
     }
     if ctx.access == "read"
         && let Some(reason) = read_only_denial(name, args, ctx)
     {
-        return ToolOutcome::err(reason);
+        return ToolOutcome::err_class(ToolErrorClass::Blocked, reason);
     }
     if name.starts_with("mcp__") {
         if ctx.access == "read" {
-            return ToolOutcome::err(
+            return ToolOutcome::err_class(
+                ToolErrorClass::Blocked,
                 "[BLOCKED] Read-only agent cannot call MCP tools. Report findings instead.",
             );
         }
-        return mcp::call(name, args, ctx).await;
+        return cancelable(ctx, name, mcp::call(name, args, ctx)).await;
     }
     if name == "run_code" {
         return codemode::handle(ctx, args).await;
@@ -819,7 +973,10 @@ pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcom
             .and_then(Value::as_str)
         {
             Some(patch) if !patch.trim().is_empty() => crate::patch::apply_patch(ctx, patch).await,
-            _ => ToolOutcome::err("Error: apply_patch requires a non-empty 'patch' string"),
+            _ => ToolOutcome::err_class(
+                ToolErrorClass::Args,
+                "Error: apply_patch requires a non-empty 'patch' string",
+            ),
         },
         "edit" => ds_fs::edit(ctx, args).await,
         "glob" => ds_fs::glob(ctx, args).await,
@@ -827,10 +984,8 @@ pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcom
         "ask_user_question" => ds_session::ask_user_question(ctx, args).await,
         "skill" => skills::skill(ctx, args).await,
         "tool_search" => mcp::search_tools(ctx, args).await,
-        "web_search" => ds_web::web_search(ctx, args).await,
-        "web_fetch" => ds_web::web_fetch(ctx, args).await,
         "update_plan" => update_plan(ctx, args).await,
-        "browser_act" => browser::browser_act(ctx, args).await,
+        "browser_act" => cancelable(ctx, "browser_act", browser::browser_act(ctx, args)).await,
         "house_get_state" => house::house_get_state(ctx, args).await,
         "house_get_device" => house::house_get_device(ctx, args).await,
         "house_set_device" => house::house_set_device(ctx, args).await,
@@ -846,9 +1001,10 @@ pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcom
         "create_xlsx" => docs::create_xlsx(ctx, args).await,
         "memory" => memory::handle(ctx, args).await,
         "personal_os" => personal::personal_os(ctx, args).await,
-        other => ToolOutcome::err(format!(
-            "Error: tool '{other}' is not implemented in the Rust Phase 1 backend"
-        )),
+        other => ToolOutcome::err_class(
+            ToolErrorClass::Unknown,
+            format!("Error: tool '{other}' is not implemented by this backend"),
+        ),
     }
 }
 
@@ -865,6 +1021,86 @@ mod tests {
             .iter()
             .filter_map(|spec| spec["function"]["name"].as_str())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn dispatch_failures_carry_a_typed_class() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path()).with_scope("developer");
+
+        // Unknown tool name.
+        let unknown = dispatch("no_such_tool", &json!({}), &ctx).await;
+        assert_eq!(
+            unknown.class,
+            Some(ToolErrorClass::Unknown),
+            "{}",
+            unknown.content
+        );
+
+        // Removed legacy name.
+        let legacy = dispatch("run_command", &json!({"command": "ls"}), &ctx).await;
+        assert_eq!(
+            legacy.class,
+            Some(ToolErrorClass::Unknown),
+            "{}",
+            legacy.content
+        );
+
+        // Missing required argument.
+        let missing = dispatch("read", &json!({}), &ctx).await;
+        assert_eq!(
+            missing.class,
+            Some(ToolErrorClass::Args),
+            "{}",
+            missing.content
+        );
+
+        // Scope denial.
+        let house = context(dir.path()).with_scope("house");
+        let blocked = dispatch("apply_patch", &json!({"input": "*** Begin Patch"}), &house).await;
+        assert!(
+            blocked.class.is_some(),
+            "denials must be typed: {}",
+            blocked.content
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_token_short_circuits_cancel_safe_tools() {
+        use tokio_util::sync::CancellationToken;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let ctx = context(dir.path()).with_cancel(cancel);
+        // Cancel-safe tools return without spawning when already cancelled.
+        let cancelled = dispatch("browser_act", &json!({"action": "extract"}), &ctx).await;
+        assert!(cancelled.is_error, "{}", cancelled.content);
+        assert_eq!(cancelled.class, Some(ToolErrorClass::Cancelled));
+        // File reads are deliberately not wrapped: Stop must never leave a
+        // half-written file, and reads complete normally.
+        std::fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
+        let read = dispatch("read", &json!({"file_path": "a.txt"}), &ctx).await;
+        assert!(!read.is_error, "{}", read.content);
+        assert!(read.content.contains("hello"), "{}", read.content);
+    }
+
+    #[test]
+    fn every_error_class_has_actionable_guidance() {
+        for class in [
+            ToolErrorClass::Args,
+            ToolErrorClass::Unknown,
+            ToolErrorClass::Blocked,
+            ToolErrorClass::Timeout,
+            ToolErrorClass::Transport,
+            ToolErrorClass::Exec,
+            ToolErrorClass::Tool,
+            ToolErrorClass::Cancelled,
+        ] {
+            let hint = class.hint();
+            assert!(hint.len() > 40, "{class:?} hint too thin: {hint}");
+            assert!(hint.ends_with('.'), "{class:?} hint not a sentence: {hint}");
+        }
     }
 
     #[test]
@@ -949,13 +1185,14 @@ mod tests {
         assert!(names.contains(&"edit"));
         assert!(names.contains(&"spawn_agent"));
         assert!(names.contains(&"update_plan"));
-        assert!(names.contains(&"web_fetch"));
+        assert!(!names.contains(&"web_fetch"));
+        assert!(!names.contains(&"web_search"));
         assert!(!names.contains(&"read_file"));
         assert!(!names.contains(&"read_pdf"));
 
         let general = tool_specs_for_scope("build", "general");
         let names = tool_names(&general);
-        assert_eq!(names.len(), 20);
+        assert_eq!(names.len(), 18);
         assert!(names.contains(&"bash"));
         assert!(names.contains(&"read"));
         assert!(names.contains(&"glob"));
@@ -1013,7 +1250,7 @@ mod tests {
         assert!(!names.contains(&"agent"));
         assert_eq!(
             tool_names(&tool_specs_for_scope("build", "agent")).len(),
-            49
+            47
         );
     }
 
@@ -1025,8 +1262,8 @@ mod tests {
         let coder_specs = tool_specs_for_scope("build", "coder");
         let coder: std::collections::BTreeSet<&str> =
             tool_names(&coder_specs).into_iter().collect();
-        assert_eq!(developer.len(), 17);
-        assert_eq!(coder.len(), 18);
+        assert_eq!(developer.len(), 15);
+        assert_eq!(coder.len(), 16);
         assert!(coder.contains("run_code"));
         assert!(!developer.contains("run_code"));
         let extra: Vec<&&str> = coder.difference(&developer).collect();
@@ -1344,11 +1581,23 @@ mod tests {
         let scoped = context(dir.path()).with_scope("developer");
         let out_of_scope = dispatch("read_file", &json!({"file_path": "a.txt"}), &scoped).await;
         assert!(out_of_scope.is_error, "{}", out_of_scope.content);
+        // A removed name answers with its replacement in every scope, before
+        // the scope check can turn it into a generic "pick a listed tool".
         assert!(
-            out_of_scope.content.contains("scope contract"),
+            out_of_scope.content.contains("was removed"),
             "{}",
             out_of_scope.content
         );
+        assert_eq!(out_of_scope.class, Some(ToolErrorClass::Unknown));
+        // A real contract tool outside the scope is a policy denial.
+        let denied = dispatch("personal_os", &json!({"action": "overview"}), &scoped).await;
+        assert!(denied.is_error, "{}", denied.content);
+        assert!(
+            denied.content.contains("scope contract"),
+            "{}",
+            denied.content
+        );
+        assert_eq!(denied.class, Some(ToolErrorClass::Blocked));
         let legacy = dispatch(
             "read_file",
             &json!({"file_path": "a.txt"}),
@@ -1409,7 +1658,7 @@ mod tests {
             .expect("job id");
         let polled = dispatch(
             "job",
-            &json!({"action": "output", "job_id": job_id, "wait": true, "timeout_ms": 5000}),
+            &json!({"action": "output", "job_id": job_id, "wait": true, "timeout_ms": 15000}),
             &ctx,
         )
         .await;
@@ -1447,7 +1696,7 @@ mod tests {
 
         let logs = dispatch(
             "job",
-            &json!({"action": "output", "job_id": job_id, "wait": true, "timeout_ms": 5000}),
+            &json!({"action": "output", "job_id": job_id, "wait": true, "timeout_ms": 15000}),
             &ctx,
         )
         .await;
@@ -1538,8 +1787,6 @@ mod v2_surface_tests {
             "grep",
             "ask_user_question",
             "skill",
-            "web_search",
-            "web_fetch",
             "spawn_agent",
             "message_agent",
             "wait_agent",

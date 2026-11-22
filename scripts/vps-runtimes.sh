@@ -14,7 +14,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends \
   build-essential pkg-config libssl-dev git curl ca-certificates gnupg \
-  python3 python3-venv python3-pip jq unzip xz-utils \
+  python3 python3-venv python3-pip jq unzip sqlite3 xz-utils \
   libasound2t64 libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
   libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
   libgbm1 libpango-1.0-0 libcairo2 libasound2-plugins fonts-liberation

@@ -6,6 +6,8 @@
 //! and warning is appended as it happens, so a crash or network failure
 //! leaves the partial work intact.
 
+use std::collections::HashSet;
+
 use serde_json::{Value, json};
 use stark_providers::ChatMessage;
 use stark_store::rollout::{
@@ -45,6 +47,19 @@ pub fn messages_from_rollout(lines: &[RolloutLine]) -> Vec<ChatMessage> {
     {
         start = index + 1;
     }
+    // Accepted outputs keep their identity: collect every call id first so
+    // outputs can be paired to their call (Codex parity). An output without
+    // a matching call is an orphan the provider would reject, so it is
+    // dropped instead of replayed. Identical bodies with distinct ids are
+    // all kept: pairing is by call id, never by content.
+    let mut call_ids = HashSet::new();
+    for line in &lines[start..] {
+        if let RolloutItem::ResponseItem { payload, .. } = &line.item
+            && let ResponseItemPayload::FunctionCall { call_id, .. } = payload
+        {
+            call_ids.insert(call_id.clone());
+        }
+    }
     for line in &lines[start..] {
         match &line.item {
             RolloutItem::ResponseItem { payload, .. } => match payload {
@@ -57,7 +72,10 @@ pub fn messages_from_rollout(lines: &[RolloutLine]) -> Vec<ChatMessage> {
                             messages.push(ChatMessage::assistant(&text));
                         }
                     } else if role == "toolResult" || role == "tool" {
-                        // Tool outputs are re-attached by call below.
+                        // A `Message` item carries no `tool_call_id`, so it
+                        // can never be paired to its call. Only
+                        // `FunctionCallOutput` items (below) replay as tool
+                        // messages; anything else would be an orphan.
                     }
                 }
                 ResponseItemPayload::FunctionCall {
@@ -78,7 +96,9 @@ pub fn messages_from_rollout(lines: &[RolloutLine]) -> Vec<ChatMessage> {
                 ResponseItemPayload::FunctionCallOutput {
                     call_id, output, ..
                 } => {
-                    messages.push(ChatMessage::tool(call_id, output));
+                    if call_ids.contains(call_id) {
+                        messages.push(ChatMessage::tool(call_id, output));
+                    }
                 }
                 ResponseItemPayload::Reasoning { .. } => {}
             },
@@ -116,6 +136,34 @@ pub fn messages_from_rollout(lines: &[RolloutLine]) -> Vec<ChatMessage> {
     messages
 }
 
+/// Images saved on a retained-tail entry, restored on replay so visuals
+/// survive compaction and restarts.
+fn entry_images(entry: &Value) -> Vec<stark_providers::ImagePart> {
+    entry
+        .get("images")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let url = item.get("url")?.as_str()?;
+                    if url.trim().is_empty() {
+                        return None;
+                    }
+                    Some(stark_providers::ImagePart {
+                        url: url.to_string(),
+                        note: item
+                            .get("note")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn entry_message(entry: &Value) -> Option<ChatMessage> {
     let role = entry.get("role")?.as_str()?;
     match role {
@@ -150,7 +198,22 @@ fn entry_message(entry: &Value) -> Option<ChatMessage> {
                 }
             }
             if calls.is_empty() {
-                (!content.trim().is_empty()).then(|| ChatMessage::assistant(content))
+                if content.trim().is_empty() && entry_images(entry).is_empty() {
+                    return None;
+                }
+                let images = entry_images(entry);
+                if images.is_empty() {
+                    (!content.trim().is_empty()).then(|| ChatMessage::assistant(content))
+                } else {
+                    Some(ChatMessage {
+                        role: "assistant".to_string(),
+                        content: Some(content),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        name: None,
+                        images,
+                    })
+                }
             } else {
                 Some(ChatMessage::assistant_tool_calls(
                     (!content.trim().is_empty()).then_some(content),
@@ -158,9 +221,15 @@ fn entry_message(entry: &Value) -> Option<ChatMessage> {
                 ))
             }
         }
-        "user" => Some(ChatMessage::user(content_text(
-            entry.get("content").unwrap_or(&Value::Null),
-        ))),
+        "user" => {
+            let content = content_text(entry.get("content").unwrap_or(&Value::Null));
+            let images = entry_images(entry);
+            if images.is_empty() {
+                Some(ChatMessage::user(content))
+            } else {
+                Some(ChatMessage::user_with_images(content, images))
+            }
+        }
         _ => None,
     }
 }
@@ -716,5 +785,130 @@ mod tests {
                     .as_deref()
                     .is_some_and(|content| content.contains("interrupted"))
         }));
+    }
+
+    fn call_line(call_id: &str, name: &str) -> RolloutLine {
+        RolloutLine {
+            timestamp: "t".to_string(),
+            ordinal: Some(0),
+            item: RolloutItem::ResponseItem {
+                payload: ResponseItemPayload::FunctionCall {
+                    id: None,
+                    call_id: call_id.to_string(),
+                    name: name.to_string(),
+                    arguments: "{}".to_string(),
+                },
+                metadata: None,
+            },
+        }
+    }
+
+    fn output_line(call_id: &str, name: &str, output: &str) -> RolloutLine {
+        RolloutLine {
+            timestamp: "t".to_string(),
+            ordinal: Some(1),
+            item: RolloutItem::ResponseItem {
+                payload: ResponseItemPayload::FunctionCallOutput {
+                    call_id: call_id.to_string(),
+                    name: name.to_string(),
+                    output: output.to_string(),
+                    is_error: false,
+                },
+                metadata: None,
+            },
+        }
+    }
+
+    #[test]
+    fn accepted_output_without_later_inference_is_kept() {
+        // Codex parity: an accepted output that never appears in a later
+        // inference request must still replay (it is the latest evidence).
+        let lines = vec![
+            call_line("call-1", "read"),
+            output_line("call-1", "read", "data"),
+        ];
+        let messages = messages_from_rollout(&lines);
+        assert!(messages.iter().any(|m| {
+            m.tool_call_id.as_deref() == Some("call-1") && m.content.as_deref() == Some("data")
+        }));
+    }
+
+    #[test]
+    fn identical_outputs_with_distinct_ids_are_all_kept() {
+        // Pairing is by call id, never by content: two calls returning the
+        // same body replay as two tool messages.
+        let lines = vec![
+            call_line("call-1", "read"),
+            call_line("call-2", "read"),
+            output_line("call-1", "read", "same"),
+            output_line("call-2", "read", "same"),
+        ];
+        let messages = messages_from_rollout(&lines);
+        let outputs: Vec<&ChatMessage> = messages
+            .iter()
+            .filter(|m| m.tool_call_id.is_some())
+            .collect();
+        assert_eq!(outputs.len(), 2);
+        assert!(
+            outputs
+                .iter()
+                .any(|m| m.tool_call_id.as_deref() == Some("call-1"))
+        );
+        assert!(
+            outputs
+                .iter()
+                .any(|m| m.tool_call_id.as_deref() == Some("call-2"))
+        );
+    }
+
+    #[test]
+    fn trimmed_output_replays_verbatim() {
+        let lines = vec![
+            call_line("call-1", "read"),
+            output_line("call-1", "read", "  padded\n"),
+        ];
+        let messages = messages_from_rollout(&lines);
+        assert!(messages.iter().any(|m| {
+            m.tool_call_id.as_deref() == Some("call-1")
+                && m.content.as_deref() == Some("  padded\n")
+        }));
+    }
+
+    #[test]
+    fn orphan_output_without_call_is_dropped() {
+        // An output with no matching call would make the provider reject
+        // the request; drop it instead of replaying an orphan.
+        let lines = vec![output_line("ghost", "read", "data")];
+        let messages = messages_from_rollout(&lines);
+        assert!(!messages.iter().any(|m| m.tool_call_id.is_some()));
+    }
+
+    #[test]
+    fn retained_tail_images_replay() {
+        // A retained-tail entry carrying images rebuilds a message with its
+        // ImageParts, so visuals survive compaction and restarts.
+        let entry = json!({
+            "type": "message",
+            "role": "user",
+            "content": "look",
+            "images": [{"url": "data:image/png;base64,abc", "note": "screen"}],
+        });
+        let lines = vec![RolloutLine {
+            timestamp: "t0".to_string(),
+            ordinal: Some(0),
+            item: RolloutItem::Compacted {
+                payload: CompactedPayload {
+                    summary: "s".to_string(),
+                    retained_tail: vec![entry],
+                },
+            },
+        }];
+        let messages = messages_from_rollout(&lines);
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.images.iter().any(|image| image.note == "screen")),
+            "{messages:?}"
+        );
     }
 }

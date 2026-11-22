@@ -69,6 +69,9 @@ struct ManagedProcess {
     read_pos: Arc<Mutex<usize>>,
     status: Arc<Mutex<ProcessStatus>>,
     started: Instant,
+    /// Job Object / process group owner for this tree. `None` means kernel
+    /// containment could not be created; the child is still killed directly.
+    tree: Option<stark_sandbox::process_tree::ProcessTree>,
 }
 
 impl ManagedProcess {
@@ -139,16 +142,26 @@ impl ManagedProcess {
             .map_err(|error| format!("failed to write PTY input: {error}"))
     }
 
+    fn terminate_tree(&self) {
+        if let Some(tree) = &self.tree
+            && let Err(error) = tree.terminate()
+        {
+            tracing::warn!("failed to terminate process tree {}: {error}", self.pid);
+        }
+    }
+
     fn kill(&self) -> Result<(), String> {
+        // Kill the whole tree first. On Windows TerminateJobObject also stops
+        // the root; on Unix killpg reaches descendants in the group. The
+        // direct child kill below is a fallback for jobs without containment.
+        self.terminate_tree();
         match self.io.as_ref() {
             ProcessIo::Pipes(process) => {
                 let mut child = process.child.lock().unwrap();
                 if let Some(child) = child.as_mut()
                     && !matches!(*self.status.lock().unwrap(), ProcessStatus::Exited(_))
                 {
-                    child
-                        .start_kill()
-                        .map_err(|error| format!("failed to kill process: {error}"))?;
+                    let _ = child.start_kill();
                 }
             }
             ProcessIo::Pty(process) => {
@@ -156,9 +169,7 @@ impl ManagedProcess {
                 if let Some(child) = child.as_mut()
                     && !matches!(*self.status.lock().unwrap(), ProcessStatus::Exited(_))
                 {
-                    child
-                        .kill()
-                        .map_err(|error| format!("failed to kill process: {error}"))?;
+                    let _ = child.kill();
                 }
             }
         }
@@ -167,6 +178,15 @@ impl ManagedProcess {
             *status = ProcessStatus::Killed;
         }
         Ok(())
+    }
+}
+
+impl Drop for ManagedProcess {
+    fn drop(&mut self) {
+        // Closing a Windows job with KILL_ON_JOB_CLOSE is the final backstop
+        // for descendants that outlived a normal root exit. On Unix this is a
+        // no-op when the tree was already terminated.
+        self.terminate_tree();
     }
 }
 
@@ -233,6 +253,7 @@ impl ProcessManager {
         name: Option<String>,
         tty: bool,
     ) -> Result<SpawnedProcess, String> {
+        stark_sandbox::ensure_enforced(workdir)?;
         if self.by_id.len() >= MAX_PROCESSES {
             return Err(format!(
                 "unified exec process limit reached ({MAX_PROCESSES}). List jobs, read their logs, then kill finished ones before starting another."
@@ -242,7 +263,7 @@ impl ProcessManager {
         let id = self.allocate_id();
         let name = name.unwrap_or_else(|| format!("exec-{id}"));
         let output = Arc::new(Mutex::new(HeadTailBuffer::default()));
-        let (io, pid) = if tty {
+        let (io, pid, tree) = if tty {
             self.spawn_pty(command, workdir, owner, output.clone())?
         } else {
             self.spawn_pipes(command, workdir, owner, output.clone())?
@@ -259,6 +280,7 @@ impl ProcessManager {
             read_pos: Arc::new(Mutex::new(0)),
             status: Arc::new(Mutex::new(ProcessStatus::Running)),
             started: Instant::now(),
+            tree,
         });
         self.processes.insert(name.clone(), managed.clone());
         self.by_id.insert(id, managed.clone());
@@ -273,19 +295,35 @@ impl ProcessManager {
         workdir: &Path,
         owner: &str,
         output: Arc<Mutex<HeadTailBuffer>>,
-    ) -> Result<(ProcessIo, u32), String> {
+    ) -> Result<
+        (
+            ProcessIo,
+            u32,
+            Option<stark_sandbox::process_tree::ProcessTree>,
+        ),
+        String,
+    > {
         let mut process = Command::new(find_bash());
         process
             .args(["--noprofile", "--norc", "-c"])
             .arg(command)
             .current_dir(workdir)
-            .env("STARK_WORKSPACE", workdir)
-            .env("STARK_SESSION_ID", owner)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        #[cfg(unix)]
+        {
+            // Put the shell in its own process group so a timeout can kill
+            // descendants as well as the shell.
+            process.process_group(0);
+        }
         stark_sandbox::for_workspace(workdir).wrap_tokio_command(&mut process);
+        // Tokio has no `get_envs`, and isolation clears the environment, so
+        // per-spawn variables must be set after wrapping.
+        process
+            .env("STARK_WORKSPACE", workdir)
+            .env("STARK_SESSION_ID", owner);
 
         let mut child = process
             .spawn()
@@ -295,6 +333,33 @@ impl ProcessManager {
                 )
             })?;
         let pid = child.id().unwrap_or(0);
+        #[cfg(windows)]
+        let mut tree = stark_sandbox::process_tree::create().ok();
+        #[cfg(unix)]
+        let tree = stark_sandbox::process_tree::ProcessTree::for_pid(pid).ok();
+        #[cfg(not(any(windows, unix)))]
+        let tree = None;
+
+        #[cfg(windows)]
+        if let Some(job) = tree.as_ref() {
+            match child.raw_handle() {
+                Some(handle) => {
+                    if let Err(error) = job.assign(handle) {
+                        tracing::warn!(
+                            "Windows process-tree containment unavailable for pid {pid}: {error}"
+                        );
+                        tree = None;
+                    }
+                }
+                None => {
+                    tracing::warn!(
+                        "Windows process-tree containment unavailable for pid {pid}: missing process handle"
+                    );
+                    tree = None;
+                }
+            }
+        }
+
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let stdin = child.stdin.take();
@@ -312,6 +377,7 @@ impl ProcessManager {
                 stdin: AsyncMutex::new(stdin),
             })),
             pid,
+            tree,
         ))
     }
 
@@ -321,23 +387,31 @@ impl ProcessManager {
         workdir: &Path,
         owner: &str,
         output: Arc<Mutex<HeadTailBuffer>>,
-    ) -> Result<(ProcessIo, u32), String> {
+    ) -> Result<
+        (
+            ProcessIo,
+            u32,
+            Option<stark_sandbox::process_tree::ProcessTree>,
+        ),
+        String,
+    > {
         let pair = native_pty_system()
             .openpty(PtySize::default())
             .map_err(|error| format!("failed to allocate PTY: {error}"))?;
         let mut builder = CommandBuilder::new(find_bash());
         builder.args(["--noprofile", "--norc", "-c", command]);
         builder.cwd(workdir);
+        // Build a fresh environment: portable-pty's builder otherwise inherits
+        // the server process environment, including provider keys.
+        builder.env_clear();
+        for (key, value) in stark_sandbox::secrets::env_pairs() {
+            builder.env(key, value);
+        }
         builder.env("TERM", "dumb");
         builder.env("STARK_WORKSPACE", workdir.to_string_lossy().as_ref());
         builder.env("STARK_SESSION_ID", owner);
         for (key, value) in stark_sandbox::for_workspace(workdir).env() {
             builder.env(key, value);
-        }
-        // PTY builders inherit the parent env via get_base_env: strip secrets
-        // explicitly since there is no wrap_tokio_command equivalent here.
-        for name in stark_sandbox::secrets::secret_var_names() {
-            builder.env_remove(name);
         }
 
         let child = pair
@@ -349,6 +423,31 @@ impl ProcessManager {
                 )
             })?;
         let pid = child.process_id().unwrap_or(0);
+        #[cfg(windows)]
+        let mut tree = stark_sandbox::process_tree::create().ok();
+        #[cfg(unix)]
+        let tree = stark_sandbox::process_tree::ProcessTree::for_pid(pid).ok();
+        #[cfg(not(any(windows, unix)))]
+        let tree = None;
+        #[cfg(windows)]
+        if let Some(job) = tree.as_ref() {
+            match child.as_raw_handle() {
+                Some(handle) => {
+                    if let Err(error) = job.assign(handle) {
+                        tracing::warn!(
+                            "Windows PTY process-tree containment unavailable for pid {pid}: {error}"
+                        );
+                        tree = None;
+                    }
+                }
+                None => {
+                    tracing::warn!(
+                        "Windows PTY process-tree containment unavailable for pid {pid}: missing process handle"
+                    );
+                    tree = None;
+                }
+            }
+        }
         let reader = pair
             .master
             .try_clone_reader()
@@ -368,6 +467,7 @@ impl ProcessManager {
                 _master: Mutex::new(Some(master)),
             })),
             pid,
+            tree,
         ))
     }
 
@@ -475,6 +575,9 @@ impl ProcessManager {
         let Ok(process) = self.get(target) else {
             return false;
         };
+        // A command may have exited while leaving a daemon in its tree; do not
+        // let that descendant outlive the job entry.
+        process.terminate_tree();
         self.by_id.remove(&process.id);
         self.processes.remove(&process.name);
         true

@@ -111,10 +111,10 @@ pub fn cloud_branch(title: &str, chat_id: Option<&str>) -> String {
 }
 
 fn git(workspace: &Path, args: &[&str]) -> Result<String, String> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(workspace)
-        .args(args)
+    let mut command = std::process::Command::new("git");
+    command.arg("-C").arg(workspace).args(args);
+    stark_sandbox::secrets::scrub_command(&mut command);
+    let output = command
         .output()
         .map_err(|error| format!("git failed: {error}"))?;
     if !output.status.success() {
@@ -431,12 +431,16 @@ pub async fn receive_package(
         .and_then(Value::as_str)
         .filter(|id| !id.trim().is_empty())
         .ok_or_else(|| "handoff has no workspace id".to_string())?;
+    stark_store::validate_workspace_id(workspace_id)
+        .map_err(|error| format!("invalid workspace id in handoff: {error}"))?;
     let branch = workspace_manifest
         .get("branch")
         .and_then(Value::as_str)
         .filter(|branch| !branch.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| "cloud/import".to_string());
+    stark_store::validate_branch_name(&branch)
+        .map_err(|error| format!("invalid branch in handoff: {error}"))?;
 
     let registry = stark_store::WorkspaceRegistry::new(harness_root);
     let record = if let Some(virtual_ws) = virtual_record(workspace_id) {
@@ -448,17 +452,22 @@ pub async fn receive_package(
             .get("name")
             .and_then(Value::as_str)
             .unwrap_or("Cloud project");
+        let name = if stark_store::validate_workspace_id(name).is_ok() {
+            name.trim()
+        } else {
+            "Cloud project"
+        };
         let rel = workspace_manifest
             .get("rel")
             .and_then(Value::as_str)
             .filter(|rel| !rel.is_empty());
         let root = stark_store::projects_root();
         let path = match rel {
-            Some(rel) => rel
-                .split('/')
-                .fold(root, |path, part| path.join(part))
-                .to_string_lossy()
-                .to_string(),
+            Some(rel) => {
+                let relative = stark_store::safe_relative_path(rel)
+                    .ok_or_else(|| format!("unsafe workspace path in handoff: {rel}"))?;
+                root.join(relative).to_string_lossy().to_string()
+            }
             None => root.join(name).to_string_lossy().to_string(),
         };
         let stored = stark_store::WorkspaceRecord {
@@ -483,18 +492,24 @@ pub async fn receive_package(
     if !Path::new(&record.path).is_dir()
         && let Some(repo) = record.repo.as_deref().filter(|repo| !repo.is_empty())
     {
+        stark_store::validate_repo_url(repo)
+            .map_err(|error| format!("invalid repository in handoff: {error}"))?;
         let path = PathBuf::from(&record.path);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|error| format!("cannot create workspace dir: {error}"))?;
         }
-        let output = std::process::Command::new("git")
+        let mut command = std::process::Command::new("git");
+        command
             .arg("clone")
             .arg("--depth")
             .arg("1")
-            .env("GIT_TERMINAL_PROMPT", "0")
+            .arg("--")
             .arg(repo)
-            .arg(&path)
+            .arg(&path);
+        stark_sandbox::secrets::scrub_command(&mut command);
+        command.env("GIT_TERMINAL_PROMPT", "0");
+        let output = command
             .output()
             .map_err(|error| format!("git clone failed: {error}"))?;
         if !output.status.success() {

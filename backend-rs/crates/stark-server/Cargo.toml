@@ -22,6 +22,7 @@ serde.workspace = true
 serde_json.workspace = true
 stark-contract = { path = "../stark-contract" }
 stark-config = { path = "../stark-config" }
+stark-policy = { path = "../stark-policy" }
 stark-core = { path = "../stark-core" }
 stark-providers = { path = "../stark-providers" }
 stark-sandbox = { path = "../stark-sandbox" }

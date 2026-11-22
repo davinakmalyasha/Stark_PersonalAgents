@@ -5,7 +5,7 @@ use serde_json::Value;
 use tokio::process::Command;
 
 use crate::truncate::{MAX_TOOL_BYTES, spill_full_output, truncate_with_spill};
-use crate::{ToolContext, ToolOutcome};
+use crate::{ToolContext, ToolErrorClass, ToolOutcome};
 
 const MAX_SNAPSHOT_CHARS: usize = MAX_TOOL_BYTES;
 const DEFAULT_WAIT_MS: u64 = 5_000;
@@ -51,9 +51,12 @@ pub async fn browser_act(ctx: &ToolContext, args: &Value) -> ToolOutcome {
             let _ = raw_command(&["close", "--all"], Duration::from_secs(10)).await;
             ToolOutcome::ok("Browser closed.")
         }
-        other => ToolOutcome::err(format!(
-            "Error: unknown browser_act action '{other}'. Valid: navigate, click, fill, type, press, extract, read, a11y, record, network, screenshot, close"
-        )),
+        other => ToolOutcome::err_class(
+            ToolErrorClass::Args,
+            format!(
+                "Error: unknown browser_act action '{other}'. Valid: navigate, click, fill, type, press, extract, read, a11y, record, network, screenshot, close"
+            ),
+        ),
     }
 }
 
@@ -71,8 +74,11 @@ async fn navigate(args: &Value) -> ToolOutcome {
         return ToolOutcome::err(format!("Error: {error}"));
     }
     let open = raw_command(&["open", &url], Duration::from_secs(30)).await;
-    if open.starts_with('(') {
-        return ToolOutcome::ok(open);
+    if open.starts_with("(timed out") {
+        return ToolOutcome::err_class(ToolErrorClass::Timeout, open);
+    }
+    if open.starts_with("(error") {
+        return ToolOutcome::err_class(ToolErrorClass::Transport, open);
     }
     let wait_ms = args
         .get("wait_ms")
@@ -318,7 +324,24 @@ async fn mcp_call(ctx: &ToolContext, tool: &str, args: Value, timeout: Duration)
     render_mcp_result(&ctx.harness_root, tool, &raw)
 }
 
+/// `raw_command` reports process failures as plain strings. Classify them
+/// before the JSON/MCP fallback, otherwise a timed-out browser action looks
+/// like a successful page response.
+fn command_failure(raw: &str) -> Option<ToolOutcome> {
+    let raw = raw.trim();
+    if raw.starts_with("(timed out") {
+        return Some(ToolOutcome::err_class(ToolErrorClass::Timeout, raw));
+    }
+    if raw.starts_with("(error") {
+        return Some(ToolOutcome::err_class(ToolErrorClass::Transport, raw));
+    }
+    None
+}
+
 fn render_mcp_result(harness_root: &Path, tool: &str, raw: &str) -> ToolOutcome {
+    if let Some(outcome) = command_failure(raw) {
+        return outcome;
+    }
     let trimmed = raw.trim();
     let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
         return truncated_ok(harness_root, tool, trimmed);
@@ -328,7 +351,7 @@ fn render_mcp_result(harness_root: &Path, tool: &str, raw: &str) -> ToolOutcome 
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or(trimmed);
-        return ToolOutcome::err(format!("Error: {message}"));
+        return ToolOutcome::err_class(ToolErrorClass::Tool, format!("Error: {message}"));
     }
     if let Some(items) = value.get("content").and_then(Value::as_array) {
         let mut parts = Vec::new();
@@ -384,11 +407,17 @@ async fn screenshot(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         Duration::from_secs(20),
     )
     .await;
+    if let Some(outcome) = command_failure(&result) {
+        return outcome;
+    }
     if path.is_file() {
         let size = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
         ToolOutcome::ok(format!("[SCREENSHOT] Saved to {path_text} ({size} bytes)"))
     } else {
-        ToolOutcome::ok(format!("(screenshot result: {result})"))
+        ToolOutcome::err_class(
+            ToolErrorClass::Transport,
+            format!("[SCREENSHOT FAILED] {result}"),
+        )
     }
 }
 
@@ -402,7 +431,13 @@ fn scratch_screenshot(ctx: &ToolContext) -> PathBuf {
 }
 
 async fn command(args: &[&str], timeout: Duration) -> ToolOutcome {
-    ToolOutcome::ok(raw_command(args, timeout).await)
+    let out = raw_command(args, timeout).await;
+    // The CLI answers failures as `(error: ..)` / `(timed out after Ns)`;
+    // surface those as typed failures instead of page content.
+    if let Some(outcome) = command_failure(&out) {
+        return outcome;
+    }
+    ToolOutcome::ok(out)
 }
 
 async fn raw_command(args: &[&str], timeout: Duration) -> String {
@@ -414,10 +449,20 @@ async fn raw_command(args: &[&str], timeout: Duration) -> String {
     match tokio::time::timeout(timeout, command.output()).await {
         Ok(Ok(output)) => {
             let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if !output.status.success() {
+                let detail = if !stderr.is_empty() {
+                    stderr
+                } else if !stdout.is_empty() {
+                    stdout
+                } else {
+                    format!("exit status {}", output.status)
+                };
+                return format!("(error: {detail})");
+            }
             if !stdout.is_empty() {
                 return stdout;
             }
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             if stderr.is_empty() {
                 "(empty)".to_string()
             } else {
@@ -522,6 +567,12 @@ mod tests {
         );
         assert!(err.is_error);
         assert!(err.content.contains("Unknown tool"));
+        let timed_out = render_mcp_result(root, "agent_browser_click", "(timed out after 30s)");
+        assert!(timed_out.is_error);
+        assert_eq!(timed_out.class, Some(ToolErrorClass::Timeout));
+        let cli_error = render_mcp_result(root, "agent_browser_click", "(error: browser gone)");
+        assert!(cli_error.is_error);
+        assert_eq!(cli_error.class, Some(ToolErrorClass::Transport));
         let big = "x".repeat(MAX_TOOL_BYTES + 10);
         let partial = render_mcp_result(root, "agent_browser_read", &big);
         assert!(partial.content.contains("omitted"), "{}", partial.content);

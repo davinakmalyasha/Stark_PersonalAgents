@@ -1,0 +1,1224 @@
+//! Codex-identical fuzzy file search.
+//!
+//! Ported from `openai/codex` `codex-rs/file-search` (`src/lib.rs` +
+//! `src/snapshot.rs` + `src/cli.rs`), Apache-2.0. Algorithm and walker flags
+//! follow Codex byte-for-byte so `glob` ranking matches Codex:
+//!
+//! - `ignore::WalkBuilder` with `threads(2)`, `hidden(false)`,
+//!   `follow_links(true)`, `require_git(true)`; `respect_gitignore` toggles
+//!   `git_ignore/git_global/git_exclude/ignore/parents`.
+//! - `exclude` via `overrides::OverrideBuilder` with `!pattern`.
+//! - `nucleo::Nucleo` with `Config::DEFAULT.match_paths()`,
+//!   `CaseMatching::Ignore`, `Normalization::Smart`, `AtomKind::Fuzzy`.
+//! - Basename bonus ranking (`NAME_BONUS = u16::MAX+1`): file exact
+//!   `+3*BONUS`, first exact folder `+2*BONUS`, other basename hit `+BONUS`.
+//! - Final order: score desc, path asc.
+//!
+//! `glob` keeps the frozen `tool-specs.json` contract (glob syntax) but ranks
+//! with this engine. `grep` content search stays ripgrep-syntax compatible
+//! and uses the same walker flags (see `ds_fs.rs`).
+//!
+//! Stark layer on top: a per-workspace warm index (`warm_entries`,
+//! `run_warm`) caches one entry list per `(root, exclude, respect_gitignore)`
+//! key and arms a `notify` recursive watcher that flips a dirty flag on any
+//! FS event, so repeat queries skip the walk. Entries are stored unfiltered
+//! (pure Codex walk); consumers filter as the cold paths do.
+
+use crossbeam_channel::Receiver;
+use crossbeam_channel::Sender;
+use crossbeam_channel::after;
+use crossbeam_channel::never;
+use crossbeam_channel::select;
+use crossbeam_channel::unbounded;
+use ignore::WalkBuilder;
+use ignore::overrides::OverrideBuilder;
+use nucleo::Config;
+use nucleo::Injector;
+use nucleo::Matcher;
+use nucleo::Nucleo;
+use nucleo::Utf32String;
+use nucleo::pattern::CaseMatching;
+use nucleo::pattern::Normalization;
+use serde::Serialize;
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::num::NonZero;
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Condvar;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::sync::RwLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::thread;
+use std::time::Duration;
+use tokio::process::Command;
+
+#[cfg(test)]
+use nucleo::Utf32Str;
+#[cfg(test)]
+use nucleo::pattern::AtomKind;
+#[cfg(test)]
+use nucleo::pattern::Pattern;
+
+use clap::ArgAction;
+use clap::Parser;
+
+/// Fuzzy matches filenames under a directory.
+#[derive(Parser, Debug)]
+pub struct Cli {
+    /// Whether to output results in JSON format.
+    #[clap(long, default_value = "false")]
+    pub json: bool,
+
+    /// Maximum number of results to return.
+    #[clap(long, short = 'l', default_value = "64")]
+    pub limit: NonZero<usize>,
+
+    /// Directory to search.
+    #[clap(long, short = 'C')]
+    pub cwd: Option<PathBuf>,
+
+    /// Include matching file indices in the output.
+    #[arg(long, default_value = "false")]
+    pub compute_indices: bool,
+
+    // While it is common to default to the number of logical CPUs when creating
+    // a thread pool, empirically, the I/O of the filetree traversal offers
+    // limited parallelism and is the bottleneck, so using a smaller number of
+    // threads is more efficient. (Empirically, using more than 2 threads doesn't seem to provide much benefit.)
+    //
+    /// Number of worker threads to use.
+    #[clap(long, default_value = "2")]
+    pub threads: NonZero<usize>,
+
+    /// Exclude patterns
+    #[arg(short, long, action = ArgAction::Append)]
+    pub exclude: Vec<String>,
+
+    /// Search pattern.
+    pub pattern: Option<String>,
+}
+
+/// A single match result returned from the search.
+///
+/// * `score` – Relevance score used to select and order this result.
+/// * `path`  – Path to the matched entry (file or directory), relative to the
+///   search directory.
+/// * `match_type` – Whether this match is a file or directory.
+/// * `indices` – Optional list of character indices that matched the query.
+///   These are only filled when the caller of [`run`] sets
+///   `options.compute_indices` to `true`. The indices vector follows the
+///   guidance from `nucleo::pattern::Pattern::indices`: they are
+///   unique and sorted in ascending order so that callers can use
+///   them directly for highlighting.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct FileMatch {
+    pub score: u32,
+    pub path: PathBuf,
+    pub match_type: MatchType,
+    pub root: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indices: Option<Vec<u32>>, // Sorted & deduplicated when present
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MatchType {
+    File,
+    Directory,
+}
+
+/// Carries the selected root and entry type without duplicating ASCII matcher paths.
+enum IndexedEntry {
+    Ascii {
+        root_idx: usize,
+        match_type: MatchType,
+    },
+    Unicode(Box<UnicodeEntry>),
+}
+
+// Unicode matcher columns retain only one codepoint per grapheme.
+struct UnicodeEntry {
+    root_idx: usize,
+    relative_path: Box<str>,
+    match_type: MatchType,
+}
+
+impl FileMatch {
+    pub fn full_path(&self) -> PathBuf {
+        self.root.join(&self.path)
+    }
+}
+
+/// Returns the final path component for a matched path, falling back to the full path.
+pub fn file_name_from_path(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
+}
+
+#[derive(Debug)]
+pub struct FileSearchResults {
+    pub matches: Vec<FileMatch>,
+    pub total_match_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
+pub struct FileSearchSnapshot {
+    pub query: String,
+    pub matches: Vec<FileMatch>,
+    pub total_match_count: usize,
+    pub scanned_file_count: usize,
+    pub walk_complete: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct FileSearchOptions {
+    pub limit: NonZero<usize>,
+    pub exclude: Vec<String>,
+    pub threads: NonZero<usize>,
+    pub compute_indices: bool,
+    /// Toggle ignore-file processing in the walker.
+    ///
+    /// When enabled, `.gitignore` files are scoped by
+    /// `WalkBuilder::require_git(true)`, so they are honored only when the
+    /// traversed path is inside a git repository. When disabled, the walker
+    /// turns off `.gitignore`, git-global/exclude rules, `.ignore`, and
+    /// parent-directory ignore scanning.
+    pub respect_gitignore: bool,
+}
+
+impl Default for FileSearchOptions {
+    fn default() -> Self {
+        Self {
+            #[expect(clippy::unwrap_used)]
+            limit: NonZero::new(20).unwrap(),
+            exclude: Vec::new(),
+            #[expect(clippy::unwrap_used)]
+            threads: NonZero::new(2).unwrap(),
+            compute_indices: false,
+            respect_gitignore: true,
+        }
+    }
+}
+
+pub trait SessionReporter: Send + Sync + 'static {
+    /// Called when the debounced top-N changes.
+    fn on_update(&self, snapshot: &FileSearchSnapshot);
+
+    /// Called when the session becomes idle or is cancelled. Guaranteed to be called at least once per update_query.
+    fn on_complete(&self);
+}
+
+pub struct FileSearchSession {
+    inner: Arc<SessionInner>,
+}
+
+impl FileSearchSession {
+    /// Update the query. This should be cheap relative to re-walking.
+    pub fn update_query(&self, pattern_text: &str) {
+        let _ = self
+            .inner
+            .work_tx
+            .send(WorkSignal::QueryUpdated(pattern_text.to_string()));
+    }
+}
+
+impl Drop for FileSearchSession {
+    fn drop(&mut self) {
+        self.inner.shutdown.store(true, Ordering::Relaxed);
+        let _ = self.inner.work_tx.send(WorkSignal::Shutdown);
+    }
+}
+
+pub fn create_session(
+    search_directories: Vec<PathBuf>,
+    options: FileSearchOptions,
+    reporter: Arc<dyn SessionReporter>,
+    cancel_flag: Option<Arc<AtomicBool>>,
+) -> anyhow::Result<FileSearchSession> {
+    let FileSearchOptions { exclude, .. } = &options;
+    let Some(primary_search_directory) = search_directories.first() else {
+        anyhow::bail!("at least one search directory is required");
+    };
+    let override_matcher = build_override_matcher(primary_search_directory, exclude)?;
+    let (inner, injector) = start_session(search_directories, options, reporter, cancel_flag)?;
+
+    let walker_inner = inner.clone();
+    thread::spawn(move || walker_worker(walker_inner, override_matcher, injector));
+
+    Ok(FileSearchSession { inner })
+}
+
+/// Shared session setup: channel, `Nucleo` matcher, and the matcher worker
+/// thread. Callers add a producer thread: the cold `walker_worker` or a warm
+/// cache feeder.
+fn start_session(
+    search_directories: Vec<PathBuf>,
+    options: FileSearchOptions,
+    reporter: Arc<dyn SessionReporter>,
+    cancel_flag: Option<Arc<AtomicBool>>,
+) -> anyhow::Result<(Arc<SessionInner>, Injector<IndexedEntry>)> {
+    let FileSearchOptions {
+        limit,
+        threads,
+        compute_indices,
+        respect_gitignore,
+        ..
+    } = options;
+
+    if search_directories.is_empty() {
+        anyhow::bail!("at least one search directory is required");
+    }
+    let (work_tx, work_rx) = unbounded();
+
+    let notify_tx = work_tx.clone();
+    let notify = Arc::new(move || {
+        let _ = notify_tx.send(WorkSignal::NucleoNotify);
+    });
+    let nucleo = Nucleo::new(
+        Config::DEFAULT.match_paths(),
+        notify,
+        Some(threads.get()),
+        1,
+    );
+    let injector = nucleo.injector();
+
+    let cancelled = cancel_flag.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+
+    let inner = Arc::new(SessionInner {
+        search_directories,
+        limit: limit.get(),
+        threads: threads.get(),
+        compute_indices,
+        respect_gitignore,
+        cancelled,
+        shutdown: Arc::new(AtomicBool::new(false)),
+        reporter,
+        work_tx,
+    });
+
+    let matcher_inner = inner.clone();
+    thread::spawn(move || matcher_worker(matcher_inner, work_rx, nucleo));
+
+    Ok((inner, injector))
+}
+
+/// Session fed from an in-memory entry list (warm cache) instead of a live
+/// filesystem walk. Ranking is byte-identical to the cold path: the same
+/// matcher worker, `snapshot::Ranking`, and score-desc/path-asc order.
+fn create_session_with_entries(
+    search_directories: Vec<PathBuf>,
+    entries: Vec<(String, MatchType)>,
+    options: FileSearchOptions,
+    reporter: Arc<dyn SessionReporter>,
+    cancel_flag: Option<Arc<AtomicBool>>,
+) -> anyhow::Result<FileSearchSession> {
+    if search_directories.len() != 1 {
+        anyhow::bail!("warm sessions support exactly one search directory");
+    }
+    let (inner, injector) = start_session(search_directories, options, reporter, cancel_flag)?;
+
+    let feeder_inner = inner.clone();
+    thread::spawn(move || {
+        for (relative, match_type) in &entries {
+            let column = Utf32String::from(relative.as_str());
+            let indexed_entry = match &column {
+                Utf32String::Ascii(_) => IndexedEntry::Ascii {
+                    root_idx: 0,
+                    match_type: *match_type,
+                },
+                Utf32String::Unicode(_) => IndexedEntry::Unicode(Box::new(UnicodeEntry {
+                    root_idx: 0,
+                    relative_path: Box::from(relative.as_str()),
+                    match_type: *match_type,
+                })),
+            };
+            injector.push(indexed_entry, |_, columns| {
+                columns[0] = column;
+            });
+        }
+        let _ = feeder_inner.work_tx.send(WorkSignal::WalkComplete);
+    });
+
+    Ok(FileSearchSession { inner })
+}
+
+pub trait Reporter {
+    fn report_match(&self, file_match: &FileMatch);
+    fn warn_matches_truncated(&self, total_match_count: usize, shown_match_count: usize);
+    fn warn_no_search_pattern(&self, search_directory: &Path);
+}
+
+pub async fn run_main<T: Reporter>(
+    Cli {
+        pattern,
+        limit,
+        cwd,
+        compute_indices,
+        json: _,
+        exclude,
+        threads,
+    }: Cli,
+    reporter: T,
+) -> anyhow::Result<()> {
+    let search_directory = match cwd {
+        Some(dir) => dir,
+        None => std::env::current_dir()?,
+    };
+    let pattern_text = match pattern {
+        Some(pattern) => pattern,
+        None => {
+            reporter.warn_no_search_pattern(&search_directory);
+            #[cfg(unix)]
+            {
+                let mut command = Command::new("ls");
+                command
+                    .arg("-al")
+                    .current_dir(search_directory)
+                    .stdout(std::process::Stdio::inherit())
+                    .stderr(std::process::Stdio::inherit());
+                stark_sandbox::secrets::scrub_tokio_command(&mut command);
+                command.status().await?;
+            }
+            #[cfg(windows)]
+            {
+                let mut command = Command::new("cmd");
+                command
+                    .arg("/c")
+                    .arg(search_directory)
+                    .stdout(std::process::Stdio::inherit())
+                    .stderr(std::process::Stdio::inherit());
+                stark_sandbox::secrets::scrub_tokio_command(&mut command);
+                command.status().await?;
+            }
+            return Ok(());
+        }
+    };
+
+    let FileSearchResults {
+        total_match_count,
+        matches,
+    } = run(
+        &pattern_text,
+        vec![search_directory.to_path_buf()],
+        FileSearchOptions {
+            limit,
+            exclude,
+            threads,
+            compute_indices,
+            respect_gitignore: true,
+        },
+        /*cancel_flag*/ None,
+    )?;
+    let match_count = matches.len();
+    let matches_truncated = total_match_count > match_count;
+
+    for file_match in matches {
+        reporter.report_match(&file_match);
+    }
+    if matches_truncated {
+        reporter.warn_matches_truncated(total_match_count, match_count);
+    }
+
+    Ok(())
+}
+
+/// The worker threads will periodically check `cancel_flag` to see if they
+/// should stop processing files.
+pub fn run(
+    pattern_text: &str,
+    roots: Vec<PathBuf>,
+    options: FileSearchOptions,
+    cancel_flag: Option<Arc<AtomicBool>>,
+) -> anyhow::Result<FileSearchResults> {
+    let reporter = Arc::new(RunReporter::default());
+    let session = create_session(roots, options, reporter.clone(), cancel_flag)?;
+    Ok(execute(pattern_text, session, reporter))
+}
+
+/// Warm-index variant of [`run`]: single-root queries are served from a
+/// per-workspace cached entry list kept fresh by a filesystem watcher,
+/// instead of re-walking on every call. Ranking is byte-identical (same
+/// matcher worker and `snapshot::Ranking`); multi-root queries fall back to
+/// the cold [`run`] path.
+pub fn run_warm(
+    pattern_text: &str,
+    roots: Vec<PathBuf>,
+    options: FileSearchOptions,
+    cancel_flag: Option<Arc<AtomicBool>>,
+) -> anyhow::Result<FileSearchResults> {
+    if roots.len() != 1 {
+        return run(pattern_text, roots, options, cancel_flag);
+    }
+    let entries = warm_entries(
+        &roots[0],
+        &options.exclude,
+        options.respect_gitignore,
+        options.threads.get(),
+    );
+    let reporter = Arc::new(RunReporter::default());
+    let session =
+        create_session_with_entries(roots, entries, options, reporter.clone(), cancel_flag)?;
+    Ok(execute(pattern_text, session, reporter))
+}
+
+fn execute(
+    pattern_text: &str,
+    session: FileSearchSession,
+    reporter: Arc<RunReporter>,
+) -> FileSearchResults {
+    session.update_query(pattern_text);
+
+    let snapshot = reporter.wait_for_complete();
+    FileSearchResults {
+        matches: snapshot.matches,
+        total_match_count: snapshot.total_match_count,
+    }
+}
+
+/// Warm per-workspace file index (Stark layer over the Codex engine).
+///
+/// The fuzzy engine itself is stateless per query; the expensive part is the
+/// filesystem walk. `warm_entries` caches one entry list per
+/// `(root, exclude, respect_gitignore)` key and arms a `notify` recursive
+/// watcher that flips a dirty flag on any change, so repeat queries skip the
+/// walk entirely. Entries are stored unfiltered (pure Codex walk, no Stark
+/// `skip_entry` denylist); each consumer applies its own filtering, exactly
+/// as the cold paths do.
+fn warm_cache() -> &'static Mutex<HashMap<String, Arc<WarmShared>>> {
+    static WARM: OnceLock<Mutex<HashMap<String, Arc<WarmShared>>>> = OnceLock::new();
+    WARM.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+struct WarmShared {
+    slot: Mutex<WarmSlot>,
+    dirty: Arc<AtomicBool>,
+}
+
+struct WarmSlot {
+    entries: Vec<(String, MatchType)>,
+    watcher: Option<notify::RecommendedWatcher>,
+}
+
+fn warm_key(root: &Path, exclude: &[String], respect_gitignore: bool) -> String {
+    format!("{}|{exclude:?}|{respect_gitignore}", root.to_string_lossy())
+}
+
+/// Blocking file list for `root`, served from the warm cache when fresh.
+/// Consumers filter by `MatchType`/denylist themselves, mirroring the cold
+/// `search::run` (no filtering) and `ds_fs::codex_walk` (skip + files-only)
+/// paths.
+pub fn warm_entries(
+    root: &Path,
+    exclude: &[String],
+    respect_gitignore: bool,
+    threads: usize,
+) -> Vec<(String, MatchType)> {
+    let key = warm_key(root, exclude, respect_gitignore);
+    let shared = warm_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(key)
+        .or_insert_with(|| {
+            Arc::new(WarmShared {
+                slot: Mutex::new(WarmSlot {
+                    entries: Vec::new(),
+                    watcher: None,
+                }),
+                dirty: Arc::new(AtomicBool::new(false)),
+            })
+        })
+        .clone();
+    // Fast path: entries present, watcher armed, no FS event since.
+    let stale = {
+        let slot = shared
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slot.entries.is_empty()
+            || slot.watcher.is_none()
+            || shared.dirty.swap(false, Ordering::Relaxed)
+    };
+    if stale {
+        // Walk outside the slot lock; last writer wins (idempotent).
+        let fresh = walk_entries_blocking(root, exclude, respect_gitignore, threads);
+        let mut slot = shared
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slot.entries = fresh;
+        if slot.watcher.is_none() {
+            slot.watcher = watch_root(root, &shared.dirty);
+        }
+        // Events that arrived mid-walk must not be lost: a set dirty flag
+        // stays set (swap above already consumed only the pre-walk state).
+        // Re-check cheaply: if dirty was set during the walk, drop the
+        // watcher-less... nothing to do: flag is still set, next call
+        // re-walks. Correct by construction.
+    }
+    shared
+        .slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entries
+        .clone()
+}
+
+/// Filesystem walk with the exact Codex walker flags from `walker_worker`
+/// (`threads`, `hidden(false)`, `follow_links(true)`, `require_git(true)`,
+/// `!pattern` overrides, gitignore toggles), collected serially instead of
+/// streamed. Single root only.
+fn walk_entries_blocking(
+    root: &Path,
+    exclude: &[String],
+    respect_gitignore: bool,
+    threads: usize,
+) -> Vec<(String, MatchType)> {
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .threads(threads)
+        .hidden(false)
+        .follow_links(true)
+        .require_git(true);
+    if !respect_gitignore {
+        builder
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false)
+            .ignore(false)
+            .parents(false);
+    }
+    if let Ok(Some(matcher)) = build_override_matcher(root, exclude) {
+        builder.overrides(matcher);
+    }
+    let mut out = Vec::new();
+    for entry in builder.build().filter_map(Result::ok) {
+        let path = entry.path();
+        if path.to_str().is_none() {
+            continue;
+        }
+        // Same root-relative mapping as `walker_worker::get_file_path` for a
+        // single root (root entry itself maps to `""`, as in the cold path).
+        let Ok(relative) = path.strip_prefix(root) else {
+            continue;
+        };
+        let Some(relative) = relative.to_str() else {
+            continue;
+        };
+        let match_type = match entry.file_type() {
+            Some(file_type) if file_type.is_dir() => MatchType::Directory,
+            _ => MatchType::File,
+        };
+        out.push((relative.to_string(), match_type));
+    }
+    out
+}
+
+/// Arm a recursive watcher on `root`; any FS event marks the slot dirty.
+/// `None` when the root cannot be watched (caller re-walks every time, which
+/// is exactly today's cold behavior, so no regression).
+fn watch_root(root: &Path, dirty: &Arc<AtomicBool>) -> Option<notify::RecommendedWatcher> {
+    use notify::Watcher as _;
+    let flag = Arc::clone(dirty);
+    let mut watcher = notify::RecommendedWatcher::new(
+        move |event: Result<notify::Event, notify::Error>| {
+            if event.is_ok() {
+                flag.store(true, Ordering::Relaxed);
+            }
+        },
+        notify::Config::default(),
+    )
+    .ok()?;
+    watcher.watch(root, notify::RecursiveMode::Recursive).ok()?;
+    Some(watcher)
+}
+
+/// Test hook: force the next [`warm_entries`] call for this key to re-walk.
+#[cfg(test)]
+pub(crate) fn mark_dirty_for_tests(root: &Path, exclude: &[String], respect_gitignore: bool) {
+    let key = warm_key(root, exclude, respect_gitignore);
+    if let Some(shared) = warm_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+    {
+        shared.dirty.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Sort matches in-place by descending score, then ascending path.
+#[cfg(test)]
+fn sort_matches(matches: &mut [(u32, String)]) {
+    matches.sort_by(cmp_by_score_desc_then_path_asc::<(u32, String), _, _>(
+        |t| t.0,
+        |t| t.1.as_str(),
+    ));
+}
+
+/// Returns a comparator closure suitable for `slice.sort_by(...)` that orders
+/// items by descending score and then ascending path using the provided accessors.
+pub fn cmp_by_score_desc_then_path_asc<T, FScore, FPath>(
+    score_of: FScore,
+    path_of: FPath,
+) -> impl FnMut(&T, &T) -> std::cmp::Ordering
+where
+    FScore: Fn(&T) -> u32,
+    FPath: Fn(&T) -> &str,
+{
+    use std::cmp::Ordering;
+    move |a, b| match score_of(b).cmp(&score_of(a)) {
+        Ordering::Equal => path_of(a).cmp(path_of(b)),
+        other => other,
+    }
+}
+
+#[cfg(test)]
+fn create_pattern(pattern: &str) -> Pattern {
+    Pattern::new(
+        pattern,
+        CaseMatching::Ignore,
+        Normalization::Smart,
+        AtomKind::Fuzzy,
+    )
+}
+
+struct SessionInner {
+    search_directories: Vec<PathBuf>,
+    limit: usize,
+    threads: usize,
+    compute_indices: bool,
+    respect_gitignore: bool,
+    cancelled: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
+    reporter: Arc<dyn SessionReporter>,
+    work_tx: Sender<WorkSignal>,
+}
+
+enum WorkSignal {
+    QueryUpdated(String),
+    NucleoNotify,
+    WalkComplete,
+    Shutdown,
+}
+
+fn build_override_matcher(
+    search_directory: &Path,
+    exclude: &[String],
+) -> anyhow::Result<Option<ignore::overrides::Override>> {
+    if exclude.is_empty() {
+        return Ok(None);
+    }
+    let mut override_builder = OverrideBuilder::new(search_directory);
+    for exclude in exclude {
+        let exclude_pattern = format!("!{exclude}");
+        override_builder.add(&exclude_pattern)?;
+    }
+    let matcher = override_builder.build()?;
+    Ok(Some(matcher))
+}
+
+fn get_file_path<'a>(path: &'a Path, search_directories: &[PathBuf]) -> Option<(usize, &'a str)> {
+    let mut best_match: Option<(usize, &Path)> = None;
+    for (idx, root) in search_directories.iter().enumerate() {
+        if let Ok(rel_path) = path.strip_prefix(root) {
+            let root_depth = root.components().count();
+            match best_match {
+                Some((best_idx, _))
+                    if search_directories[best_idx].components().count() >= root_depth => {}
+                _ => {
+                    best_match = Some((idx, rel_path));
+                }
+            }
+        }
+    }
+
+    let (root_idx, rel_path) = best_match?;
+    rel_path.to_str().map(|p| (root_idx, p))
+}
+
+/// Walks the search directories and feeds discovered paths into `nucleo`
+/// via the injector.
+///
+/// The walker uses `require_git(true)` to match git's own ignore semantics:
+/// git never reads `.gitignore` files from directories above the repository
+/// root. Without this flag, the `ignore` crate reads `.gitignore` files from
+/// *all* ancestor directories—a deliberate divergence from git intended for
+/// non-git use cases—allowing a broad parent ignore (e.g. `~/.gitignore`
+/// containing `*`) to silently suppress every file in the walk.
+///
+/// When `respect_gitignore` is `false`, all git-related ignore processing is
+/// disabled regardless of this flag.
+fn walker_worker(
+    inner: Arc<SessionInner>,
+    override_matcher: Option<ignore::overrides::Override>,
+    injector: Injector<IndexedEntry>,
+) {
+    let roots = &inner.search_directories;
+    let Some((first_root, other_roots)) = roots.split_first() else {
+        let _ = inner.work_tx.send(WorkSignal::WalkComplete);
+        return;
+    };
+
+    let mut walk_builder = WalkBuilder::new(first_root);
+    let mut walk_roots = HashSet::from([first_root.as_path()]);
+    for root in other_roots {
+        if walk_roots.insert(root.as_path()) {
+            walk_builder.add(root);
+        }
+    }
+    // Keep both walks for nested roots: ignore rules can expose different entries.
+    // Only those subtrees need to remember paths already sent to the matcher.
+    let seen_paths: Vec<_> = roots
+        .iter()
+        .map(|root| {
+            root.ancestors()
+                .skip(1)
+                .any(|parent| walk_roots.contains(parent))
+                .then(|| Mutex::new(HashSet::new()))
+        })
+        .collect();
+    walk_builder
+        .threads(inner.threads)
+        // Allow hidden entries.
+        .hidden(false)
+        // Follow symlinks to search their contents.
+        .follow_links(true)
+        // Keep ignore behavior aligned with git repositories: only apply
+        // gitignore rules when a git context exists.
+        .require_git(true);
+    if !inner.respect_gitignore {
+        walk_builder
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false)
+            .ignore(false)
+            .parents(false);
+    }
+    if let Some(override_matcher) = override_matcher {
+        walk_builder.overrides(override_matcher);
+    }
+
+    let walker = walk_builder.build_parallel();
+
+    walker.run(|| {
+        const CHECK_INTERVAL: usize = 1024;
+        let mut n = 0;
+        let seen_paths = &seen_paths;
+        let injector = injector.clone();
+        let cancelled = inner.cancelled.clone();
+        let shutdown = inner.shutdown.clone();
+
+        Box::new(move |entry| {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => return ignore::WalkState::Continue,
+            };
+            let path = entry.path();
+            if path.to_str().is_none() {
+                return ignore::WalkState::Continue;
+            }
+            if let Some((root_idx, relative_path)) = get_file_path(path, roots)
+                && seen_paths[root_idx].as_ref().is_none_or(|seen| {
+                    seen.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(PathBuf::from(relative_path))
+                })
+            {
+                let match_type = match entry.file_type() {
+                    Some(file_type) if file_type.is_dir() => MatchType::Directory,
+                    _ => MatchType::File,
+                };
+                let column = Utf32String::from(relative_path);
+                let indexed_entry = match &column {
+                    Utf32String::Ascii(_) => IndexedEntry::Ascii {
+                        root_idx,
+                        match_type,
+                    },
+                    Utf32String::Unicode(_) => IndexedEntry::Unicode(Box::new(UnicodeEntry {
+                        root_idx,
+                        relative_path: Box::from(relative_path),
+                        match_type,
+                    })),
+                };
+                injector.push(indexed_entry, |_, cols| {
+                    cols[0] = column;
+                });
+            }
+            n += 1;
+            if n >= CHECK_INTERVAL {
+                if cancelled.load(Ordering::Relaxed) || shutdown.load(Ordering::Relaxed) {
+                    return ignore::WalkState::Quit;
+                }
+                n = 0;
+            }
+            ignore::WalkState::Continue
+        })
+    });
+    let _ = inner.work_tx.send(WorkSignal::WalkComplete);
+}
+
+fn matcher_worker(
+    inner: Arc<SessionInner>,
+    work_rx: Receiver<WorkSignal>,
+    mut nucleo: Nucleo<IndexedEntry>,
+) -> anyhow::Result<()> {
+    const TICK_TIMEOUT_MS: u64 = 10;
+    let config = Config::DEFAULT.match_paths();
+    let mut matcher = Matcher::new(config);
+    let cancel_requested = || inner.cancelled.load(Ordering::Relaxed);
+    let shutdown_requested = || inner.shutdown.load(Ordering::Relaxed);
+
+    let mut last_query = String::new();
+    let mut next_notify = never();
+    let mut will_notify = false;
+    let mut walk_complete = false;
+    let mut ranking = None;
+
+    loop {
+        select! {
+            recv(work_rx) -> signal => {
+                let Ok(signal) = signal else {
+                    break;
+                };
+                match signal {
+                    WorkSignal::QueryUpdated(query) => {
+                        ranking = None;
+                        let append = query.starts_with(&last_query);
+                        nucleo.pattern.reparse(
+                            0,
+                            &query,
+                            CaseMatching::Ignore,
+                            Normalization::Smart,
+                            append,
+                        );
+                        last_query = query;
+                        will_notify = true;
+                        next_notify = after(Duration::from_millis(0));
+                    }
+                    WorkSignal::NucleoNotify => {
+                        if !will_notify {
+                            will_notify = true;
+                            next_notify = after(Duration::from_millis(TICK_TIMEOUT_MS));
+                        }
+                    }
+                    WorkSignal::WalkComplete => {
+                        walk_complete = true;
+                        if !will_notify {
+                            will_notify = true;
+                            next_notify = after(Duration::from_millis(0));
+                        }
+                    }
+                    WorkSignal::Shutdown => {
+                        break;
+                    }
+                }
+            }
+            recv(next_notify) -> _ => {
+                will_notify = false;
+                if ranking.is_none() {
+                    let status = nucleo.tick(TICK_TIMEOUT_MS);
+                    if status.changed {
+                        ranking = snapshot::Ranking::start(&nucleo, &last_query, walk_complete);
+                    }
+                    if ranking.is_none() && !status.running && walk_complete {
+                        inner.reporter.on_complete();
+                    }
+                }
+                if let Some(active) = &mut ranking {
+                    if let Some(snapshot) = active.advance(
+                        &inner, &nucleo, &last_query, &mut matcher,
+                        Duration::from_millis(TICK_TIMEOUT_MS),
+                    ) {
+                        inner.reporter.on_update(&snapshot);
+                        ranking = None;
+                    }
+                    // Resume this snapshot or collect work that arrived while ranking it.
+                    will_notify = true;
+                    next_notify = after(Duration::ZERO);
+                }
+            }
+            default(Duration::from_millis(100)) => {
+                // Occasionally check the cancel flag.
+            }
+        }
+
+        if cancel_requested() || shutdown_requested() {
+            break;
+        }
+    }
+
+    // If we cancelled or otherwise exited the loop, make sure the reporter is notified.
+    inner.reporter.on_complete();
+
+    Ok(())
+}
+
+#[derive(Default)]
+struct RunReporter {
+    snapshot: RwLock<FileSearchSnapshot>,
+    completed: (Condvar, Mutex<bool>),
+}
+
+impl SessionReporter for RunReporter {
+    fn on_update(&self, snapshot: &FileSearchSnapshot) {
+        #[allow(clippy::unwrap_used)]
+        let mut guard = self.snapshot.write().unwrap();
+        *guard = snapshot.clone();
+    }
+
+    fn on_complete(&self) {
+        let (cv, mutex) = &self.completed;
+        #[allow(clippy::unwrap_used)]
+        let mut completed = mutex.lock().unwrap();
+        *completed = true;
+        cv.notify_all();
+    }
+}
+
+impl RunReporter {
+    fn wait_for_complete(&self) -> FileSearchSnapshot {
+        let (cv, mutex) = &self.completed;
+        #[allow(clippy::unwrap_used)]
+        let mut completed = mutex.lock().unwrap();
+        while !*completed {
+            #[allow(clippy::unwrap_used)]
+            {
+                completed = cv.wait(completed).unwrap();
+            }
+        }
+        #[allow(clippy::unwrap_used)]
+        self.snapshot.read().unwrap().clone()
+    }
+}
+
+pub(crate) mod snapshot {
+    //! Ranks a stable matcher snapshot in slices so the worker can handle new queries.
+
+    use crate::search::FileMatch;
+    use crate::search::FileSearchSnapshot;
+    use crate::search::IndexedEntry;
+    use crate::search::MatchType;
+    use crate::search::SessionInner;
+    use nucleo::Match;
+    use nucleo::Matcher;
+    use nucleo::Nucleo;
+    use nucleo::Utf32Str;
+    use nucleo::Utf32String;
+    use nucleo::pattern::AtomKind;
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+    use std::path::PathBuf;
+    use std::time::Duration;
+    use std::time::Instant;
+
+    // A single Nucleo atom returns a u16. Leave room for its full score within each group.
+    const NAME_BONUS: u32 = u16::MAX as u32 + 1;
+
+    #[derive(Default)]
+    pub(super) struct Ranking {
+        next: usize,
+        best: BinaryHeap<(Reverse<u32>, usize)>,
+        found_exact_folder: bool,
+        rank_names: bool,
+        walk_complete: bool,
+    }
+
+    impl Ranking {
+        pub(super) fn start(
+            nucleo: &Nucleo<IndexedEntry>,
+            query: &str,
+            walk_complete: bool,
+        ) -> Option<Self> {
+            let pattern = nucleo.snapshot().pattern().column_pattern(0);
+            // A tick can collect the previous query while the new one is running.
+            if pattern.atoms != nucleo.pattern.column_pattern(0).atoms {
+                return None;
+            }
+            let rank_names = matches!(pattern.atoms.as_slice(), [atom] if atom.kind == AtomKind::Fuzzy && !atom.negative)
+                && !query.contains(['/', '\\']);
+            Some(Self {
+                rank_names,
+                walk_complete,
+                ..Self::default()
+            })
+        }
+
+        /// Yields to the worker between slices so a new query or cancellation can preempt this snapshot.
+        pub(super) fn advance(
+            &mut self,
+            inner: &SessionInner,
+            nucleo: &Nucleo<IndexedEntry>,
+            query: &str,
+            matcher: &mut Matcher,
+            budget: Duration,
+        ) -> Option<FileSearchSnapshot> {
+            let snapshot = nucleo.snapshot();
+            let ranked = snapshot.matches();
+            if !self.rank_names {
+                return Some(collect(
+                    inner,
+                    nucleo,
+                    query,
+                    matcher,
+                    self.walk_complete,
+                    ranked
+                        .iter()
+                        .copied()
+                        .take(inner.limit)
+                        .map(|matched| (matched, false)),
+                ));
+            }
+            let name = &snapshot.pattern().column_pattern(0).atoms[0];
+            let deadline = Instant::now() + budget;
+            for (matched, item) in ranked[self.next..]
+                .iter()
+                .zip(snapshot.matched_items(self.next as u32..))
+            {
+                let kind = match item.data {
+                    IndexedEntry::Ascii { match_type, .. } => *match_type,
+                    IndexedEntry::Unicode(entry) => entry.match_type,
+                };
+                let basename = basename(item.matcher_columns[0].slice(..));
+                let exact_length = basename.len() == name.needle_text().len();
+                let score = match kind {
+                    MatchType::File => name.score(basename, matcher).map(|score| {
+                        let bonus = if exact_length {
+                            3 * NAME_BONUS
+                        } else {
+                            NAME_BONUS
+                        };
+                        bonus + u32::from(score)
+                    }),
+                    // Keep the strongest exact folder. More folders with the same name
+                    // compete in path order so they cannot crowd out matching files.
+                    MatchType::Directory
+                        if !self.found_exact_folder
+                            && exact_length
+                            && name.score(basename, matcher).is_some() =>
+                    {
+                        self.found_exact_folder = true;
+                        Some(2 * NAME_BONUS + matched.score)
+                    }
+                    MatchType::Directory => None,
+                }
+                .unwrap_or(matched.score);
+                // The heap head is the lowest score, then the latest path on a tie.
+                let candidate = (Reverse(score), self.next);
+                if self.best.len() < inner.limit {
+                    self.best.push(candidate);
+                } else if let Some(mut worst) = self.best.peek_mut()
+                    && candidate < *worst
+                {
+                    *worst = candidate;
+                }
+                self.next += 1;
+                if self.next.is_multiple_of(64) && Instant::now() >= deadline {
+                    return None;
+                }
+            }
+            let selected = std::mem::take(&mut self.best)
+                .into_sorted_vec()
+                .into_iter()
+                .map(|(Reverse(score), index)| {
+                    (
+                        Match {
+                            score,
+                            idx: ranked[index].idx,
+                        },
+                        score >= NAME_BONUS,
+                    )
+                });
+            Some(collect(
+                inner,
+                nucleo,
+                query,
+                matcher,
+                self.walk_complete,
+                selected,
+            ))
+        }
+    }
+
+    fn collect(
+        inner: &SessionInner,
+        nucleo: &Nucleo<IndexedEntry>,
+        query: &str,
+        matcher: &mut Matcher,
+        walk_complete: bool,
+        candidates: impl Iterator<Item = (Match, bool)>,
+    ) -> FileSearchSnapshot {
+        let snapshot = nucleo.snapshot();
+        let pattern = snapshot.pattern().column_pattern(0);
+        let matches = candidates
+            .filter_map(|(match_, matched_name)| {
+                let item = snapshot.get_item(match_.idx)?;
+                let (root_idx, relative_path, match_type) = match item.data {
+                    IndexedEntry::Ascii {
+                        root_idx,
+                        match_type,
+                    } => {
+                        let Utf32String::Ascii(path) = &item.matcher_columns[0] else {
+                            return None;
+                        };
+                        (*root_idx, path.as_ref(), *match_type)
+                    }
+                    IndexedEntry::Unicode(entry) => (
+                        entry.root_idx,
+                        entry.relative_path.as_ref(),
+                        entry.match_type,
+                    ),
+                };
+                let indices = if inner.compute_indices {
+                    let mut indices = Vec::<u32>::new();
+                    let path = item.matcher_columns[0].slice(..);
+                    let haystack = if matched_name { basename(path) } else { path };
+                    let _ = pattern.indices(haystack, matcher, &mut indices);
+                    for index in &mut indices {
+                        *index += (path.len() - haystack.len()) as u32;
+                    }
+                    indices.sort_unstable();
+                    indices.dedup();
+                    Some(indices)
+                } else {
+                    None
+                };
+                Some(FileMatch {
+                    score: match_.score,
+                    path: PathBuf::from(relative_path),
+                    match_type,
+                    root: inner.search_directories[root_idx].clone(),
+                    indices,
+                })
+            })
+            .collect();
+        FileSearchSnapshot {
+            query: query.to_string(),
+            matches,
+            total_match_count: snapshot.matched_item_count() as usize,
+            scanned_file_count: snapshot.item_count() as usize,
+            walk_complete,
+        }
+    }
+
+    fn basename(path: Utf32Str<'_>) -> Utf32Str<'_> {
+        let len = path
+            .chars()
+            .rev()
+            .take_while(|c| !std::path::is_separator(*c))
+            .count();
+        path.slice(path.len() - len..)
+    }
+}
+
+#[cfg(test)]
+#[path = "search_tests.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "search_cache_tests.rs"]
+mod cache_tests;

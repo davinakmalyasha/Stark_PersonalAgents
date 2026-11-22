@@ -13,6 +13,7 @@ mod canvas;
 mod groups;
 mod jobs;
 mod memory;
+mod migrate;
 pub mod rollout;
 mod schedules;
 mod workspaces;
@@ -30,7 +31,8 @@ pub use schedules::{
 };
 pub use workspaces::{
     PROJECTS_ROOT_TOKEN, WorkspaceRecord, WorkspaceRegistry, projects_root, rebase_record,
-    resolve_record,
+    resolve_record, safe_relative_path, validate_branch_name, validate_repo_url,
+    validate_workspace_id,
 };
 
 /// Rebases `path` from `old_root` (lowercased, backslash-normalized) onto
@@ -63,6 +65,8 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
     #[error("invalid chat id: {0}")]
     InvalidChatId(String),
+    #[error("rollout locked: {0}")]
+    Locked(String),
     #[error("invalid state: {0}")]
     Invalid(String),
 }
@@ -92,6 +96,62 @@ pub fn sqlite_options(db_path: &Path, create: bool) -> SqliteConnectOptions {
         .pragma("cache_size", "-64000")
         .pragma("temp_store", "MEMORY")
 }
+
+/// Starts a write transaction with an immediate write lock.
+///
+/// A deferred transaction that reads first can fail with `SQLITE_BUSY` when it
+/// later tries to upgrade to a writer, and `busy_timeout` does not retry that
+/// snapshot conflict. `BEGIN IMMEDIATE` takes the write lock up front. Only
+/// acquiring the transaction is retried: once a commit has been attempted its
+/// outcome is unknown, and retrying could apply the transaction twice.
+pub async fn begin_immediate(
+    pool: &SqlitePool,
+) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>, StoreError> {
+    // Match SQLite's own bounded retry shape: one initial attempt plus two
+    // short retries. `busy_timeout` on the connection handles ordinary lock
+    // waits; these retries cover snapshot conflicts that return immediately.
+    let mut delays = [Duration::from_millis(100), Duration::from_millis(200)].into_iter();
+    loop {
+        match pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(transaction) => return Ok(transaction),
+            Err(error) => {
+                if sqlite_is_busy(&error)
+                    && let Some(delay) = delays.next()
+                {
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                return Err(error.into());
+            }
+        }
+    }
+}
+
+/// SQLite reports extended result codes (for example 517 for
+/// `SQLITE_BUSY_SNAPSHOT`). The primary code is the low byte. Message matching
+/// is a fallback for wrappers that do not expose a numeric code.
+fn sqlite_is_busy(error: &sqlx::Error) -> bool {
+    let sqlx::Error::Database(database) = error else {
+        return false;
+    };
+    if let Some(code) = database.code()
+        && sqlite_code_is_busy(code.trim())
+    {
+        return true;
+    }
+    let message = database.message().to_ascii_lowercase();
+    message.contains("database is locked") || message.contains("database table is locked")
+}
+
+fn sqlite_code_is_busy(code: &str) -> bool {
+    if let Ok(code) = code.parse::<i32>()
+        && matches!(code & 0xff, 5 | 6)
+    {
+        return true;
+    }
+    code.eq_ignore_ascii_case("SQLITE_BUSY") || code.eq_ignore_ascii_case("SQLITE_LOCKED")
+}
+
 pub async fn vacuum_sqlite(src: &Path, dest: &Path) -> Result<(), StoreError> {
     if !src.is_file() {
         return Err(StoreError::Invalid(format!(
@@ -118,11 +178,68 @@ pub async fn vacuum_sqlite(src: &Path, dest: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Ordered schema changes after the version-1 baseline created by `init`.
+/// Keep each statement idempotent; `migrate::apply` wraps the whole entry in
+/// `BEGIN IMMEDIATE` and records its version atomically.
+const CHAT_MIGRATIONS: &[migrate::Migration] = &[migrate::Migration {
+    version: 2,
+    name: "rollout_recency_index",
+    statements: &["CREATE INDEX IF NOT EXISTS idx_rollouts_updated ON rollouts(updated_at)"],
+    columns: &[],
+}];
+
 #[derive(Clone)]
 pub struct ChatStore {
     pool: SqlitePool,
     harness_root: PathBuf,
     jobs: JobStore,
+}
+
+/// True when `path` is a structurally sound SQLite database. A crashed
+/// `VACUUM INTO` can leave a file with a valid header but missing pages;
+/// `PRAGMA quick_check(1)` catches that before the snapshot is trusted.
+async fn sqlite_snapshot_is_intact(path: &Path) -> bool {
+    use sqlx::Connection;
+
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .read_only(true)
+        .create_if_missing(false);
+    let Ok(mut connection) = sqlx::SqliteConnection::connect_with(&options).await else {
+        return false;
+    };
+    let result: Result<String, _> = sqlx::query_scalar("PRAGMA quick_check(1)")
+        .fetch_one(&mut connection)
+        .await;
+    let _ = connection.close().await;
+    result.is_ok_and(|value| value.eq_ignore_ascii_case("ok"))
+}
+
+/// Keep the newest 7 `chats-YYYYMMDD.db` snapshots. Runs after a fresh backup
+/// and after a same-day skip, so a long-lived install never accumulates.
+async fn prune_backups(dir: &Path) -> Result<(), StoreError> {
+    let mut entries = tokio::fs::read_dir(dir).await?;
+    let mut snaps: Vec<PathBuf> = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("chats-") && name.ends_with(".db"))
+        {
+            snaps.push(path);
+        }
+    }
+    snaps.sort();
+    while snaps.len() > 7 {
+        if let Some(oldest) = snaps.first().cloned() {
+            let _ = tokio::fs::remove_file(&oldest).await;
+            snaps.remove(0);
+        } else {
+            break;
+        }
+    }
+    Ok(())
 }
 
 impl ChatStore {
@@ -158,6 +275,16 @@ impl ChatStore {
         &self.jobs
     }
 
+    /// Checkpoints WAL and closes every pooled connection owned by this store.
+    /// Call after active runs have stopped so shutdown does not race a writer.
+    pub async fn close(&self) {
+        let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&self.pool)
+            .await;
+        self.pool.close().await;
+        self.jobs.close().await;
+    }
+
     async fn init(&self) -> Result<(), StoreError> {
         sqlx::query(
             r#"
@@ -178,13 +305,9 @@ impl ChatStore {
         )
         .execute(&self.pool)
         .await?;
-        for statement in [
-            "ALTER TABLE chats ADD COLUMN parent_chat_id TEXT",
-            "ALTER TABLE chats ADD COLUMN parent_workspace_id TEXT",
-            "ALTER TABLE chats ADD COLUMN token_usage_json TEXT",
-        ] {
-            let _ = sqlx::query(statement).execute(&self.pool).await;
-        }
+        migrate::ensure_column(&self.pool, "chats", "parent_chat_id", "TEXT").await?;
+        migrate::ensure_column(&self.pool, "chats", "parent_workspace_id", "TEXT").await?;
+        migrate::ensure_column(&self.pool, "chats", "token_usage_json", "TEXT").await?;
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS messages (
@@ -257,6 +380,8 @@ impl ChatStore {
         )
         .execute(&self.pool)
         .await;
+        migrate::baseline(&self.pool, "chats").await?;
+        migrate::apply(&self.pool, "chats", CHAT_MIGRATIONS).await?;
         Ok(())
     }
 
@@ -423,8 +548,15 @@ impl ChatStore {
         tokio::fs::create_dir_all(&dir).await?;
         let date = chrono::Utc::now().format("%Y%m%d").to_string();
         let dest = dir.join(format!("chats-{date}.db"));
-        // VACUUM INTO fails if the destination exists; remove yesterday's
-        // partial file first so the backup is always fresh.
+        // A restart must not delete and re-VACUUM a good snapshot from
+        // earlier today. `quick_check` validates structure, so a truncated
+        // file with a valid header is replaced instead of trusted.
+        if sqlite_snapshot_is_intact(&dest).await {
+            prune_backups(&dir).await?;
+            return Ok(dest);
+        }
+        // VACUUM INTO fails if the destination exists; remove a partial file
+        // first so the backup is always complete.
         let _ = tokio::fs::remove_file(&dest).await;
         let dest_text = dest.to_string_lossy().replace('\'', "''");
         // The path is generated, not user input (date-stamped filename under
@@ -434,28 +566,7 @@ impl ChatStore {
         sqlx::raw_sql(sqlx::AssertSqlSafe(sql.as_str()))
             .execute(&self.pool)
             .await?;
-        // Prune to the newest 7 snapshots.
-        let mut entries = tokio::fs::read_dir(&dir).await?;
-        let mut snaps: Vec<PathBuf> = Vec::new();
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            if path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("chats-") && name.ends_with(".db"))
-            {
-                snaps.push(path);
-            }
-        }
-        snaps.sort();
-        while snaps.len() > 7 {
-            if let Some(oldest) = snaps.first().cloned() {
-                let _ = tokio::fs::remove_file(&oldest).await;
-                snaps.remove(0);
-            } else {
-                break;
-            }
-        }
+        prune_backups(&dir).await?;
         Ok(dest)
     }
 
@@ -532,7 +643,7 @@ impl ChatStore {
             .map(serde_json::to_string)
             .transpose()
             .map_err(|e| StoreError::Invalid(e.to_string()))?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = begin_immediate(&self.pool).await?;
         sqlx::query(
             "INSERT INTO messages (id, chat_id, role, content, timestamp, is_trace, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
@@ -1256,7 +1367,7 @@ impl ChatStore {
 
     pub async fn delete_chat(&self, chat_id: &str) -> Result<bool, StoreError> {
         validate_chat_id(chat_id)?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = begin_immediate(&self.pool).await?;
         sqlx::query("DELETE FROM messages WHERE chat_id = ?")
             .bind(chat_id)
             .execute(&mut *tx)
@@ -1359,7 +1470,7 @@ impl ChatStore {
             .filter(|value| !value.trim().is_empty())
             .map(str::to_string)
             .unwrap_or_else(now_iso);
-        let mut tx = self.pool.begin().await?;
+        let mut tx = begin_immediate(&self.pool).await?;
         sqlx::query(
             r#"
             INSERT INTO chats
@@ -1508,7 +1619,7 @@ impl ChatStore {
             .collect();
         let keep = &rows[..index];
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = begin_immediate(&self.pool).await?;
         for row in &rows[index..] {
             sqlx::query("DELETE FROM messages WHERE id = ? AND chat_id = ?")
                 .bind(row.get::<String, _>("id"))
@@ -2376,5 +2487,165 @@ mod tests {
         let info = store.rollout_info("chat-roll").await.unwrap().unwrap();
         assert_eq!(info["last_ordinal"], 7);
         assert!(info["path"].as_str().unwrap().contains("chat-roll.jsonl"));
+    }
+
+    #[tokio::test]
+    async fn backup_database_is_idempotent_for_the_same_day() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        let workspace = dir.path().to_string_lossy().to_string();
+        let chat = store
+            .create_chat("_general", &workspace, "Backup", "model")
+            .await
+            .unwrap();
+        let chat_id = chat["id"].as_str().unwrap().to_string();
+        store
+            .append_message(&chat_id, "user", "hello", false)
+            .await
+            .unwrap();
+        let first = store.backup_database().await.unwrap();
+        let before = tokio::fs::read(&first).await.unwrap();
+        assert!(!before.is_empty());
+        // A restart restarts this loop; it must not delete and re-VACUUM a
+        // good snapshot from earlier today.
+        let second = store.backup_database().await.unwrap();
+        assert_eq!(first, second);
+        let after = tokio::fs::read(&second).await.unwrap();
+        assert_eq!(before, after);
+
+        // A valid header does not make a complete database: truncating the
+        // snapshot must cause a fresh backup instead of trusting it.
+        let mut truncated = after.clone();
+        truncated.truncate(32);
+        tokio::fs::write(&second, &truncated).await.unwrap();
+        let repaired = store.backup_database().await.unwrap();
+        assert_eq!(second, repaired);
+        let repaired_bytes = tokio::fs::read(&repaired).await.unwrap();
+        assert!(repaired_bytes.len() > 32);
+    }
+
+    #[test]
+    fn sqlite_busy_codes_are_retryable() {
+        for code in ["5", "517", "6", "262", "SQLITE_BUSY", "SQLITE_LOCKED"] {
+            assert!(sqlite_code_is_busy(code), "{code}");
+        }
+        for code in ["19", "SQLITE_CONSTRAINT", ""] {
+            assert!(!sqlite_code_is_busy(code), "{code}");
+        }
+    }
+
+    #[tokio::test]
+    async fn existing_chat_database_is_baselined_and_columns_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(".deep_agents").join("chats.db");
+        tokio::fs::create_dir_all(db.parent().unwrap())
+            .await
+            .unwrap();
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(sqlite_options(&db, true))
+            .await
+            .unwrap();
+        // The pre-migration schema: no parent_chat_id, parent_workspace_id,
+        // or token_usage_json, and no version table.
+        sqlx::query(
+            r#"
+            CREATE TABLE chats (
+                id TEXT PRIMARY KEY,
+                workspace_id TEXT,
+                workspace_path TEXT,
+                title TEXT,
+                model TEXT,
+                created_at TEXT,
+                updated_at TEXT,
+                message_count INTEGER DEFAULT 0,
+                mode TEXT DEFAULT 'build',
+                pinned INTEGER DEFAULT 0,
+                tasks_json TEXT
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO chats (id, title) VALUES ('chat-old', 'Old')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('chats')")
+                .fetch_all(&store.pool)
+                .await
+                .unwrap();
+        for column in ["parent_chat_id", "parent_workspace_id", "token_usage_json"] {
+            assert!(columns.iter().any(|value| value == column), "{column}");
+        }
+        let version: i64 = sqlx::query_scalar(
+            "SELECT MAX(version) FROM _stark_migrations WHERE namespace = 'chats'",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(version, 2);
+        let title: String = sqlx::query_scalar("SELECT title FROM chats WHERE id = 'chat-old'")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(title, "Old");
+        store.close().await;
+    }
+
+    #[tokio::test]
+    async fn close_checkpoints_and_truncates_the_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        let workspace = dir.path().to_string_lossy().to_string();
+        let chat = store
+            .create_chat("_general", &workspace, "Close", "model")
+            .await
+            .unwrap();
+        let chat_id = chat["id"].as_str().unwrap().to_string();
+        store
+            .append_message(&chat_id, "user", "checkpoint me", false)
+            .await
+            .unwrap();
+        let wal = dir.path().join(".deep_agents").join("chats.db-wal");
+        assert!(wal.is_file(), "the write should create a WAL");
+        store.close().await;
+        let remaining = std::fs::metadata(&wal).map(|meta| meta.len()).unwrap_or(0);
+        assert_eq!(remaining, 0, "close must checkpoint the WAL");
+    }
+
+    #[tokio::test]
+    async fn concurrent_appends_do_not_fail_with_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        let workspace = dir.path().to_string_lossy().to_string();
+        let chat = store
+            .create_chat("_general", &workspace, "Concurrent", "model")
+            .await
+            .unwrap();
+        let chat_id = chat["id"].as_str().unwrap().to_string();
+        let mut tasks = Vec::new();
+        for worker in 0..8 {
+            let store = store.clone();
+            let chat_id = chat_id.clone();
+            tasks.push(tokio::spawn(async move {
+                for item in 0..10 {
+                    store
+                        .append_message(&chat_id, "user", &format!("worker-{worker}-{item}"), false)
+                        .await
+                        .unwrap();
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(store.history(&chat_id, 200).await.unwrap().len(), 80);
+        store.close().await;
     }
 }

@@ -1,22 +1,24 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, Query, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::header::ORIGIN;
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::middleware;
 use axum::response::IntoResponse;
 use axum::response::Response;
-use axum::response::sse::{Event, Sse};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use chrono::Utc;
 use dashmap::DashMap;
-use dashmap::mapref::entry::Entry;
 use futures_util::{Stream, StreamExt, stream};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -32,16 +34,16 @@ use stark_tools::{
     Checkpoint, HouseStore, PlanStore, QuestionBroker, evaluate_acceptance, public_device,
     public_state,
 };
-use tokio::sync::broadcast;
-use tokio_stream::wrappers::BroadcastStream;
+use tokio::sync::{broadcast, mpsc};
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
-use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 mod cloud;
 mod data_transfer;
+mod harness_lock;
 mod pairing;
 mod screen_routes;
 mod voice;
@@ -49,45 +51,139 @@ use pairing::PairingStore;
 
 type SseStream = Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>;
 
+/// OpenCode V2's live EventFeed subscriber capacity.
+const SSE_SUBSCRIBER_CAPACITY: usize = 4096;
+/// Internal run broadcast capacity. The live bridge turns overflow into a
+/// closed stream instead of silently dropping frames.
+const RUN_EVENT_CAPACITY: usize = 4096;
+const SSE_HEARTBEAT: Duration = Duration::from_secs(15);
+
 struct RunHandle {
+    run_id: String,
     cancel: CancellationToken,
     tx: broadcast::Sender<ServerEvent>,
     steering: Arc<Mutex<VecDeque<String>>>,
     follow_up: Arc<Mutex<VecDeque<String>>>,
     started_at: String,
     workspace_path: String,
+    /// Latest live `AppState` produced by the run. Unlike `last_state`, this is
+    /// available while the run is still active, so reconnecting clients can
+    /// recover the current UI state instead of waiting for the next state event.
+    latest: Arc<Mutex<Option<AppState>>>,
 }
 
-#[derive(Default)]
+struct RunAttachment {
+    run_id: String,
+    receiver: broadcast::Receiver<ServerEvent>,
+}
+
+struct RunClaim {
+    run_id: String,
+    latest: Arc<Mutex<Option<AppState>>>,
+    cancel: CancellationToken,
+    tx: broadcast::Sender<ServerEvent>,
+    steering: Arc<Mutex<VecDeque<String>>>,
+    follow_up: Arc<Mutex<VecDeque<String>>>,
+    workspace_path: String,
+}
+
 struct RunManager {
     runs: DashMap<String, RunHandle>,
     last_state: DashMap<String, Value>,
+    /// FIFO insertion order for `last_state` eviction. DashMap has no
+    /// ordering, so the oldest chat is dropped once the cap is reached.
+    state_order: Mutex<VecDeque<String>>,
+    /// Process-wide admission cap. Codex rejects with `AgentLimitReached`
+    /// instead of over-subscribing the machine; 0 disables the cap.
+    max_runs: usize,
+    /// Serializes the length check and insertion so two chats cannot both
+    /// take the last slot.
+    admission: Mutex<()>,
+    /// Set before the first cancellation during shutdown. Every claim path
+    /// checks it so a delayed follow-up retry cannot start new work while the
+    /// store is being closed.
+    shutting_down: AtomicBool,
+}
+
+impl Default for RunManager {
+    fn default() -> Self {
+        Self {
+            runs: DashMap::new(),
+            last_state: DashMap::new(),
+            state_order: Mutex::new(VecDeque::new()),
+            max_runs: std::env::var("STARK_MAX_CONCURRENT_RUNS")
+                .ok()
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(8),
+            admission: Mutex::new(()),
+            shutting_down: AtomicBool::new(false),
+        }
+    }
+}
+
+/// One cached `AppState` JSON per finished chat. 128 entries cover a long
+/// session without growing for the life of the server.
+const MAX_CACHED_STATES: usize = 128;
+
+/// Why `RunManager::claim` refused. `AlreadyRunning` is per chat; `Limit` is
+/// the machine-wide cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimError {
+    AlreadyRunning,
+    Limit { max: usize },
+    ShuttingDown,
+}
+
+impl ClaimError {
+    fn message(self) -> String {
+        match self {
+            Self::AlreadyRunning => "This chat already has a running agent.".to_string(),
+            Self::Limit { max } => format!(
+                "Server run limit reached ({max} concurrent runs, STARK_MAX_CONCURRENT_RUNS). Wait for a run to finish and retry."
+            ),
+            Self::ShuttingDown => "The server is shutting down.".to_string(),
+        }
+    }
 }
 
 impl RunManager {
-    fn claim(
-        &self,
-        chat_id: &str,
-        cancel: CancellationToken,
-        tx: broadcast::Sender<ServerEvent>,
-        steering: Arc<Mutex<VecDeque<String>>>,
-        follow_up: Arc<Mutex<VecDeque<String>>>,
-        workspace_path: &str,
-    ) -> bool {
-        match self.runs.entry(chat_id.to_string()) {
-            Entry::Occupied(_) => false,
-            Entry::Vacant(entry) => {
-                entry.insert(RunHandle {
-                    cancel,
-                    tx,
-                    steering,
-                    follow_up,
-                    started_at: Utc::now().to_rfc3339(),
-                    workspace_path: workspace_path.to_string(),
-                });
-                true
-            }
+    fn claim(&self, chat_id: &str, claim: RunClaim) -> Result<(), ClaimError> {
+        let RunClaim {
+            run_id,
+            latest,
+            cancel,
+            tx,
+            steering,
+            follow_up,
+            workspace_path,
+        } = claim;
+        let _admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(ClaimError::ShuttingDown);
         }
+        if self.runs.contains_key(chat_id) {
+            return Err(ClaimError::AlreadyRunning);
+        }
+        if self.max_runs > 0 && self.runs.len() >= self.max_runs {
+            return Err(ClaimError::Limit { max: self.max_runs });
+        }
+        self.runs.insert(
+            chat_id.to_string(),
+            RunHandle {
+                run_id,
+                cancel,
+                tx,
+                steering,
+                follow_up,
+                started_at: Utc::now().to_rfc3339(),
+                workspace_path,
+                latest,
+            },
+        );
+        Ok(())
     }
 
     fn finish(&self, chat_id: &str, state: Option<AppState>) {
@@ -96,6 +192,22 @@ impl RunManager {
             && let Ok(value) = serde_json::to_value(&state)
         {
             self.last_state.insert(chat_id.to_string(), value);
+            if let Ok(mut order) = self.state_order.lock() {
+                order.retain(|id| id != chat_id);
+                order.push_back(chat_id.to_string());
+                while order.len() > MAX_CACHED_STATES {
+                    if let Some(oldest) = order.pop_front() {
+                        self.last_state.remove(&oldest);
+                    }
+                }
+            }
+        }
+    }
+
+    fn forget(&self, chat_id: &str) {
+        self.last_state.remove(chat_id);
+        if let Ok(mut order) = self.state_order.lock() {
+            order.retain(|id| id != chat_id);
         }
     }
 
@@ -115,6 +227,7 @@ impl RunManager {
                 json!({
                     "running": true,
                     "chat_id": entry.key(),
+                    "run_id": entry.run_id,
                     "workspace_path": entry.workspace_path,
                     "started_at": entry.started_at,
                 })
@@ -176,12 +289,44 @@ impl RunManager {
         true
     }
 
+    /// Stops new admissions and cancels every claimed run. Returns the number
+    /// signalled so shutdown can log whether it actually interrupted work.
+    fn cancel_all(&self) -> usize {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        let mut cancelled = 0;
+        for handle in self.runs.iter() {
+            handle.cancel.cancel();
+            cancelled += 1;
+        }
+        cancelled
+    }
+
     fn subscribe(&self, chat_id: &str) -> Option<broadcast::Receiver<ServerEvent>> {
         self.runs.get(chat_id).map(|handle| handle.tx.subscribe())
     }
 
+    /// Subscribe and capture the run metadata atomically. The receiver is
+    /// created before the caller reads the rollout watermark, so durable and
+    /// live observation cannot miss an append that lands during setup.
+    fn attach(&self, chat_id: &str) -> Option<RunAttachment> {
+        self.runs.get(chat_id).map(|handle| RunAttachment {
+            run_id: handle.run_id.clone(),
+            receiver: handle.tx.subscribe(),
+        })
+    }
+
+    fn run_id(&self, chat_id: &str) -> Option<String> {
+        self.runs.get(chat_id).map(|handle| handle.run_id.clone())
+    }
+
     fn state(&self, chat_id: Option<&str>) -> Option<Value> {
         if let Some(chat_id) = chat_id {
+            if let Some(handle) = self.runs.get(chat_id)
+                && let Some(snapshot) = handle.latest.lock().ok().and_then(|guard| guard.clone())
+                && let Ok(value) = serde_json::to_value(snapshot)
+            {
+                return Some(value);
+            }
             return self.last_state.get(chat_id).map(|value| value.clone());
         }
         self.last_state
@@ -197,6 +342,7 @@ impl RunManager {
                     "running": true,
                     "workspace_path": handle.workspace_path,
                     "chat_id": chat_id,
+                    "run_id": handle.run_id,
                     "started_at": handle.started_at,
                 });
             }
@@ -475,12 +621,79 @@ async fn main() -> anyhow::Result<()> {
             harness_root.display()
         )
     })?;
+    // One server owns a harness root. The advisory lock is released by the OS
+    // on exit or crash, so it never becomes a permanent stale lock.
+    let harness_guard = harness_lock::HarnessLock::acquire(&harness_root)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    tracing::info!("harness lock: {}", harness_guard.path().display());
     // Keys come ONLY from <harness_root>/.env. Never load the process cwd
     // .env: that file belongs to a workspace the agent can edit, and must
     // never supply provider keys.
     let app_env = harness_root.join(".env");
     if app_env.is_file() {
         let _ = dotenvy::from_path(&app_env);
+    }
+    // Load the Starlark execution policy. A missing or invalid file keeps the
+    // built-in destructive-command rules; it never disables the policy.
+    let policy = stark_policy::configure(&harness_root);
+    match (&policy.path, &policy.error) {
+        (Some(path), Some(error)) => {
+            tracing::warn!("exec policy {} failed to load: {error}", path.display());
+        }
+        (Some(path), None) if policy.loaded => tracing::info!(
+            "exec policy: {} ({} command rules, {} network rules, {} host executables)",
+            path.display(),
+            policy.rules,
+            policy.network_rules,
+            policy.host_executables
+        ),
+        _ => tracing::info!(
+            "exec policy: built-in defaults ({} command rules)",
+            policy.rules
+        ),
+    }
+    // Children always get proxy variables; when network is off the proxy
+    // denies every destination. Set STARK_NETWORK_PROXY=off only for
+    // debugging on a machine with external OS isolation.
+    let proxy_disabled = std::env::var("STARK_NETWORK_PROXY")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "off" | "0" | "false" | "none"
+            )
+        });
+    if proxy_disabled {
+        tracing::warn!(
+            "network proxy disabled by STARK_NETWORK_PROXY; child egress policy is advisory only"
+        );
+    } else {
+        match stark_sandbox::netproxy::start_background("127.0.0.1:0").await {
+            Ok(url) => tracing::info!(
+                "network proxy: {url} (network {}, local destinations {})",
+                if stark_sandbox::network_enabled() {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                if std::env::var("STARK_NETWORK_ALLOW_LOCAL")
+                    .ok()
+                    .is_some_and(|value| {
+                        matches!(
+                            value.trim().to_ascii_lowercase().as_str(),
+                            "on" | "1" | "true" | "yes"
+                        )
+                    })
+                {
+                    "allowed"
+                } else {
+                    "blocked"
+                }
+            ),
+            Err(error) => tracing::warn!(
+                "network proxy failed to start: {error}; child egress policy is advisory only"
+            ),
+        }
     }
     // Provider/base/model come from `.deep_agents/config/providers.json`.
     // Environment variables only supply keys (referenced by `key_env`).
@@ -507,13 +720,24 @@ async fn main() -> anyhow::Result<()> {
         provider.config().model
     );
     tracing::info!("{}", stark_tools::sandbox_status(&harness_root));
+    if stark_sandbox::strict() && !stark_sandbox::enforced() {
+        tracing::error!(
+            "STARK_SANDBOX_STRICT is set but no filesystem sandbox backend is enforcing; shell commands will be refused"
+        );
+    }
+    // One cancellation token stops every long-lived background loop. Tasks
+    // that only sleep are tracked so shutdown can abort them after the grace
+    // period instead of leaving a writer alive behind a closed pool.
+    let shutdown = CancellationToken::new();
+    let mut background: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     // Learn the real context window per model from every configured provider
     // instead of guessing. Best-effort.
     let provider_health = Arc::new(Mutex::new(HashMap::new()));
     {
         let providers = providers.clone();
         let health = provider_health.clone();
-        tokio::spawn(async move {
+        let shutdown = shutdown.clone();
+        background.push(tokio::spawn(async move {
             loop {
                 let mut learned = 0;
                 for (id, provider) in providers.iter() {
@@ -540,9 +764,11 @@ async fn main() -> anyhow::Result<()> {
                 if learned > 0 {
                     tracing::info!("learned context windows for {learned} model(s)");
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await;
+                if !sleep_or_shutdown(std::time::Duration::from_secs(6 * 3600), &shutdown).await {
+                    break;
+                }
             }
-        });
+        }));
     }
     // A staged import replaces files before the store opens; afterwards the
     // chat rows still carry the old absolute workspace prefix, so rebase them.
@@ -566,6 +792,77 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("no voice models directory found; voice/TTS endpoints will return 503");
     }
     let mcp_manager = stark_tools::init_mcp(&harness_root);
+    // Bounded, silent cleanup of harness-generated files (spilled tool output,
+    // rewind snapshots in every workspace, orphan import staging). Runs off
+    // the boot path and repeats hourly. Nothing model-visible.
+    {
+        let sweeper_root = harness_root.clone();
+        let shutdown = shutdown.clone();
+        background.push(tokio::spawn(async move {
+            let policy = stark_tools::RetentionPolicy::from_env();
+            let mut low_disk = false;
+            loop {
+                let root = sweeper_root.clone();
+                let (report, free) = tokio::task::spawn_blocking(move || {
+                    let registry = WorkspaceRegistry::new(&root);
+                    let mut workspaces: Vec<PathBuf> = registry
+                        .list()
+                        .into_iter()
+                        .map(|record| PathBuf::from(record.path))
+                        .filter(|path| path.is_dir())
+                        .collect();
+                    // Worktree agents checkpoint into the worktree, which is
+                    // not a registered workspace. Sweep live worktrees too;
+                    // settled ones are removed by worktree GC.
+                    let worktrees = root.join(".deep_agents").join("worktrees");
+                    if let Ok(entries) = std::fs::read_dir(worktrees) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.is_dir() {
+                                workspaces.push(path);
+                            }
+                        }
+                    }
+                    let report = stark_tools::sweep_harness(&root, &workspaces, &policy);
+                    (report, stark_tools::free_bytes(&root))
+                })
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!("retention sweep failed: {error}");
+                    (stark_tools::RetentionReport::default(), None)
+                });
+                if !report.is_empty() {
+                    tracing::info!(
+                        "retention: removed {} scratch files ({:.1} MB), {} snapshot runs ({:.1} MB), {} imports",
+                        report.scratch_removed,
+                        report.scratch_bytes as f64 / (1024.0 * 1024.0),
+                        report.snapshot_runs_removed,
+                        report.snapshot_bytes as f64 / (1024.0 * 1024.0),
+                        report.imports_removed
+                    );
+                }
+                match free {
+                    Some(bytes) if bytes < 2 * 1024 * 1024 * 1024 => {
+                        if !low_disk {
+                            tracing::warn!(
+                                "harness drive has only {:.1} GB free; builds and runs may fail",
+                                bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+                            );
+                            low_disk = true;
+                        }
+                    }
+                    Some(_) if low_disk => {
+                        tracing::info!("harness drive free space recovered");
+                        low_disk = false;
+                    }
+                    _ => {}
+                }
+                if !sleep_or_shutdown(std::time::Duration::from_secs(3600), &shutdown).await {
+                    break;
+                }
+            }
+        }));
+    }
     let state = ServerState {
         store,
         provider,
@@ -584,30 +881,34 @@ async fn main() -> anyhow::Result<()> {
     let group_runner_state = state.clone();
     let canvas_state = state.clone();
     let agent_state = state.clone();
-    tokio::spawn(async move {
+    background.push(tokio::spawn(async move {
         mcp_manager.start_all().await;
-    });
+    }));
     // Daily chats.db backup (plus one at startup). Best-effort.
     {
         let backup_store = state.store.clone();
-        tokio::spawn(async move {
+        let shutdown = shutdown.clone();
+        background.push(tokio::spawn(async move {
             if let Err(error) = backup_store.backup_database().await {
                 tracing::warn!("startup chats.db backup failed: {error}");
             }
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(24 * 3600)).await;
+                if !sleep_or_shutdown(std::time::Duration::from_secs(24 * 3600), &shutdown).await {
+                    break;
+                }
                 if let Err(error) = backup_store.backup_database().await {
                     tracing::warn!("daily chats.db backup failed: {error}");
                 }
             }
-        });
+        }));
     }
     // Daily portable snapshot (encrypted when STARK_SNAPSHOT_PASSPHRASE is
     // set). This is the backup that can be restored on another machine.
     {
         let snapshot_root = state.harness_root.clone();
         let snapshot_store = state.store.clone();
-        tokio::spawn(async move {
+        let shutdown = shutdown.clone();
+        background.push(tokio::spawn(async move {
             loop {
                 match data_transfer::snapshot_once(&snapshot_root, &snapshot_store).await {
                     Ok(path) => tracing::info!("snapshot written: {}", path.display()),
@@ -618,14 +919,18 @@ async fn main() -> anyhow::Result<()> {
                     .and_then(|value| value.trim().parse::<u64>().ok())
                     .filter(|value| *value > 0)
                     .unwrap_or(24);
-                tokio::time::sleep(std::time::Duration::from_secs(hours * 3600)).await;
+                if !sleep_or_shutdown(std::time::Duration::from_secs(hours * 3600), &shutdown).await
+                {
+                    break;
+                }
             }
-        });
+        }));
     }
 
     let app = Router::new()
-        .route("/api/run", post(run_handler))
-        .route("/api/stream/{chat_id}", get(stream_handler))
+        .route("/api/chats/{chat_id}/run", post(run_command_handler))
+        .route("/api/chats/{chat_id}/events", get(chat_events_handler))
+        .route("/api/chats/{chat_id}/log", get(chat_log_handler))
         .route("/api/abort", post(abort_handler))
         .route("/api/health", get(health_handler))
         .route("/api/state", get(state_handler))
@@ -871,25 +1176,18 @@ async fn main() -> anyhow::Result<()> {
             "/api/cloud/receive",
             post(cloud_receive_handler).layer(DefaultBodyLimit::max(512 * 1024 * 1024)),
         )
+        // `origin_guard` is added last so it runs before auth/CORS. The CORS
+        // layer stays permissive for the allowed origins; disallowed browser
+        // origins never reach it.
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
-        ));
+        ))
+        .layer(middleware::from_fn(origin_guard));
 
-    // Remote/mobile mode: serve the production Vite build from the same
-    // origin so a phone only needs http://<laptop>:<port>. The shell stays
-    // public (the pairing gate lives inside it); /api/* is still guarded.
-    let app = if let Some(dist) = frontend_dist(&state.harness_root) {
-        let assets = dist.join("assets");
-        tracing::info!("serving frontend from {}", dist.display());
-        app.nest_service("/assets", ServeDir::new(assets))
-            .fallback(spa_fallback)
-    } else {
-        app
-    }
-    .with_state(state.clone());
+    let app = app.with_state(state.clone());
 
     let host = std::env::var("STARK_HOST")
         .or_else(|_| std::env::var("STARK_BIND"))
@@ -897,20 +1195,177 @@ async fn main() -> anyhow::Result<()> {
     let port = std::env::var("STARK_PORT").unwrap_or_else(|_| "8124".to_string());
     let address = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&address).await?;
-    tokio::spawn(schedule_loop(scheduler_state));
-    tokio::spawn(group_loop(group_runner_state));
-    tokio::spawn(canvas_loop(canvas_state));
-    tokio::spawn(agent_loop(agent_state));
+    background.push(tokio::spawn(schedule_loop(
+        scheduler_state,
+        shutdown.clone(),
+    )));
+    background.push(tokio::spawn(group_loop(
+        group_runner_state,
+        shutdown.clone(),
+    )));
+    background.push(tokio::spawn(canvas_loop(canvas_state, shutdown.clone())));
+    background.push(tokio::spawn(agent_loop(agent_state, shutdown.clone())));
     tracing::info!("stark-server listening on http://{address}");
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?;
+
+    let signal_state = state.clone();
+    let signal_shutdown = shutdown.clone();
+    let signal_task = tokio::spawn(async move {
+        shutdown_signal().await;
+        tracing::info!("shutdown signal received");
+        signal_shutdown.cancel();
+        let runs = signal_state.runs.cancel_all();
+        let children = stark_core::cancel_all_child_runs();
+        let agents = stark_core::cancel_all_agent_runs();
+        tracing::info!(
+            "shutdown: cancelled {runs} run(s), {children} child run(s), {agents} agent run(s)"
+        );
+    });
+
+    let server_shutdown = shutdown.clone();
+    let server = async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move { server_shutdown.cancelled().await })
+        .await
+    };
+    tokio::pin!(server);
+    let grace = shutdown.clone();
+    let deadline = async move {
+        grace.cancelled().await;
+        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+    };
+    let server_error = tokio::select! {
+        result = &mut server => result.err(),
+        _ = deadline => {
+            tracing::warn!("graceful shutdown exceeded 15s; closing remaining connections");
+            None
+        }
+    };
+
+    // Stop loops and runs even when the server ended on its own (for example a
+    // listener error) instead of a signal. Give loops a short cooperative
+    // window first: aborting one halfway through `spawn_agent_run` can strand
+    // a claimed run that no task will finish. Anything still running after the
+    // window is aborted, then the admission gate and cancellation sweep run.
+    shutdown.cancel();
+    signal_task.abort();
+    let _ = signal_task.await;
+    let drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while tokio::time::Instant::now() < drain_deadline
+        && background.iter().any(|handle| !handle.is_finished())
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    for handle in &background {
+        if !handle.is_finished() {
+            handle.abort();
+        }
+    }
+    let runs = state.runs.cancel_all();
+    let children = stark_core::cancel_all_child_runs();
+    let agents = stark_core::cancel_all_agent_runs();
+    if runs + children + agents > 0 {
+        tracing::info!(
+            "shutdown: cancelled {runs} run(s), {children} child run(s), {agents} agent run(s)"
+        );
+    }
+    wait_for_runs(&state, std::time::Duration::from_secs(10)).await;
+    for handle in background {
+        let _ = handle.await;
+    }
+    if tokio::time::timeout(std::time::Duration::from_secs(5), state.store.close())
+        .await
+        .is_err()
+    {
+        tracing::warn!("store close timed out; process exit will release SQLite handles");
+    }
+    if let Some(error) = server_error {
+        return Err(error.into());
+    }
+    tracing::info!("stark-server stopped");
     Ok(())
 }
 
-async fn canvas_loop(state: ServerState) {
+/// Resolves on Ctrl-C, or on SIGTERM on Unix. Windows process termination that
+/// does not go through the console handler still relies on OS-level cleanup;
+/// this covers the normal desktop close and developer Ctrl-C paths.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut terminate = match signal(SignalKind::terminate()) {
+            Ok(signal) => signal,
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(windows)]
+    {
+        // A desktop app or test harness may use Ctrl-Break rather than
+        // Ctrl-C. Both take the same graceful path.
+        let mut ctrl_break = match tokio::signal::windows::ctrl_break() {
+            Ok(signal) => signal,
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = ctrl_break.recv() => {}
+        }
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Sleeps for `duration` unless shutdown starts first. Returns false when the
+/// loop should stop.
+async fn sleep_or_shutdown(duration: std::time::Duration, shutdown: &CancellationToken) -> bool {
+    tokio::select! {
+        _ = shutdown.cancelled() => false,
+        _ = tokio::time::sleep(duration) => true,
+    }
+}
+
+/// Waits for top-level and child runs to release their rollout writers. The
+/// timeout is a bound, not a guarantee: a provider request that ignores
+/// cancellation cannot hold process exit forever.
+async fn wait_for_runs(state: &ServerState, timeout: std::time::Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        // A delayed follow-up retry or an already-spawned group task can reach
+        // the claim gate just after the first sweep. Re-signal on every tick;
+        // admissions are closed, so this drains instead of racing.
+        state.runs.cancel_all();
+        stark_core::cancel_all_child_runs();
+        stark_core::cancel_all_agent_runs();
+        let active = state.runs.running_count();
+        let children = stark_core::child_run_count();
+        if active == 0 && children == 0 {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                "shutdown: {active} run(s) and {children} child run(s) still active after grace period"
+            );
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+async fn canvas_loop(state: ServerState, shutdown: CancellationToken) {
     let store = match CanvasStore::open(&state.harness_root).await {
         Ok(store) => store,
         Err(error) => {
@@ -924,7 +1379,9 @@ async fn canvas_loop(state: ServerState) {
         tracing::info!("recovered {count} interrupted canvas wake(s)");
     }
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if !sleep_or_shutdown(std::time::Duration::from_secs(1), &shutdown).await {
+            break;
+        }
         let due = match store.due_wakes(20).await {
             Ok(due) => due,
             Err(error) => {
@@ -1023,7 +1480,7 @@ fn canvas_target(state: &ServerState, chat: &Value) -> RunTarget {
     }
 }
 
-async fn schedule_loop(state: ServerState) {
+async fn schedule_loop(state: ServerState, shutdown: CancellationToken) {
     let store = match ScheduleStore::open(&state.harness_root).await {
         Ok(store) => store,
         Err(error) => {
@@ -1032,7 +1489,9 @@ async fn schedule_loop(state: ServerState) {
         }
     };
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        if !sleep_or_shutdown(std::time::Duration::from_secs(15), &shutdown).await {
+            break;
+        }
         let due = match store.due(20).await {
             Ok(due) => due,
             Err(error) => {
@@ -1084,7 +1543,7 @@ async fn schedule_loop(state: ServerState) {
     }
 }
 
-async fn group_loop(state: ServerState) {
+async fn group_loop(state: ServerState, shutdown: CancellationToken) {
     let groups = GroupStore::default_root();
     match groups.recover_doing_items().await {
         Ok(count) if count > 0 => tracing::info!("recovered {count} interrupted group item(s)"),
@@ -1092,7 +1551,9 @@ async fn group_loop(state: ServerState) {
         Err(error) => tracing::warn!("group runner recovery failed: {error}"),
     }
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        if !sleep_or_shutdown(std::time::Duration::from_secs(2), &shutdown).await {
+            break;
+        }
         for project in groups
             .list()
             .await
@@ -1259,35 +1720,44 @@ async fn run_group_item(state: ServerState, groups: GroupStore, project_id: Stri
         }
     };
     let chat_id = chat["id"].as_str().unwrap_or_default().to_string();
-    let (tx, _) = broadcast::channel(256);
+    let (tx, _) = broadcast::channel(RUN_EVENT_CAPACITY);
     let cancel = CancellationToken::new();
     let steering = Arc::new(Mutex::new(VecDeque::new()));
     let follow_up = Arc::new(Mutex::new(VecDeque::new()));
-    if !state.runs.claim(
+    let run_id = Checkpoint::next_run_id();
+    let latest = Arc::new(Mutex::new(None));
+    if let Err(error) = state.runs.claim(
         &chat_id,
-        cancel.clone(),
-        tx.clone(),
-        steering.clone(),
-        follow_up.clone(),
-        workspace.to_string_lossy().as_ref(),
+        RunClaim {
+            run_id: run_id.clone(),
+            latest: latest.clone(),
+            cancel: cancel.clone(),
+            tx: tx.clone(),
+            steering: steering.clone(),
+            follow_up: follow_up.clone(),
+            workspace_path: workspace.to_string_lossy().to_string(),
+        },
     ) {
+        if error == ClaimError::ShuttingDown {
+            return;
+        }
+        let message = error.message();
         let _ = groups
             .finish_item(
                 &project_id,
                 item["id"].as_str().unwrap_or(""),
                 false,
-                "Worker chat already has an active run.",
+                &message,
             )
             .await;
         return;
     }
 
-    let checkpoint = Checkpoint::begin(&chat_id, &workspace);
+    let checkpoint = Checkpoint::begin_with_run_id(&chat_id, &workspace, run_id);
     if workspace != state.harness_root {
         let snapshot = checkpoint.clone();
         let _ = tokio::task::spawn_blocking(move || snapshot.snapshot_all()).await;
     }
-    let latest = Arc::new(Mutex::new(None));
     let ctx = RunContext {
         chat_id: chat_id.clone(),
         workspace_id,
@@ -1459,10 +1929,51 @@ async fn notify_group_origin(
     spawn_follow_up_run(state.clone(), target, message);
 }
 
-async fn run_handler(
-    State(state): State<ServerState>,
-    Json(request): Json<RunRequest>,
-) -> Result<Sse<SseStream>, (StatusCode, Json<Value>)> {
+struct StartedRun {
+    chat_id: String,
+    run_id: String,
+    after_seq: u64,
+}
+
+enum StartRunError {
+    Http(StatusCode, Value),
+    AlreadyRunning {
+        chat_id: String,
+        run_id: Option<String>,
+        current_seq: u64,
+    },
+}
+
+impl StartRunError {
+    fn into_http(self) -> (StatusCode, Json<Value>) {
+        match self {
+            Self::Http(status, body) => (status, Json(body)),
+            Self::AlreadyRunning {
+                chat_id,
+                run_id,
+                current_seq,
+            } => (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "This chat already has a running agent.",
+                    "code": "already_running",
+                    "chat_id": chat_id,
+                    "run_id": run_id,
+                    "current_seq": current_seq,
+                })),
+            ),
+        }
+    }
+}
+
+fn latest_seq(harness_root: &std::path::Path, chat_id: &str) -> u64 {
+    stark_store::rollout::find_rollout(harness_root, chat_id)
+        .and_then(|path| stark_store::rollout::latest_ordinal(&path))
+        .unwrap_or(0)
+}
+
+/// Shared admission + launch path for `POST /api/chats/{chat_id}/run`.
+async fn start_run(state: &ServerState, request: RunRequest) -> Result<StartedRun, StartRunError> {
     let mut prompt = request.prompt.trim().to_string();
     if !request.attachments.is_empty() {
         let note = attachment_note(&state.harness_root, &request.attachments);
@@ -1480,21 +1991,21 @@ Attached files:
         }
     }
     if prompt.is_empty() {
-        return Err((
+        return Err(StartRunError::Http(
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "prompt is required"})),
+            json!({"error": "prompt is required"}),
         ));
     }
     // Drain gate: deploys write this marker, wait for active runs to settle,
     // swap the binary, then remove it. New runs are refused meanwhile so a
     // restart can never kill a delegation mid-flight.
     if state.harness_root.join(".drain").exists() {
-        return Err((
+        return Err(StartRunError::Http(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({
+            json!({
                 "error": "Stark is deploying a new version. Your message was not started — retry in a moment.",
                 "draining": true,
-            })),
+            }),
         ));
     }
     // Concurrency cap: bounds parallel runs so a burst degrades into a clear
@@ -1502,16 +2013,16 @@ Attached files:
     let cap = concurrent_cap();
     let running = state.runs.running_count();
     if running >= cap {
-        return Err((
+        return Err(StartRunError::Http(
             StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({
+            json!({
                 "error": format!(
                     "Stark is already running {running} session(s) (limit {cap}). Wait for one to finish or raise STARK_MAX_CONCURRENT_RUNS."
                 ),
                 "busy": true,
                 "running": running,
                 "limit": cap,
-            })),
+            }),
         ));
     }
 
@@ -1520,14 +2031,18 @@ Attached files:
     } else {
         request.chat_id.trim().to_string()
     };
-    let workspace = if request.workspace_path.trim().is_empty() {
-        state.harness_root.clone()
-    } else {
+    let workspace = if !request.workspace_path.trim().is_empty() {
         PathBuf::from(request.workspace_path.trim())
+    } else if let Ok(Some(path)) = state.store.chat_workspace_path(&chat_id).await
+        && !path.trim().is_empty()
+    {
+        PathBuf::from(path)
+    } else {
+        state.harness_root.clone()
     };
     let agent = resolve_agent(&request.workspace_kind, &workspace, &state.harness_root);
 
-    let mut effective = (*effective_for(&state, agent.key, agent.tier)).clone();
+    let mut effective = (*effective_for(state, agent.key, agent.tier)).clone();
     let model = if request.model.trim().is_empty() {
         effective.model.clone()
     } else {
@@ -1537,9 +2052,9 @@ Attached files:
         {
             Ok((_, model)) => model,
             Err(error) => {
-                return Err((
+                return Err(StartRunError::Http(
                     StatusCode::BAD_REQUEST,
-                    Json(json!({"error": error.to_string()})),
+                    json!({"error": error.to_string()}),
                 ));
             }
         }
@@ -1569,33 +2084,45 @@ Attached files:
             .workspace_id_for_path(workspace.to_string_lossy().as_ref())
     };
 
-    let (tx, _) = broadcast::channel(256);
-    let receiver = tx.subscribe();
+    let (tx, _) = broadcast::channel(RUN_EVENT_CAPACITY);
     let cancel = CancellationToken::new();
     let steering = Arc::new(Mutex::new(VecDeque::new()));
     let follow_up = Arc::new(Mutex::new(VecDeque::new()));
-    let checkpoint = Checkpoint::begin(&chat_id, &workspace);
-    if !state.runs.claim(
+    let run_id = Checkpoint::next_run_id();
+    let latest = Arc::new(Mutex::new(None));
+    if let Err(error) = state.runs.claim(
         &chat_id,
-        cancel.clone(),
-        tx.clone(),
-        steering.clone(),
-        follow_up.clone(),
-        workspace.to_string_lossy().as_ref(),
+        RunClaim {
+            run_id: run_id.clone(),
+            latest: latest.clone(),
+            cancel: cancel.clone(),
+            tx: tx.clone(),
+            steering: steering.clone(),
+            follow_up: follow_up.clone(),
+            workspace_path: workspace.to_string_lossy().to_string(),
+        },
     ) {
-        // Mid-run message: deliver it as steering and attach this request to
-        // the existing run's event stream instead of returning HTTP 409.
-        if state.runs.steer(&chat_id, &prompt)
-            && let Some(receiver) = state.runs.subscribe(&chat_id)
-        {
-            let stream: SseStream = Box::pin(sse_stream(receiver));
-            return Ok(Sse::new(stream));
+        if error == ClaimError::AlreadyRunning {
+            let run_id = state.runs.run_id(&chat_id);
+            let current_seq = latest_seq(&state.harness_root, &chat_id);
+            return Err(StartRunError::AlreadyRunning {
+                chat_id,
+                run_id,
+                current_seq,
+            });
         }
-        return Err((
-            StatusCode::CONFLICT,
-            Json(json!({"error": "This chat already has a running agent."})),
+        let status = match error {
+            ClaimError::AlreadyRunning => StatusCode::CONFLICT,
+            ClaimError::Limit { .. } => StatusCode::TOO_MANY_REQUESTS,
+            ClaimError::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
+        };
+        return Err(StartRunError::Http(
+            status,
+            json!({"error": error.message()}),
         ));
     }
+    let after_seq = latest_seq(&state.harness_root, &chat_id);
+    let checkpoint = Checkpoint::begin_with_run_id(&chat_id, &workspace, run_id.clone());
 
     if workspace != state.harness_root {
         let checkpoint = checkpoint.clone();
@@ -1627,11 +2154,10 @@ Attached files:
                 note: image.name,
             })
             .collect();
-    let latest = Arc::new(Mutex::new(None));
     let root_access = stark_core::default_access(&target.scope, 0, false);
     // Ensure the root agent exists before the run so status transitions are
     // visible in the tree for the whole run.
-    let target = ensure_root_agent(&state, target, root_access.as_str()).await;
+    let target = ensure_root_agent(state, target, root_access.as_str()).await;
     let ctx = RunContext {
         chat_id: target.chat_id.clone(),
         workspace_id: target.workspace_id.clone(),
@@ -1662,6 +2188,7 @@ Attached files:
     let canvas_chat = chat_id.clone();
     let status_state = state.clone();
     let status_chat = chat_id.clone();
+    let started_chat_id = chat_id.clone();
     let prompt_for_run = prompt;
     tokio::spawn(async move {
         let result = run_agent(ctx, prompt_for_run).await;
@@ -1699,8 +2226,37 @@ Attached files:
         spawn_canvas_notification(canvas_state, canvas_chat, report, status);
     });
 
-    let stream: SseStream = Box::pin(sse_stream(receiver));
-    Ok(Sse::new(stream))
+    Ok(StartedRun {
+        chat_id: started_chat_id,
+        run_id,
+        after_seq,
+    })
+}
+
+async fn run_command_handler(
+    State(state): State<ServerState>,
+    Path(chat_id): Path<String>,
+    Json(mut request): Json<RunRequest>,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    if chat_id.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "chat_id is required"})),
+        ));
+    }
+    request.chat_id = chat_id;
+    let started = start_run(&state, request)
+        .await
+        .map_err(StartRunError::into_http)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "accepted": true,
+            "chat_id": started.chat_id,
+            "run_id": started.run_id,
+            "after_seq": started.after_seq,
+        })),
+    ))
 }
 
 fn job_hook(state: ServerState, target: RunTarget) -> stark_core::JobDoneHook {
@@ -1712,7 +2268,20 @@ fn job_hook(state: ServerState, target: RunTarget) -> stark_core::JobDoneHook {
     })
 }
 
-fn spawn_follow_up_run(state: ServerState, mut target: RunTarget, message: String) {
+fn spawn_follow_up_run(state: ServerState, target: RunTarget, message: String) {
+    spawn_follow_up_run_attempt(state, target, message, 0);
+}
+
+/// A follow-up was triggered by a finished run, so a global slot is usually
+/// free immediately. If another chat took it, retry with capped backoff
+/// instead of dropping the message. Per-chat conflicts attach to the existing
+/// run's steering queue.
+fn spawn_follow_up_run_attempt(
+    state: ServerState,
+    mut target: RunTarget,
+    message: String,
+    attempt: u32,
+) {
     // Re-resolve on every follow-up so config edits apply without waiting for
     // a new chat.
     let tier = agent_for_scope(&target.scope)
@@ -1721,24 +2290,68 @@ fn spawn_follow_up_run(state: ServerState, mut target: RunTarget, message: Strin
     let effective = effective_for(&state, &target.scope, tier);
     target.model = effective.model.clone();
     target.effective = effective;
-    let (tx, _) = broadcast::channel(256);
+    let (tx, _) = broadcast::channel(RUN_EVENT_CAPACITY);
     let cancel = CancellationToken::new();
     let steering = Arc::new(Mutex::new(VecDeque::new()));
     let follow_up = Arc::new(Mutex::new(VecDeque::new()));
-    if !state.runs.claim(
+    let run_id = Checkpoint::next_run_id();
+    let latest = Arc::new(Mutex::new(None));
+    if let Err(error) = state.runs.claim(
         &target.chat_id,
-        cancel.clone(),
-        tx.clone(),
-        steering.clone(),
-        follow_up.clone(),
-        target.workspace.to_string_lossy().as_ref(),
+        RunClaim {
+            run_id: run_id.clone(),
+            latest: latest.clone(),
+            cancel: cancel.clone(),
+            tx: tx.clone(),
+            steering: steering.clone(),
+            follow_up: follow_up.clone(),
+            workspace_path: target.workspace.to_string_lossy().to_string(),
+        },
     ) {
-        let _ = state.runs.follow_up(&target.chat_id, &message);
+        match error {
+            ClaimError::AlreadyRunning => {
+                let _ = state.runs.follow_up(&target.chat_id, &message);
+            }
+            ClaimError::ShuttingDown => return,
+            ClaimError::Limit { max } => {
+                const MAX_ADMISSION_RETRIES: u32 = 6;
+                if attempt >= MAX_ADMISSION_RETRIES {
+                    tracing::warn!(
+                        chat_id = %target.chat_id,
+                        max,
+                        message_chars = message.chars().count(),
+                        "dropping follow-up: run limit stayed saturated"
+                    );
+                    // Make the drop visible in history instead of losing the
+                    // message silently. Same role the turn loop uses for
+                    // failures, so the UI renders it as an error.
+                    let store = state.store.clone();
+                    let chat_id = target.chat_id.clone();
+                    tokio::spawn(async move {
+                        let _ = store
+                            .append_message(
+                                &chat_id,
+                                "error",
+                                &format!(
+                                    "Follow-up not started: the server stayed at its {max}-run limit. Send the message again once a run finishes."
+                                ),
+                                false,
+                            )
+                            .await;
+                    });
+                    return;
+                }
+                let delay = std::time::Duration::from_secs(1 << attempt.min(4));
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    spawn_follow_up_run_attempt(state, target, message, attempt + 1);
+                });
+            }
+        }
         return;
     }
 
-    let checkpoint = Checkpoint::begin(&target.chat_id, &target.workspace);
-    let latest = Arc::new(Mutex::new(None));
+    let checkpoint = Checkpoint::begin_with_run_id(&target.chat_id, &target.workspace, run_id);
     let follow_access =
         stark_core::default_access(&target.scope, target.depth, target.agent_id.is_some());
     let ctx = RunContext {
@@ -1888,7 +2501,7 @@ async fn mark_agent_status(state: &ServerState, chat_id: &str, status: &str) {
     }
 }
 
-async fn agent_loop(state: ServerState) {
+async fn agent_loop(state: ServerState, shutdown: CancellationToken) {
     let store = match AgentStore::open(&state.harness_root).await {
         Ok(store) => store,
         Err(error) => {
@@ -1910,7 +2523,9 @@ async fn agent_loop(state: ServerState) {
         }
     }
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if !sleep_or_shutdown(std::time::Duration::from_secs(1), &shutdown).await {
+            break;
+        }
         let due = match store.pending_trigger(8).await {
             Ok(due) => due,
             Err(error) => {
@@ -1984,18 +2599,28 @@ async fn spawn_agent_run(state: ServerState, store: AgentStore, agent: AgentReco
         let _ = store.set_status(&agent.id, "idle", false).await;
         return false;
     }
-    let (tx, _) = broadcast::channel(256);
+    let (tx, _) = broadcast::channel(RUN_EVENT_CAPACITY);
     let cancel = CancellationToken::new();
     let steering = Arc::new(Mutex::new(VecDeque::new()));
     let follow_up = Arc::new(Mutex::new(VecDeque::new()));
-    if !state.runs.claim(
-        &target.chat_id,
-        cancel.clone(),
-        tx.clone(),
-        steering.clone(),
-        follow_up.clone(),
-        target.workspace.to_string_lossy().as_ref(),
-    ) {
+    let run_id = Checkpoint::next_run_id();
+    let latest = Arc::new(Mutex::new(None));
+    if state
+        .runs
+        .claim(
+            &target.chat_id,
+            RunClaim {
+                run_id: run_id.clone(),
+                latest: latest.clone(),
+                cancel: cancel.clone(),
+                tx: tx.clone(),
+                steering: steering.clone(),
+                follow_up: follow_up.clone(),
+                workspace_path: target.workspace.to_string_lossy().to_string(),
+            },
+        )
+        .is_err()
+    {
         return false;
     }
     let messages = match store.take_messages(&agent.id, 20).await {
@@ -2016,8 +2641,7 @@ async fn spawn_agent_run(state: ServerState, store: AgentStore, agent: AgentReco
         .map(|message| message["body"].as_str().unwrap_or("").to_string())
         .collect::<Vec<_>>()
         .join("\n\n");
-    let checkpoint = Checkpoint::begin(&target.chat_id, &target.workspace);
-    let latest = Arc::new(Mutex::new(None));
+    let checkpoint = Checkpoint::begin_with_run_id(&target.chat_id, &target.workspace, run_id);
     let access = stark_core::FileAccess::from_str(&agent.access);
     let ctx = RunContext {
         chat_id: target.chat_id.clone(),
@@ -2185,131 +2809,6 @@ fn spawn_canvas_notification(state: ServerState, chat_id: String, report: String
     });
 }
 
-async fn stream_handler(
-    State(state): State<ServerState>,
-    Path(chat_id): Path<String>,
-    headers: HeaderMap,
-) -> Sse<SseStream> {
-    let hello = Event::default()
-        .event("hello")
-        .data(json!({"chat_id": chat_id}).to_string());
-    // Last-Event-ID replay: the client sends the last rollout ordinal it
-    // processed. Everything after it is replayed from the canonical log
-    // before the live stream attaches, so a dropped phone connection loses
-    // nothing.
-    let replay_events: Vec<Result<Event, Infallible>> = replay_after(&state, &chat_id, &headers)
-        .await
-        .unwrap_or_default();
-    if let Some(receiver) = state
-        .runs
-        .subscribe(&chat_id)
-        .or_else(|| stark_core::subscribe_child_run(&chat_id))
-    {
-        let head = stream::iter(
-            std::iter::once(Ok(hello))
-                .chain(replay_events)
-                .collect::<Vec<_>>(),
-        );
-        let body = sse_stream(receiver);
-        let combined = head.chain(body);
-        let stream: SseStream = Box::pin(combined);
-        Sse::new(stream)
-    } else {
-        let mut events: Vec<Result<Event, Infallible>> = vec![Ok(hello)];
-        events.extend(replay_events);
-        events.push(Ok(Event::default()
-            .event("done")
-            .data(json!({"status": "complete"}).to_string())));
-        let stream: SseStream = Box::pin(stream::iter(events));
-        Sse::new(stream)
-    }
-}
-
-async fn replay_after(
-    state: &ServerState,
-    chat_id: &str,
-    headers: &HeaderMap,
-) -> Result<Vec<Result<Event, Infallible>>, String> {
-    let last: Option<u64> = headers
-        .get("last-event-id")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<u64>().ok());
-    let Some(last) = last else {
-        return Ok(Vec::new());
-    };
-    let Some(path) = stark_store::rollout::find_rollout(&state.harness_root, chat_id) else {
-        return Ok(Vec::new());
-    };
-    let lines = stark_store::rollout::read_rollout(&path);
-    let mut out = Vec::new();
-    for line in lines
-        .into_iter()
-        .filter(|line| line.ordinal.unwrap_or(0) > last)
-    {
-        let ordinal = line.ordinal.unwrap_or(0).to_string();
-        for (event, data) in rollout_events(&line) {
-            out.push(Ok(Event::default()
-                .event(event)
-                .id(ordinal.clone())
-                .data(data)));
-        }
-    }
-    Ok(out)
-}
-
-/// Codex App Server lifecycle: response items replay as `item_started` /
-/// `item_completed` in addition to the legacy `delta` frames, so a
-/// reconnecting client can rebuild streaming items without the full log.
-fn rollout_events(line: &stark_store::rollout::RolloutLine) -> Vec<(&'static str, String)> {
-    let (event, data) = rollout_event(line);
-    let mut events = vec![(event, data)];
-    use stark_store::rollout::{ResponseItemPayload, RolloutItem};
-    if let RolloutItem::ResponseItem { payload, .. } = &line.item {
-        match payload {
-            ResponseItemPayload::FunctionCall {
-                call_id,
-                name,
-                arguments,
-                ..
-            } => {
-                events.push((
-                    "item_started",
-                    json!({"kind": "tool_started", "tool": name, "id": call_id, "args": arguments})
-                        .to_string(),
-                ));
-            }
-            ResponseItemPayload::FunctionCallOutput {
-                call_id,
-                name,
-                output,
-                is_error,
-            } => {
-                events.push((
-                    "item_completed",
-                    json!({"kind": "tool_finished", "tool": name, "id": call_id, "ok": !is_error, "preview": output.chars().take(300).collect::<String>()}).to_string(),
-                ));
-            }
-            ResponseItemPayload::Message { role, content, .. } => {
-                let text = match content {
-                    Value::String(text) => text.clone(),
-                    other => other.to_string(),
-                };
-                events.push((
-                    "item_completed",
-                    json!({"kind": "text", "role": role, "text": text}).to_string(),
-                ));
-            }
-            ResponseItemPayload::Reasoning { summary, .. } => {
-                events.push((
-                    "item_completed",
-                    json!({"kind": "reasoning", "text": summary.first().map(|entry| entry.text.clone()).unwrap_or_default()}).to_string(),
-                ));
-            }
-        }
-    }
-    events
-}
-
 fn rollout_event(line: &stark_store::rollout::RolloutLine) -> (&'static str, String) {
     use stark_store::rollout::{EventMsgPayload, ResponseItemPayload, RolloutItem};
     match &line.item {
@@ -2357,17 +2856,345 @@ fn rollout_event(line: &stark_store::rollout::RolloutLine) -> (&'static str, Str
     }
 }
 
-fn sse_stream(
-    receiver: broadcast::Receiver<ServerEvent>,
-) -> impl Stream<Item = Result<Event, Infallible>> {
-    BroadcastStream::new(receiver).filter_map(|item| async move {
-        match item {
-            Ok(event) => Some(Ok(Event::default()
-                .event(event.event)
-                .data(event.data.to_string()))),
-            Err(_) => None,
-        }
+fn sse_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, no-transform"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-accel-buffering"),
+        HeaderValue::from_static("no"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    headers
+}
+
+fn opencode_event_value(event: ServerEvent) -> Value {
+    json!({
+        "id": event.id,
+        "type": event.event,
+        "created": event.created,
+        "data": event.data,
     })
+}
+
+fn opencode_frame(value: Value) -> Event {
+    Event::default().data(value.to_string())
+}
+
+fn opencode_sse_response(stream: SseStream) -> Response {
+    (
+        sse_headers(),
+        Sse::new(stream).keep_alive(KeepAlive::new().interval(SSE_HEARTBEAT).text("heartbeat")),
+    )
+        .into_response()
+}
+
+fn parse_types(raw: Option<&str>) -> Option<Arc<HashSet<String>>> {
+    let raw = raw?;
+    let types: HashSet<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect();
+    (!types.is_empty()).then(|| Arc::new(types))
+}
+
+fn query_flag(raw: Option<&str>) -> bool {
+    raw.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct EventFeedQuery {
+    #[serde(default)]
+    types: Option<String>,
+}
+
+fn connected_event(chat_id: &str, running: bool, seq: u64, run_id: Option<&str>) -> Value {
+    let mut data = json!({
+        "chat_id": chat_id,
+        "running": running,
+        "seq": seq,
+    });
+    if let Some(run_id) = run_id {
+        data["run_id"] = json!(run_id);
+    }
+    opencode_event_value(ServerEvent::new("server.connected", data))
+}
+
+async fn chat_events_handler(
+    State(state): State<ServerState>,
+    Path(chat_id): Path<String>,
+    Query(query): Query<EventFeedQuery>,
+) -> Response {
+    // Subscribe before reading the watermark. Events emitted between the
+    // subscription and the handshake stay buffered in the receiver; the
+    // announced seq lets the client open the durable log without a gap.
+    let attached = state.runs.attach(&chat_id);
+    let child = if attached.is_none() {
+        stark_core::subscribe_child_run(&chat_id)
+    } else {
+        None
+    };
+    let running = attached.is_some() || child.is_some();
+    let run_id = attached
+        .as_ref()
+        .map(|attachment| attachment.run_id.clone());
+    let seq = latest_seq(&state.harness_root, &chat_id);
+    let connected = opencode_frame(connected_event(&chat_id, running, seq, run_id.as_deref()));
+    let receiver = attached.map(|attachment| attachment.receiver).or(child);
+    let stream: SseStream = if let Some(receiver) = receiver {
+        let live = live_opencode_stream(receiver, parse_types(query.types.as_deref()));
+        Box::pin(stream::iter(vec![Ok(connected)]).chain(live))
+    } else {
+        Box::pin(stream::iter(vec![Ok(connected)]))
+    };
+    opencode_sse_response(stream)
+}
+
+/// Filtering by `types` must never hide run lifecycle. A client that asked
+/// for token deltas still needs `done`/errors to know when to stop.
+fn is_lifecycle_event(event: &str) -> bool {
+    matches!(
+        event,
+        "done" | "error" | "turn_started" | "turn_complete" | "turn_aborted" | "run.finished"
+    )
+}
+
+fn live_opencode_stream(
+    receiver: broadcast::Receiver<ServerEvent>,
+    types: Option<Arc<HashSet<String>>>,
+) -> SseStream {
+    let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(SSE_SUBSCRIBER_CAPACITY);
+    tokio::spawn(async move {
+        let mut receiver = receiver;
+        loop {
+            let received = tokio::select! {
+                _ = tx.closed() => break,
+                received = receiver.recv() => received,
+            };
+            match received {
+                Ok(event) => {
+                    if let Some(types) = &types
+                        && !types.contains(&event.event)
+                        && !is_lifecycle_event(&event.event)
+                    {
+                        continue;
+                    }
+                    if tx
+                        .try_send(Ok(opencode_frame(opencode_event_value(event))))
+                        .is_err()
+                    {
+                        tracing::warn!(
+                            capacity = SSE_SUBSCRIBER_CAPACITY,
+                            "live SSE subscriber overflow; closing stream"
+                        );
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(missed)) => {
+                    tracing::warn!(missed, "live SSE subscriber lagged; closing stream");
+                    break;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+    Box::pin(ReceiverStream::new(rx))
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ChatLogQuery {
+    #[serde(default)]
+    after: Option<u64>,
+    #[serde(default)]
+    follow: Option<String>,
+    #[serde(default)]
+    types: Option<String>,
+}
+
+async fn chat_log_handler(
+    State(state): State<ServerState>,
+    Path(chat_id): Path<String>,
+    Query(query): Query<ChatLogQuery>,
+) -> Response {
+    let values = spawn_log_values(
+        state.harness_root.clone(),
+        chat_id,
+        query.after,
+        query_flag(query.follow.as_deref()),
+        parse_types(query.types.as_deref()),
+    );
+    let stream: SseStream =
+        Box::pin(ReceiverStream::new(values).map(|value| Ok(opencode_frame(value))));
+    opencode_sse_response(stream)
+}
+
+/// Returns the event values in order: replay, `log.synced`, then live appends
+/// when `follow` is set. Keeping this as values makes the replay/live handoff
+/// testable without going through HTTP.
+fn spawn_log_values(
+    harness_root: std::path::PathBuf,
+    chat_id: String,
+    after: Option<u64>,
+    follow: bool,
+    types: Option<Arc<HashSet<String>>>,
+) -> mpsc::Receiver<Value> {
+    let (tx, rx) = mpsc::channel::<Value>(64);
+    let mut appends = stark_store::rollout::subscribe_appends();
+    tokio::spawn(async move {
+        let mut path = stark_store::rollout::find_rollout(&harness_root, &chat_id);
+        let mut cursor = after;
+        let lines = load_rollout_lines(path.as_ref()).await;
+        let target = max_ordinal(&lines);
+        if !send_log_values(&tx, &chat_id, &mut cursor, lines, &types).await {
+            return;
+        }
+        if tx.send(log_synced_value(&chat_id, target)).await.is_err() {
+            return;
+        }
+        if !follow {
+            return;
+        }
+        loop {
+            let received = tokio::select! {
+                _ = tx.closed() => break,
+                received = appends.recv() => received,
+            };
+            match received {
+                Ok(append) if append.chat_id == chat_id => {
+                    if path.is_none() {
+                        path = stark_store::rollout::find_rollout(&harness_root, &chat_id);
+                    }
+                    let lines = load_rollout_lines(path.as_ref()).await;
+                    if !send_log_values(&tx, &chat_id, &mut cursor, lines, &types).await {
+                        return;
+                    }
+                }
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(missed)) => {
+                    tracing::warn!(
+                        missed,
+                        chat_id = %chat_id,
+                        "durable log follower lagged; resyncing"
+                    );
+                    if path.is_none() {
+                        path = stark_store::rollout::find_rollout(&harness_root, &chat_id);
+                    }
+                    let lines = load_rollout_lines(path.as_ref()).await;
+                    if !send_log_values(&tx, &chat_id, &mut cursor, lines, &types).await {
+                        return;
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+    rx
+}
+
+async fn load_rollout_lines(
+    path: Option<&std::path::PathBuf>,
+) -> Vec<stark_store::rollout::RolloutLine> {
+    let Some(path) = path.cloned() else {
+        return Vec::new();
+    };
+    tokio::task::spawn_blocking(move || stark_store::rollout::read_rollout(&path))
+        .await
+        .unwrap_or_default()
+}
+
+fn max_ordinal(lines: &[stark_store::rollout::RolloutLine]) -> Option<u64> {
+    lines.iter().filter_map(|line| line.ordinal).max()
+}
+
+async fn send_log_values(
+    tx: &mpsc::Sender<Value>,
+    chat_id: &str,
+    cursor: &mut Option<u64>,
+    lines: Vec<stark_store::rollout::RolloutLine>,
+    types: &Option<Arc<HashSet<String>>>,
+) -> bool {
+    for value in log_values(chat_id, cursor, lines, types) {
+        if tx.send(value).await.is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+fn log_values(
+    chat_id: &str,
+    cursor: &mut Option<u64>,
+    lines: Vec<stark_store::rollout::RolloutLine>,
+    types: &Option<Arc<HashSet<String>>>,
+) -> Vec<Value> {
+    let mut values = Vec::new();
+    for line in lines {
+        let Some(ordinal) = line.ordinal else {
+            continue;
+        };
+        if cursor.is_some_and(|current| ordinal <= current) {
+            continue;
+        }
+        let Some(value) = durable_event_value(chat_id, &line) else {
+            continue;
+        };
+        let event_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+        *cursor = Some(cursor.map_or(ordinal, |current| current.max(ordinal)));
+        if let Some(types) = types
+            && !types.contains(event_type)
+            && !is_lifecycle_event(event_type)
+        {
+            continue;
+        }
+        values.push(value);
+    }
+    values
+}
+
+fn durable_event_value(chat_id: &str, line: &stark_store::rollout::RolloutLine) -> Option<Value> {
+    let ordinal = line.ordinal?;
+    let (event_type, data) = rollout_event(line);
+    let data = serde_json::from_str(&data).unwrap_or(Value::String(data));
+    Some(json!({
+        "id": format!("evt_{chat_id}_{ordinal}"),
+        "type": event_type,
+        "created": line_created(line),
+        "durable": {
+            "aggregateID": chat_id,
+            "seq": ordinal,
+            "version": 1,
+        },
+        "data": data,
+    }))
+}
+
+fn line_created(line: &stark_store::rollout::RolloutLine) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(&line.timestamp)
+        .map(|date| date.timestamp_millis())
+        .unwrap_or_else(|_| Utc::now().timestamp_millis())
+}
+
+fn log_synced_value(chat_id: &str, seq: Option<u64>) -> Value {
+    let mut value = json!({
+        "type": "log.synced",
+        "aggregateID": chat_id,
+    });
+    if let Some(seq) = seq {
+        value["seq"] = json!(seq);
+    }
+    value
 }
 
 #[derive(Debug, Deserialize)]
@@ -2394,8 +3221,8 @@ async fn health_handler() -> Json<Value> {
 }
 
 /// Which machine this server is: "local" by default, "vps" when
-/// `STARK_ORIGIN=vps` is set on the cloud box. The frontend cloud badge
-/// reads this — no absolute paths ever leave the server.
+/// `STARK_ORIGIN=vps` is set on the cloud box. Rune's cloud badge reads this;
+/// no absolute paths ever leave the server.
 fn server_origin() -> String {
     std::env::var("STARK_ORIGIN")
         .ok()
@@ -3794,6 +4621,8 @@ async fn clone_workspace_handler(
             record.name
         )));
     };
+    stark_store::validate_repo_url(repo)
+        .map_err(|error| bad_request(format!("invalid repository URL: {error}")))?;
     let path = PathBuf::from(&record.path);
     if path.is_dir() {
         return Ok(Json(
@@ -3806,16 +4635,16 @@ async fn clone_workspace_handler(
             .map_err(|error| bad_request(format!("cannot create {}: {error}", parent.display())))?;
     }
     let mut command = tokio::process::Command::new("git");
-    command
-        .arg("clone")
-        .arg("--depth")
-        .arg("1")
-        .env("GIT_TERMINAL_PROMPT", "0");
+    command.arg("clone").arg("--depth").arg("1");
     if let Some(branch) = record.branch.as_deref().filter(|branch| !branch.is_empty()) {
+        stark_store::validate_branch_name(branch)
+            .map_err(|error| bad_request(format!("invalid branch: {error}")))?;
         command.arg("--branch").arg(branch);
     }
     stark_sandbox::secrets::scrub_tokio_command(&mut command);
+    command.env("GIT_TERMINAL_PROMPT", "0");
     let output = command
+        .arg("--")
         .arg(repo)
         .arg(&path)
         .output()
@@ -3947,6 +4776,7 @@ async fn delete_chat_handler(
     Path((_workspace_id, chat_id)): Path<(String, String)>,
 ) -> Json<Value> {
     let ok = state.store.delete_chat(&chat_id).await.unwrap_or(false);
+    state.runs.forget(&chat_id);
     Json(json!({"status": if ok { "ok" } else { "not found" }}))
 }
 
@@ -5578,15 +6408,165 @@ async fn restore_run_handler(
     Ok(Json(json!({"ok": ok, "messages": messages})))
 }
 
+/// Browser origins that may call the local API. Rune web and loopback dev
+/// servers are explicit; any other website is rejected before CORS can
+/// advertise the response. Loopback-only local processes are still trusted by
+/// the auth middleware.
+fn allowed_origins() -> &'static Vec<String> {
+    static ORIGINS: OnceLock<Vec<String>> = OnceLock::new();
+    ORIGINS.get_or_init(|| {
+        std::env::var("STARK_ALLOWED_ORIGINS")
+            .ok()
+            .map(|value| value.split(',').filter_map(normalize_origin).collect())
+            .unwrap_or_default()
+    })
+}
+
+fn normalize_origin(value: &str) -> Option<String> {
+    let value = value.trim().trim_end_matches('/');
+    if value.is_empty() || value.eq_ignore_ascii_case("null") {
+        return None;
+    }
+    Some(value.to_ascii_lowercase())
+}
+
+fn is_loopback_origin(origin: &str) -> bool {
+    let Some(rest) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        rest.split_once(']').map(|(host, _)| host).unwrap_or("")
+    } else {
+        authority.split(':').next().unwrap_or(authority)
+    };
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+}
+
+fn host_only(value: &str) -> String {
+    let value = value.trim().to_ascii_lowercase();
+    if value.starts_with('[') {
+        return value
+            .split_once(']')
+            .map(|(host, _)| host.trim_start_matches('[').to_string())
+            .unwrap_or(value);
+    }
+    match value.rsplit_once(':') {
+        Some((host, port)) if port.chars().all(|character| character.is_ascii_digit()) => {
+            host.to_string()
+        }
+        _ => value,
+    }
+}
+
+fn allowed_hosts() -> &'static Vec<String> {
+    static HOSTS: OnceLock<Vec<String>> = OnceLock::new();
+    HOSTS.get_or_init(|| {
+        std::env::var("STARK_ALLOWED_HOSTS")
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(host_only)
+                    .filter(|host| !host.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+fn loopback_bind() -> bool {
+    static LOOPBACK: OnceLock<bool> = OnceLock::new();
+    *LOOPBACK.get_or_init(|| {
+        let host = std::env::var("STARK_HOST")
+            .or_else(|_| std::env::var("STARK_BIND"))
+            .unwrap_or_else(|_| "127.0.0.1".to_string());
+        let host = host.trim();
+        host.eq_ignore_ascii_case("127.0.0.1")
+            || host.eq_ignore_ascii_case("localhost")
+            || host == "::1"
+            || host == "[::1]"
+    })
+}
+
+fn host_allowed(host_header: &str) -> bool {
+    let host = host_only(host_header);
+    if host.is_empty() {
+        return false;
+    }
+    if matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1") {
+        return true;
+    }
+    allowed_hosts().iter().any(|allowed| allowed == &host)
+}
+
+fn origin_allowed(origin: &str, headers: &HeaderMap) -> bool {
+    let Some(origin) = normalize_origin(origin) else {
+        return false;
+    };
+    if allowed_origins()
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(&origin))
+        || is_loopback_origin(&origin)
+    {
+        return true;
+    }
+    // Same-origin requests (Rune web, custom port) are allowed when the
+    // Origin authority matches the Host header.
+    let Some(host) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let host = host.trim().to_ascii_lowercase();
+    origin == format!("http://{host}") || origin == format!("https://{host}")
+}
+
+/// Rejects browser requests from unknown origins and, when the server is
+/// bound to loopback, requests whose Host is not a local name. This closes the
+/// DNS-rebinding / malicious-webpage path to the API without breaking Rune
+/// web or a loopback dev server.
+async fn origin_guard(
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> axum::response::Response {
+    let headers = request.headers();
+    if let Some(origin) = headers.get(ORIGIN).and_then(|value| value.to_str().ok())
+        && !origin_allowed(origin, headers)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "Origin is not allowed to call the local API"})),
+        )
+            .into_response();
+    }
+    if loopback_bind()
+        && let Some(host) = headers
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok())
+        && !host_allowed(host)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Host is not a loopback name"})),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
 async fn auth_middleware(
     State(state): State<ServerState>,
     ConnectInfo(address): ConnectInfo<SocketAddr>,
     request: axum::extract::Request,
     next: middleware::Next,
 ) -> axum::response::Response {
-    // The SPA shell (/, /assets/*) stays public so a remote phone can load
-    // the UI and reach the pairing gate. Only API calls require the token.
-    // Only /api/* is guarded; the shell must stay public for the pairing gate.
+    // Only API calls require the pairing token. The server no longer serves
+    // a browser shell; Rune connects directly to the API.
     let path = request.uri().path();
     if !path.starts_with("/api/") {
         return next.run(request).await;
@@ -5603,6 +6583,10 @@ async fn auth_middleware(
     if state.pairing.authorize(token) {
         return next.run(request).await;
     }
+    // Bad tokens are cheap to guess and this endpoint is reachable from the
+    // LAN. A small fixed delay caps brute-force attempts without affecting
+    // legitimate clients (which send the right token on the first try).
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     (
         StatusCode::UNAUTHORIZED,
         Json(json!({"error": "Pairing required"})),
@@ -5636,12 +6620,12 @@ async fn pairing_issue_handler(
     State(state): State<ServerState>,
     Json(request): Json<IssuePairingRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let device = state.pairing.issue(&request.name);
+    let issued = state.pairing.issue(&request.name);
     Ok(Json(json!({
-        "id": device.id,
-        "name": device.name,
-        "token": device.token,
-        "created_at": device.created_at,
+        "id": issued.device.id,
+        "name": issued.device.name,
+        "token": issued.token,
+        "created_at": issued.device.created_at,
     })))
 }
 
@@ -5651,106 +6635,6 @@ async fn pairing_revoke_handler(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let removed = state.pairing.revoke(&device_id);
     Ok(Json(json!({ "ok": removed, "id": device_id })))
-}
-
-fn frontend_dist(harness_root: &std::path::Path) -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("STARK_FRONTEND_DIST")
-        && !dir.trim().is_empty()
-    {
-        let path = PathBuf::from(dir.trim());
-        if path.join("index.html").is_file() {
-            return Some(path);
-        }
-    }
-    let local = harness_root.join("frontend").join("dist");
-    if local.join("index.html").is_file() {
-        return Some(local);
-    }
-    None
-}
-
-fn spa_content_type(path: &std::path::Path) -> &'static str {
-    match path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "html" => "text/html; charset=utf-8",
-        "js" => "text/javascript; charset=utf-8",
-        "css" => "text/css; charset=utf-8",
-        "json" | "map" => "application/json",
-        "webmanifest" => "application/manifest+json",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "svg" => "image/svg+xml",
-        "ico" => "image/x-icon",
-        "woff2" => "font/woff2",
-        "woff" => "font/woff",
-        "ttf" => "font/ttf",
-        _ => "application/octet-stream",
-    }
-}
-
-async fn spa_fallback(
-    State(state): State<ServerState>,
-    request: axum::extract::Request,
-) -> Response {
-    let path = request.uri().path();
-    if path.starts_with("/api/") {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
-    }
-    let Some(dist) = frontend_dist(&state.harness_root) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "frontend not built (run npm run build)"})),
-        )
-            .into_response();
-    };
-    let relative = path.trim_start_matches('/');
-    if !relative.is_empty() {
-        let candidate = dist.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
-        // Contain path traversal inside the dist root.
-        let Ok(absolute) = std::path::absolute(&candidate) else {
-            return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
-        };
-        let Ok(root) = std::path::absolute(&dist) else {
-            return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
-        };
-        if absolute.starts_with(&root) && absolute.is_file() {
-            match tokio::fs::read(&absolute).await {
-                Ok(bytes) => {
-                    return (
-                        StatusCode::OK,
-                        [(
-                            axum::http::header::CONTENT_TYPE,
-                            spa_content_type(&absolute),
-                        )],
-                        bytes,
-                    )
-                        .into_response();
-                }
-                Err(_) => {
-                    return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"})))
-                        .into_response();
-                }
-            }
-        }
-    }
-    match tokio::fs::read(dist.join("index.html")).await {
-        Ok(bytes) => (
-            StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
-            bytes,
-        )
-            .into_response(),
-        Err(_) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "frontend not built (run npm run build)"})),
-        )
-            .into_response(),
-    }
 }
 
 async fn pairing_rotate_handler(
@@ -6406,5 +7290,514 @@ mod tests {
 
         let missing = read_file(root.to_string_lossy().as_ref(), "missing.txt").unwrap_err();
         assert_eq!(missing.0, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn last_state_is_capped_and_forgettable() {
+        let runs = RunManager::default();
+        for index in 0..(MAX_CACHED_STATES + 10) {
+            let chat = format!("chat-{index}");
+            let state = stark_contract::AppState {
+                client_request: chat.clone(),
+                ..Default::default()
+            };
+            runs.finish(&chat, Some(state));
+        }
+        assert_eq!(runs.last_state.len(), MAX_CACHED_STATES);
+        assert!(runs.last_state.get("chat-0").is_none());
+        assert!(
+            runs.last_state
+                .get(&format!("chat-{}", MAX_CACHED_STATES + 9))
+                .is_some()
+        );
+        runs.forget(&format!("chat-{}", MAX_CACHED_STATES + 9));
+        assert!(
+            runs.last_state
+                .get(&format!("chat-{}", MAX_CACHED_STATES + 9))
+                .is_none()
+        );
+        assert_eq!(runs.last_state.len(), MAX_CACHED_STATES - 1);
+    }
+
+    #[test]
+    fn run_admission_enforces_the_global_cap_and_releases_on_finish() {
+        let runs = RunManager {
+            max_runs: 1,
+            ..RunManager::default()
+        };
+        let claim = |chat: &str| {
+            let (tx, _rx) = broadcast::channel(4);
+            runs.claim(
+                chat,
+                RunClaim {
+                    run_id: format!("run-{chat}"),
+                    latest: Arc::new(Mutex::new(None)),
+                    cancel: CancellationToken::new(),
+                    tx,
+                    steering: Arc::new(Mutex::new(VecDeque::new())),
+                    follow_up: Arc::new(Mutex::new(VecDeque::new())),
+                    workspace_path: "C:/workspace".to_string(),
+                },
+            )
+        };
+        assert_eq!(claim("chat-a"), Ok(()));
+        // Same chat is rejected first, even when the machine cap is free.
+        assert_eq!(claim("chat-a"), Err(ClaimError::AlreadyRunning));
+        // A second chat hits the machine-wide cap (Codex's AgentLimitReached).
+        assert_eq!(claim("chat-b"), Err(ClaimError::Limit { max: 1 }));
+        runs.finish("chat-a", None);
+        assert_eq!(claim("chat-b"), Ok(()));
+    }
+
+    #[test]
+    fn cancel_all_signals_every_claimed_run() {
+        let runs = RunManager::default();
+        let first = CancellationToken::new();
+        let second = CancellationToken::new();
+        for (chat, cancel) in [("chat-a", first.clone()), ("chat-b", second.clone())] {
+            let (tx, _rx) = broadcast::channel(4);
+            runs.claim(
+                chat,
+                RunClaim {
+                    run_id: format!("run-{chat}"),
+                    latest: Arc::new(Mutex::new(None)),
+                    cancel,
+                    tx,
+                    steering: Arc::new(Mutex::new(VecDeque::new())),
+                    follow_up: Arc::new(Mutex::new(VecDeque::new())),
+                    workspace_path: "C:/workspace".to_string(),
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(runs.cancel_all(), 2);
+        assert!(first.is_cancelled());
+        assert!(second.is_cancelled());
+    }
+
+    #[test]
+    fn shutdown_closes_admission() {
+        let runs = RunManager::default();
+        assert_eq!(runs.cancel_all(), 0);
+        let (tx, _rx) = broadcast::channel(4);
+        let error = runs
+            .claim(
+                "late-chat",
+                RunClaim {
+                    run_id: "run-late".to_string(),
+                    latest: Arc::new(Mutex::new(None)),
+                    cancel: CancellationToken::new(),
+                    tx,
+                    steering: Arc::new(Mutex::new(VecDeque::new())),
+                    follow_up: Arc::new(Mutex::new(VecDeque::new())),
+                    workspace_path: "C:/workspace".to_string(),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error, ClaimError::ShuttingDown);
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_background_sleep() {
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        assert!(
+            !sleep_or_shutdown(std::time::Duration::from_secs(3600), &shutdown).await,
+            "an already-cancelled token must wake the sleeper"
+        );
+    }
+
+    fn warning_line(ordinal: u64, message: &str) -> stark_store::rollout::RolloutLine {
+        serde_json::from_value(json!({
+            "timestamp": "2026-01-01T00:00:00.000Z",
+            "ordinal": ordinal,
+            "type": "event_msg",
+            "payload": {"type": "warning", "message": message},
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn opencode_event_envelope_carries_id_type_and_created() {
+        let value = opencode_event_value(ServerEvent::new("delta", json!({"kind": "text"})));
+        assert!(value["id"].as_str().unwrap().starts_with("evt_"), "{value}");
+        assert_eq!(value["type"], "delta");
+        assert!(value["created"].as_i64().unwrap() > 0);
+        assert_eq!(value["data"]["kind"], "text");
+    }
+
+    #[test]
+    fn durable_log_event_uses_rollout_ordinal_as_seq() {
+        let line = warning_line(7, "durable");
+        let value = durable_event_value("chat-log", &line).unwrap();
+        assert_eq!(value["id"], "evt_chat-log_7");
+        assert_eq!(value["type"], "warning");
+        assert_eq!(value["durable"]["aggregateID"], "chat-log");
+        assert_eq!(value["durable"]["seq"], 7);
+        assert_eq!(value["durable"]["version"], 1);
+        assert_eq!(value["data"]["message"], "durable");
+    }
+
+    #[test]
+    fn log_values_use_an_exclusive_cursor_and_respect_type_filters() {
+        let lines = vec![
+            warning_line(1, "one"),
+            warning_line(2, "two"),
+            warning_line(3, "three"),
+        ];
+        let types = Some(Arc::new(HashSet::from(["warning".to_string()])));
+        let mut cursor = Some(1);
+        let values = log_values("chat-log", &mut cursor, lines, &types);
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0]["durable"]["seq"], 2);
+        assert_eq!(values[1]["durable"]["seq"], 3);
+        assert_eq!(cursor, Some(3));
+    }
+
+    #[test]
+    fn log_values_advance_the_cursor_past_filtered_events() {
+        let lines = vec![warning_line(1, "one"), warning_line(2, "two")];
+        let types = Some(Arc::new(HashSet::from(["error".to_string()])));
+        let mut cursor = None;
+        let values = log_values("chat-log", &mut cursor, lines, &types);
+        assert!(values.is_empty());
+        assert_eq!(cursor, Some(2));
+    }
+
+    #[test]
+    fn log_synced_marker_matches_the_opencode_shape() {
+        let value = log_synced_value("chat-log", Some(9));
+        assert_eq!(value["type"], "log.synced");
+        assert_eq!(value["aggregateID"], "chat-log");
+        assert_eq!(value["seq"], 9);
+        let empty = log_synced_value("chat-log", None);
+        assert!(empty.get("seq").is_none());
+    }
+
+    #[tokio::test]
+    async fn durable_log_replays_then_follows_live_appends() {
+        use stark_store::rollout::{EventMsgPayload, RolloutItem, RolloutWriter};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = RolloutWriter::open(dir.path(), "chat-follow", "ws", dir.path(), "model")
+            .await
+            .unwrap();
+        // The writer's session_meta is ordinal 0; this is ordinal 1.
+        writer
+            .append(RolloutItem::EventMsg {
+                payload: EventMsgPayload::Warning {
+                    message: "replayed".to_string(),
+                },
+            })
+            .await
+            .unwrap();
+
+        let mut values = spawn_log_values(
+            dir.path().to_path_buf(),
+            "chat-follow".to_string(),
+            Some(0),
+            true,
+            None,
+        );
+        let replayed = tokio::time::timeout(std::time::Duration::from_secs(2), values.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replayed["durable"]["seq"], 1);
+        assert_eq!(replayed["data"]["message"], "replayed");
+
+        let synced = tokio::time::timeout(std::time::Duration::from_secs(2), values.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(synced["type"], "log.synced");
+        assert_eq!(synced["seq"], 1);
+
+        let ordinal = writer
+            .append(RolloutItem::EventMsg {
+                payload: EventMsgPayload::Warning {
+                    message: "live".to_string(),
+                },
+            })
+            .await
+            .unwrap();
+        let live = tokio::time::timeout(std::time::Duration::from_secs(2), values.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(live["durable"]["seq"], ordinal);
+        assert_eq!(live["data"]["message"], "live");
+    }
+
+    fn turn_complete_line(ordinal: u64) -> stark_store::rollout::RolloutLine {
+        serde_json::from_value(json!({
+            "timestamp": "2026-01-01T00:00:01.000Z",
+            "ordinal": ordinal,
+            "type": "event_msg",
+            "payload": {
+                "type": "turn_complete",
+                "turn_id": "turn-1",
+                "last_agent_message": "done"
+            },
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn connected_event_carries_chat_running_seq_and_run_id() {
+        let value = connected_event("chat-live", true, 42, Some("run-1"));
+        assert_eq!(value["type"], "server.connected");
+        assert!(value["id"].as_str().unwrap().starts_with("evt_"));
+        assert_eq!(value["data"]["chat_id"], "chat-live");
+        assert_eq!(value["data"]["running"], true);
+        assert_eq!(value["data"]["seq"], 42);
+        assert_eq!(value["data"]["run_id"], "run-1");
+
+        let idle = connected_event("chat-idle", false, 0, None);
+        assert_eq!(idle["data"]["running"], false);
+        assert!(idle["data"].get("run_id").is_none());
+    }
+
+    #[test]
+    fn lifecycle_events_bypass_type_filters() {
+        assert!(is_lifecycle_event("done"));
+        assert!(is_lifecycle_event("error"));
+        assert!(is_lifecycle_event("turn_complete"));
+        assert!(!is_lifecycle_event("delta"));
+
+        let types = Some(Arc::new(HashSet::from(["delta".to_string()])));
+        let lines = vec![warning_line(1, "hidden"), turn_complete_line(2)];
+        let mut cursor = Some(0);
+        let values = log_values("chat-log", &mut cursor, lines, &types);
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0]["type"], "turn_complete");
+        assert_eq!(values[0]["durable"]["seq"], 2);
+        assert_eq!(cursor, Some(2));
+    }
+
+    #[test]
+    fn state_prefers_live_run_state_over_the_last_finished_state() {
+        let runs = RunManager::default();
+        let latest = Arc::new(Mutex::new(Some(AppState {
+            active_node: "agent".to_string(),
+            ..AppState::default()
+        })));
+        let (tx, _rx) = broadcast::channel(4);
+        runs.claim(
+            "chat-live",
+            RunClaim {
+                run_id: "run-live".to_string(),
+                latest,
+                cancel: CancellationToken::new(),
+                tx,
+                steering: Arc::new(Mutex::new(VecDeque::new())),
+                follow_up: Arc::new(Mutex::new(VecDeque::new())),
+                workspace_path: "C:/workspace".to_string(),
+            },
+        )
+        .unwrap();
+        let value = runs.state(Some("chat-live")).unwrap();
+        assert_eq!(value["active_node"], "agent");
+        let active = runs.active(Some("chat-live"));
+        assert_eq!(active["run_id"], "run-live");
+
+        runs.finish(
+            "chat-live",
+            Some(AppState {
+                active_node: "done".to_string(),
+                ..AppState::default()
+            }),
+        );
+        let finished = runs.state(Some("chat-live")).unwrap();
+        assert_eq!(finished["active_node"], "done");
+    }
+
+    #[test]
+    fn already_running_has_a_stable_conflict_shape() {
+        let (status, Json(body)) = StartRunError::AlreadyRunning {
+            chat_id: "chat-1".to_string(),
+            run_id: Some("run-1".to_string()),
+            current_seq: 12,
+        }
+        .into_http();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["code"], "already_running");
+        assert_eq!(body["chat_id"], "chat-1");
+        assert_eq!(body["run_id"], "run-1");
+        assert_eq!(body["current_seq"], 12);
+    }
+
+    #[tokio::test]
+    async fn latest_seq_tracks_the_durable_watermark_for_after_seq() {
+        use stark_store::rollout::{EventMsgPayload, RolloutItem, RolloutWriter};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = RolloutWriter::open(dir.path(), "chat-seq", "ws", dir.path(), "model")
+            .await
+            .unwrap();
+        let ordinal = writer
+            .append(RolloutItem::EventMsg {
+                payload: EventMsgPayload::Warning {
+                    message: "watermark".to_string(),
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(latest_seq(dir.path(), "chat-seq"), ordinal);
+        assert_eq!(latest_seq(dir.path(), "chat-missing"), 0);
+    }
+
+    #[tokio::test]
+    async fn command_endpoint_starts_a_run_and_after_seq_predates_the_log() {
+        async fn command_mock_provider(Json(_body): Json<Value>) -> Response {
+            let body = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Command reply\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            );
+            Response::builder()
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(body))
+                .unwrap()
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/chat/completions", post(command_mock_provider)),
+            )
+            .await
+            .unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = group_test_state(dir.path(), format!("http://{address}")).await;
+        let request = RunRequest {
+            prompt: "command test".to_string(),
+            model: "mock".to_string(),
+            temperature: 0.0,
+            workspace_path: dir.path().to_string_lossy().to_string(),
+            workspace_id: "_general".to_string(),
+            chat_id: String::new(),
+            attachments: Vec::new(),
+            workspace_kind: "general".to_string(),
+        };
+        let started = run_command_handler(
+            State(state.clone()),
+            Path("chat-command".to_string()),
+            Json(request),
+        )
+        .await
+        .unwrap();
+        let (status, Json(body)) = started;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body["accepted"], true);
+        assert_eq!(body["chat_id"], "chat-command");
+        assert!(body["run_id"].as_str().unwrap().starts_with("run-"));
+        let after_seq = body["after_seq"].as_u64().unwrap();
+
+        for _ in 0..400 {
+            if !state.runs.is_running("chat-command") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(!state.runs.is_running("chat-command"));
+
+        let mut values = spawn_log_values(
+            dir.path().to_path_buf(),
+            "chat-command".to_string(),
+            Some(after_seq),
+            false,
+            None,
+        );
+        let mut saw_assistant = false;
+        loop {
+            let value = tokio::time::timeout(std::time::Duration::from_secs(2), values.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if value["type"] == "log.synced" {
+                break;
+            }
+            if value["type"] == "delta"
+                && value["data"]["role"] == "assistant"
+                && value["data"]["text"] == "Command reply"
+            {
+                saw_assistant = true;
+            }
+            assert!(
+                value["durable"]["seq"].as_u64().unwrap() > after_seq,
+                "log event must be after the command cursor"
+            );
+        }
+        assert!(saw_assistant);
+    }
+
+    #[test]
+    fn event_feed_type_filters_and_flags_parse() {
+        let types = parse_types(Some("delta, state,,delta")).unwrap();
+        assert!(types.contains("delta"));
+        assert!(types.contains("state"));
+        assert_eq!(types.len(), 2);
+        assert!(parse_types(Some("")).is_none());
+        assert!(query_flag(Some("true")));
+        assert!(query_flag(Some("1")));
+        assert!(!query_flag(Some("0")));
+    }
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::*;
+
+    fn headers(host: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::HOST,
+            axum::http::HeaderValue::from_str(host).unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn local_origins_are_allowed() {
+        let request_headers = headers("127.0.0.1:8124");
+        for origin in ["http://localhost:5173", "http://127.0.0.1:5174"] {
+            assert!(
+                origin_allowed(origin, &request_headers),
+                "{origin} should be allowed"
+            );
+        }
+        assert!(!origin_allowed("https://evil.example", &request_headers));
+        assert!(!origin_allowed("null", &request_headers));
+    }
+
+    #[test]
+    fn origin_must_match_host_for_remote_same_origin() {
+        let request_headers = headers("192.168.1.20:8124");
+        assert!(origin_allowed("http://192.168.1.20:8124", &request_headers));
+        assert!(!origin_allowed(
+            "http://192.168.1.20:9999",
+            &request_headers
+        ));
+    }
+
+    #[test]
+    fn loopback_host_check_accepts_local_names_only() {
+        assert!(host_allowed("127.0.0.1:8124"));
+        assert!(host_allowed("localhost:8124"));
+        assert!(host_allowed("[::1]:8124"));
+        assert!(!host_allowed("evil.example:8124"));
+        assert!(!host_allowed("192.168.1.20:8124"));
+    }
+
+    #[test]
+    fn host_only_strips_ports_and_ipv6_brackets() {
+        assert_eq!(host_only("LOCALHOST:8124"), "localhost");
+        assert_eq!(host_only("[::1]:8124"), "::1");
+        assert_eq!(host_only("example.com"), "example.com");
     }
 }

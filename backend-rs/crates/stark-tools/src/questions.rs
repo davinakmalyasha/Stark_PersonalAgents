@@ -4,6 +4,7 @@ use std::time::Duration;
 use dashmap::DashMap;
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 struct Pending {
@@ -32,6 +33,19 @@ impl QuestionBroker {
         questions: Vec<Value>,
         timeout_secs: u64,
     ) -> Result<Vec<Value>, String> {
+        self.ask_cancellable(chat_id, questions, timeout_secs, &CancellationToken::new())
+            .await
+    }
+
+    /// Like [`ask`](Self::ask), but a stopped run drops the batch instead of
+    /// leaving it pending on screen for the full timeout.
+    pub async fn ask_cancellable(
+        &self,
+        chat_id: &str,
+        questions: Vec<Value>,
+        timeout_secs: u64,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<Value>, String> {
         let batch_id = Uuid::new_v4().to_string();
         let (sender, receiver) = oneshot::channel();
         self.pending.insert(
@@ -44,12 +58,17 @@ impl QuestionBroker {
             },
         );
 
-        let result = tokio::time::timeout(Duration::from_secs(timeout_secs), receiver).await;
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => None,
+            result = tokio::time::timeout(Duration::from_secs(timeout_secs), receiver) => Some(result),
+        };
         self.pending.remove(&batch_id);
         match result {
-            Ok(Ok(answers)) => Ok(answers),
-            Ok(Err(_)) => Err("question batch was cancelled".to_string()),
-            Err(_) => Err(format!("timed out after {timeout_secs}s")),
+            None => Err("cancelled by the user".to_string()),
+            Some(Ok(Ok(answers))) => Ok(answers),
+            Some(Ok(Err(_))) => Err("question batch was cancelled".to_string()),
+            Some(Err(_)) => Err(format!("timed out after {timeout_secs}s")),
         }
     }
 

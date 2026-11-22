@@ -156,6 +156,7 @@ impl CanvasStore {
         )
         .execute(&self.pool)
         .await?;
+        crate::migrate::baseline(&self.pool, "canvas").await?;
         Ok(())
     }
 

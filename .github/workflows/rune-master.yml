@@ -21,9 +21,10 @@ on:
 
 concurrency:
   group: rune-master
-  # A newer master commit supersedes an older build. Publishing happens as a
-  # draft first, so a cancelled run never becomes "latest".
-  cancel-in-progress: true
+  # Queue, never cancel: a build that is already compiling must be allowed to
+  # finish and publish, and the newest commit must publish last. The version
+  # includes the run number, so the feed advances in order.
+  cancel-in-progress: false
 
 permissions:
   actions: read

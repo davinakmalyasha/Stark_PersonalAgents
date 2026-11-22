@@ -9,9 +9,9 @@
 //! - A non-200 (unknown/expired batch) means delivery failed; the agent keeps
 //!   waiting until its own timeout.
 //!
-//! Dismiss is client-only, exactly like React: the batch stays pending for the
+//! Dismiss is client-only, exactly like the reference UI: the batch stays pending for the
 //! agent (voice or another surface may still answer it). The panel replaces
-//! the prompt dock for the owning chat, never a global overlay.
+//! The prompt dock for the owning chat, never a global overlay.
 
 use crate::keys::EnterPress;
 use rune::{col, row, text, text_input, El, ScrollSpec, TextEdit};
@@ -34,7 +34,7 @@ fn rgba(r: f32, g: f32, b: f32, a: f32) -> rune::Color {
 /// `usePendingAsk.ts` interval.
 pub const POLL_MS: u64 = 1500;
 
-/// One selectable answer. React accepts either a bare string or
+/// One selectable answer. The reference UI accepts either a bare string or
 /// `{label, description}`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AskOption {
@@ -220,7 +220,7 @@ impl AskState {
     }
 
     /// Adopt a poll result, dropping the dismissed marker once the batch is
-    /// gone (React filters `dismissed` the same way).
+    /// gone (the reference UI filters `dismissed` the same way).
     pub fn adopt(&mut self, batches: Vec<AskBatch>) {
         if let Some(id) = &self.dismissed_batch {
             if !batches.iter().any(|batch| &batch.batch_id == id) {
@@ -231,7 +231,7 @@ impl AskState {
     }
 
     /// Point the form at the visible batch. Returns true when the visible
-    /// batch changed (the panel behaves like React's per-batch `key`).
+    /// batch changed (the panel behaves like the reference UI's per-batch `key`).
     pub fn bind_visible(&mut self, chat_id: &str) -> bool {
         let visible = self
             .visible_batch(chat_id)
@@ -282,7 +282,7 @@ impl AskState {
     }
 
     /// First click on “Type your own answer…” clears the option selection,
-    /// like React's `!custom` branch. Later clicks keep both.
+    /// like the reference UI's `!custom` branch. Later clicks keep both.
     pub fn open_custom(&mut self, question_id: &str) {
         let already = self.custom_open.contains(question_id)
             || self
@@ -348,8 +348,8 @@ impl AskState {
 }
 
 /// Submit the visible batch. No-op while another submit is in flight or any
-/// question is unanswered (React's disabled guard, enforced again here for
-/// the Enter key).
+/// question is unanswered (the reference UI's disabled guard, enforced again here for
+/// The Enter key).
 pub fn submit<S: TranscriptHost + 'static>(s: &mut S, which: Thread, batch: &AskBatch) {
     let thread = s.thread_mut(which);
     if thread.ask.submitting || !thread.ask.all_answered(batch) {
@@ -448,7 +448,7 @@ pub fn poll_ask_state(s: &mut RuneTranscriptState, clock: f64) -> bool {
         changed = true;
     }
     if submit_dead && s.ask.submitting {
-        // Worker dropped without a result (panic/kill): surface React's error
+        // Worker dropped without a result (panic/kill): surface the reference UI's error
         // instead of leaving the button stuck on “Sending…”.
         s.ask.submitting = false;
         s.ask.error =
@@ -686,7 +686,7 @@ fn option_row<S: TranscriptHost + 'static>(
 
     // The outer stack keeps the public key and the full border box; the
     // padded button sits inside it, so the overlay border is not inset by
-    // the button's padding.
+    // The button's padding.
     let mut stack = col()
         .key(format!("ask-option-{}-{index}", question.id))
         .w_full();
@@ -873,7 +873,7 @@ pub fn ask_panel<S: TranscriptHost + 'static>(
     };
     // The panel's outlined border box caps at `max_h`; its two 1pt borders
     // and the measured head/foot heights leave the rest for the scrolling
-    // body (React's `flex: 1 1 auto` inside the same max-height).
+    // body (the reference UI's `flex: 1 1 auto` inside the same max-height).
     let head_h = if compact { 45.65 } else { 58.9 };
     let foot_h = if compact { 42.0 } else { 57.75 };
     let body_cap = (max_h - 2.0 - head_h - foot_h).max(48.0);
@@ -1187,7 +1187,7 @@ mod tests {
         assert!(ask.answers["q1"].is_empty());
         ask.custom_edits.get_mut("q1").unwrap().text = "  release  ".to_string();
         assert!(ask.is_answered("q1"));
-        // Opening again keeps the current selection (React's `custom` is
+        // Opening again keeps the current selection (the reference UI's `custom` is
         // already true, so it skips the clearing branch).
         ask.toggle("q1", "dev", false);
         ask.open_custom("q1");

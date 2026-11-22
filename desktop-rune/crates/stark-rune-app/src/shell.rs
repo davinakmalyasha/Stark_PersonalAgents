@@ -27,7 +27,7 @@ static mut WINDOW_W: f32 = 1280.0;
 static mut WINDOW_H: f32 = 900.0;
 static mut WINDOW_SAFE_BOTTOM: f32 = 0.0;
 
-/// Sidebar/side-panel fold threshold (React `md:` = 768).
+/// Sidebar/side-panel fold threshold (the reference UI `md:` = 768).
 const PANEL_FOLD_W: f32 = 768.0;
 /// Top session-tab bar (`HouseHeader` md:h-[52px]).
 const TAB_H: f32 = 52.0;
@@ -209,7 +209,7 @@ fn rail_icon(tab: RailTab, size: f32, color: rune::Color) -> Shape {
         RailTab::Chats => icon_home(size, color),
         RailTab::Group => icon_folder(size, color),
         RailTab::Cloud => icon_cloud(size, color),
-        // Not in React's rail (single-page: chats, projects, cloud only);
+        // Not in the reference UI's rail (single-page: chats, projects, cloud only);
         // mapped for completeness if a panel reuses the helper.
         RailTab::Agents | RailTab::Memory | RailTab::House => icon_home(size, color),
     }
@@ -292,7 +292,7 @@ pub struct ShellState {
     pub mobile_panel_open: bool,
     /// Home chat card folded to its prompt dock (`HouseChat` minimize). The
     /// card is not keyed by chat, so this persists across chat switches like
-    /// React's local `minimized` state.
+    /// The reference UI's local `minimized` state.
     pub home_minimized: bool,
     /// Hover-revealed collapse control (`HouseChat`'s floating chevron).
     /// Desktop rests at 0 and fades in with the card; phones keep it visible.
@@ -418,7 +418,7 @@ impl CloudHost for ShellState {
     }
 }
 
-/// One session tab: card title + close. Press activates the chat (React
+/// One session tab: card title + close. Press activates the chat (the reference UI
 /// `SessionTabs`: the active tab drives the home chat card).
 fn session_tab(s: &ShellState, id: &str) -> El {
     let title = s
@@ -433,7 +433,7 @@ fn session_tab(s: &ShellState, id: &str) -> El {
         .map(|c| c.kind.clone())
         .unwrap_or_else(|| "Main".to_string());
     // `isSpawnedChat`: a chat row with a parent gets the Bot glyph and the
-    // `↳ ` title prefix (React `SessionTabs`).
+    // `↳ ` title prefix (the reference UI `SessionTabs`).
     let spawned = s
         .canvas
         .chat_rows
@@ -451,8 +451,8 @@ fn session_tab(s: &ShellState, id: &str) -> El {
     };
     let mut title_style = rune::tok::TextStyle::new(12.0, 400.0);
     title_style.line_height = 12.0;
-    // Rune measures text to whole points (`measure` rounds up); React keeps
-    // the fractional advance. Trimming the rounding off the right padding
+    // Rune measures text to whole points (`measure` rounds up); the reference UI keeps
+    // The fractional advance. Trimming the rounding off the right padding
     // keeps the tab's outer width — and the next tab's x — exact.
     let advance = rune::text::advance(&title_text, title_style);
     let right_pad = 11.0 - (advance.ceil() - advance);
@@ -645,7 +645,7 @@ fn tab_code_icon(size: f32, color: rune::Color) -> Shape {
 /// Icon rail button (Lucide-shaped icon + label for assistive tech).
 /// Phone bottom navigation (`HouseMobileNav`): same destinations as the
 /// desktop rail without stealing chat width. Safe-area bottom padding keeps
-/// the bar above the home indicator.
+/// The bar above the home indicator.
 fn mobile_nav(s: &ShellState, safe_bottom: f32) -> El {
     let waiting: u64 = s.canvas.projects.projects.iter().map(|p| p.waiting).sum();
     let mut nav = row()
@@ -893,9 +893,9 @@ fn side_panel(s: &ShellState, width: f32) -> El {
 
 /// Home chat card (`HouseChat variant="home"`): the active session's
 /// conversation, bottom-anchored over the map, prompt dock always visible.
-/// Width hugs React's `md:max-w-[740px]`, height caps at 74vh.
+/// Width hugs the reference UI's `md:max-w-[740px]`, height caps at 74vh.
 fn home_chat_overlay(s: &ShellState, stage_w: f32, stage_h: f32, window_h: f32) -> Option<El> {
-    // React's `HouseChat` is mounted even with no open chats: a fresh
+    // The reference UI's `HouseChat` is mounted even with no open chats: a fresh
     // account sees the empty "What to do Boss?" card and prompt dock over the
     // empty canvas. With no sheet, reuse the always-present main thread.
     let (thread, which) = match s.canvas.sheet_thread() {
@@ -903,7 +903,7 @@ fn home_chat_overlay(s: &ShellState, stage_w: f32, stage_h: f32, window_h: f32) 
         None if s.canvas.cards.is_empty() => (&s.transcript, Thread::Main),
         None => return None,
     };
-    // React caps the wrapper (`md:max-w-[740px]`) and the wrapper's own
+    // The reference UI caps the wrapper (`md:max-w-[740px]`) and the wrapper's own
     // `px-2` gutters sit inside that cap: the card is at most 724 wide.
     // At 800 the stage is narrower than the cap, so this matches the old
     // `stage_w - 16` exactly.
@@ -913,10 +913,10 @@ fn home_chat_overlay(s: &ShellState, stage_w: f32, stage_h: f32, window_h: f32) 
         .w(card_w)
         .radius(16.0)
         .border(1.0, ink("#ffffff14"))
-        // React is `rgba(13,13,16,.94)` over `backdrop-filter: blur(18px)`.
+        // The reference UI is `rgba(13,13,16,.94)` over `backdrop-filter: blur(18px)`.
         // The web renderer's backdrop copy leaves the canvas cards' text
         // legible through 6% bleed; at 99% the composite is the same flat
-        // colour React shows (the desktop blur still smooths the remainder).
+        // colour the reference UI shows (the desktop blur still smooths the remainder).
         .fill(ink("#0d0d10fc"))
         // `.house-chat-card { backdrop-filter: blur(18px) }`: without it the
         // fill leaves sharp canvas ghosts under the conversation.
@@ -926,7 +926,7 @@ fn home_chat_overlay(s: &ShellState, stage_w: f32, stage_h: f32, window_h: f32) 
         .pb(4.0)
         .clip_rounded(16.0)
         // CSS borders take layout room; matching that keeps the inner
-        // transcript/dock exactly React's 469pt (487 - 2 - 16).
+        // transcript/dock exactly the reference UI's 469pt (487 - 2 - 16).
         .border_layout()
         .on_hover_change({
             let controls = s.home_controls.0.clone();
@@ -947,7 +947,7 @@ fn home_chat_overlay(s: &ShellState, stage_w: f32, stage_h: f32, window_h: f32) 
     card = card.child(home_transcript_body::<ShellState>(
         thread, which, card_w, window_h, minimized,
     ));
-    // React `HouseChat` home: a floating 28pt chevron at the card's top-right.
+    // The reference UI `HouseChat` home: a floating 28pt chevron at the card's top-right.
     // It rests hidden on desktop and fades in with the card; phones keep it
     // visible. The button folds the message area and leaves the prompt dock.
     let icon_color = if (unsafe { WINDOW_W }) < PANEL_FOLD_W {
@@ -985,7 +985,7 @@ fn home_chat_overlay(s: &ShellState, stage_w: f32, stage_h: f32, window_h: f32) 
                 .inert()
                 .shape(chevron(14.0, !minimized, icon_color)),
         );
-    // React's `md:` is the viewport, not the canvas stage; a narrow stage
+    // The reference UI's `md:` is the viewport, not the canvas stage; a narrow stage
     // behind a wide sidebar must not pin the control visible.
     collapse = if (unsafe { WINDOW_W }) < PANEL_FOLD_W {
         collapse.opacity(1.0)
@@ -1005,7 +1005,7 @@ fn home_chat_overlay(s: &ShellState, stage_w: f32, stage_h: f32, window_h: f32) 
 }
 
 /// Modals owned by the active card thread. They render at the shell root so
-/// the home chat card's clipping never crops them (React portals its dialogs
+/// The home chat card's clipping never crops them (the reference UI portals its dialogs
 /// over the whole workspace).
 fn active_chat_sheets(s: &ShellState) -> Vec<El> {
     let Some(t) = s.canvas.sheet_thread() else {
@@ -1035,7 +1035,7 @@ fn active_chat_sheets(s: &ShellState) -> Vec<El> {
     }
     if let Some(file) = t.attachment_preview.clone() {
         // The card clips its content, so the message lightbox lives at the
-        // shell root like React's fixed overlay.
+        // shell root like the reference UI's fixed overlay.
         let (w, h) = unsafe { (WINDOW_W, WINDOW_H) };
         sheets.push(crate::rune_transcript::attachment_lightbox::<ShellState>(
             &file,
@@ -1075,7 +1075,7 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
         .gap(4.0)
         .px(16.0)
         .pb(1.0)
-        // React's strip is `overflow-x-auto`; phones scroll tabs instead of
+        // The reference UI's strip is `overflow-x-auto`; phones scroll tabs instead of
         // clipping the tail at the window edge.
         .scroll_x()
         .border_sides([0.0, 0.0, 1.0, 0.0], ink("#ffffff14"))
@@ -1313,7 +1313,7 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
         .fill(ink("#0a0a0a"));
     if !folded {
         // Desktop: icon rail + docked panel. Below `md` both disappear and
-        // the panel becomes an on-demand drawer (React `House.tsx`).
+        // The panel becomes an on-demand drawer (the reference UI `House.tsx`).
         main = main.child(rail).child(side_panel(s, PANEL_W));
     }
     main = main.child(stage);
@@ -1325,7 +1325,7 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
         .hover_motion_within(crate::motion::HOVER, crate::motion::HOVER)
         .on_key(
             |s: &mut ShellState, key: &rune::KeyEvent, _tx: &mut rune::Tx| {
-                // React closes the phone drawer on Escape; modals keep their own
+                // The reference UI closes the phone drawer on Escape; modals keep their own
                 // handlers because they sit above this root.
                 if key.key == rune::Key::Escape && s.mobile_panel_open {
                     s.mobile_panel_open = false;
@@ -1454,7 +1454,7 @@ fn sync_audio_owner(s: &mut ShellState) -> bool {
 }
 
 /// At least one clip is loading or playing; the shell polls those at 4 Hz so
-/// the scrub bar and clock advance without a continuous animation.
+/// The scrub bar and clock advance without a continuous animation.
 fn poll_audio(s: &mut ShellState) -> bool {
     let active = s.transcript.audio.has_active()
         || s.personal.audio.has_active()
@@ -1510,7 +1510,7 @@ fn update_restart_safe(s: &ShellState) -> bool {
     true
 }
 
-/// Global updater toast: matches React's `UpdateToast` placement and keeps the
+/// Global updater toast: matches the reference UI's `UpdateToast` placement and keeps the
 /// downloading/ready states visible until they resolve.
 fn update_toast(s: &ShellState, w: f32, h: f32, bottom_inset: f32) -> Option<El> {
     let update = &s.settings.update;
@@ -1801,7 +1801,7 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
             tx.wake_after(std::time::Duration::from_millis(250));
         }
     }
-    // Keep the canvas stage sized to the live window (React's container
+    // Keep the canvas stage sized to the live window (the reference UI's container
     // drives `fitView`). While the camera is auto it refits on resize.
     let (win_w, win_h, safe_bottom) = unsafe { (WINDOW_W, WINDOW_H, WINDOW_SAFE_BOTTOM) };
     let folded = win_w < PANEL_FOLD_W;
@@ -1829,7 +1829,7 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
     let services_auto = s.chats.auto;
     changed |= crate::agent_config::poll_agent_config(&mut s.transcript.agent_config);
     changed |= crate::agent_config::poll_agent_config(&mut s.personal.agent_config);
-    // Only the visible card's dock shows provider/models (React mounts one
+    // Only the visible card's dock shows provider/models (the reference UI mounts one
     // PromptDock), so poll just that thread — not every open tab.
     if let Some(thread) = s.canvas.sheet_thread_mut() {
         if services_auto {
@@ -1865,7 +1865,7 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
     }
     // A `chat` SSE frame names the real id for a local draft card. Rekey the
     // card/tab/thread now so history, abort, rewind and the sidebar all use
-    // the server identity. Main/personal threads have no map card.
+    // The server identity. Main/personal threads have no map card.
     let rekeys: Vec<(String, String, String)> = ids
         .iter()
         .filter_map(|id| {
@@ -1950,7 +1950,7 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
     }
     if s.chats.auto {
         // Keep the 2.5s run poll (and the 30s sessions poll) ticking on an
-        // otherwise idle screen, exactly like React's intervals.
+        // otherwise idle screen, exactly like the reference UI's intervals.
         let run_left = (2.5 - (clock - s.chats.last_run_poll)).max(0.01);
         tx.wake_after(std::time::Duration::from_secs_f64(run_left));
         if s.chats.loaded {
@@ -1995,7 +1995,7 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
 
 /// Whether any mounted transcript has a trace body inside its 180 ms open or
 /// close fade. The shell forces a rebuild each frame so the opacity lands on
-/// the poll clock rather than a presence spring.
+/// The poll clock rather than a presence spring.
 fn trace_animating(s: &ShellState) -> bool {
     let now = crate::rune_transcript::frame_millis();
     let closing = |thread: &RuneTranscriptState| {
@@ -2024,7 +2024,7 @@ fn tick_voice_breathe(s: &ShellState) -> bool {
 }
 
 /// Start uploads for browser-picked files. Fresh cards create their chat
-/// first, matching React's create-before-upload send path.
+/// first, matching the reference UI's create-before-upload send path.
 #[cfg(target_arch = "wasm32")]
 fn apply_web_picks(s: &mut ShellState) -> bool {
     use crate::transport::WebTarget;
@@ -2246,7 +2246,7 @@ fn poll_chats(s: &mut ShellState, clock: f64) -> bool {
             ChatsMsg::Snapshot(Ok(snapshot)) => {
                 if s.chats.booted {
                     // Later polls keep local tabs/active/pins/filter and only
-                    // reconcile server data (React `useSessions` poll).
+                    // reconcile server data (the reference UI `useSessions` poll).
                     s.canvas.apply_chat_snapshot(&snapshot);
                 } else {
                     // Boot: the persisted layout wins once. A genuinely empty
@@ -2301,7 +2301,7 @@ fn poll_chats(s: &mut ShellState, clock: f64) -> bool {
                 changed |= sync_running_tab(s);
             }
             ChatsMsg::ActiveRun(Err(_)) => {
-                // React catches the poll and keeps the last known dot.
+                // The reference UI catches the poll and keeps the last known dot.
                 s.chats.run_loading = false;
             }
             ChatsMsg::Saved(result) => {
@@ -2368,7 +2368,7 @@ fn tick_sidebar_editing(s: &mut ShellState) -> bool {
 }
 
 /// Two-step delete: first press arms a 2.5s confirm, the second fades the row
-/// for 220ms before the optimistic removal + DELETE (React `HouseSidebar`).
+/// for 220ms before the optimistic removal + DELETE (the reference UI `HouseSidebar`).
 fn tick_chat_deletes(s: &mut ShellState, _clock: f64) -> bool {
     let now = crate::clock::now_millis();
     // The 220ms fade recomputes opacity from the wall clock, so keep the
@@ -2398,7 +2398,7 @@ fn tick_chat_deletes(s: &mut ShellState, _clock: f64) -> bool {
     changed
 }
 
-/// React's 400ms debounced `saveUiState`: write only when the layout payload
+/// The reference UI's 400ms debounced `saveUiState`: write only when the layout payload
 /// actually changed.
 fn poll_ui_state(s: &mut ShellState, clock: f64) -> bool {
     if !s.chats.booted || !s.chats.loaded || s.chats.ui_saving {
@@ -2560,7 +2560,7 @@ fn init_shell() -> ShellState {
     shell.canvas.projects.group.host = crate::rune_transcript::DEFAULT_API_HOST.to_string();
     shell.canvas.projects.group.port = crate::rune_transcript::api_port();
     shell.chats.auto = true;
-    // The dock's provider/model pills load on mount (React's PromptDock
+    // The dock's provider/model pills load on mount (the reference UI's PromptDock
     // effect), then refresh on their intervals.
     shell.transcript.services_auto = true;
     shell.personal.services_auto = true;
@@ -2724,7 +2724,7 @@ pub fn shell_spec() -> AppSpec<ShellState> {
     spec.poll = Some(shell_poll);
     spec.setup = Some(crate::image_cache::setup::<ShellState>);
     spec.fonts = SHELL_FONTS;
-    // Chromium's Tailwind mono stack resolves `ui-monospace` to Consolas on
+    // The browser's reference mono stack resolves `ui-monospace` to Consolas on
     // Windows; Rune's system-mono list prefers Cascadia Mono, so name the
     // browser's face outright for byte parity. Web keeps the bundled Plex.
     #[cfg(target_arch = "wasm32")]
@@ -2740,7 +2740,7 @@ pub fn shell_spec() -> AppSpec<ShellState> {
 
 pub fn run_shell_headless(extra_args: Vec<String>) {
     // `STARK_FONT_SMOOTHING` is a parity-rig knob: DirectWrite is the
-    // Windows default (Chromium's path), `off`/`on` are the portable
+    // Windows default (the browser's path), `off`/`on` are the portable
     // pipelines. It never changes the shipped default.
     let mut app = rune::App::new(shell_spec());
     if let Ok(mode) = std::env::var("STARK_FONT_SMOOTHING") {
@@ -2801,7 +2801,7 @@ mod tests {
     }
 
     #[test]
-    fn home_card_width_matches_react_wrapper_gutters() {
+    fn home_card_width_matches_reference_wrapper_gutters() {
         for (w, h, expected) in [(1280.0, 900.0, 724.0), (800.0, 573.0, 487.0)] {
             let env = Env::new(true, 1.0);
             let mut rt = Runtime::new(ShellState::default(), shell_view, (w, h), env);
@@ -2828,7 +2828,7 @@ mod tests {
         assert!(rt.find("composer-dock").is_some(), "dock starts mounted");
 
         let (x, y) = rt.find("home-chat-collapse").expect("collapse control");
-        // The control rests at 0 opacity on desktop, like React's hover-only
+        // The control rests at 0 opacity on desktop, like the reference UI's hover-only
         // chevron; hover the card before pressing it.
         rt.pointer_move(x, y);
         for _ in 0..8 {
@@ -3136,7 +3136,7 @@ mod tests {
         assert!(rt.find("house-board").is_some());
         // Refresh from the House tab, then drain via shell poll through
         // `rt.update` (the AppHandle path): external data enters the frame
-        // the same way in tests and in the window.
+        // The same way in tests and in the window.
         let (x, y) = rt.find("house-refresh").unwrap();
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
@@ -3154,7 +3154,7 @@ mod tests {
         assert_eq!(rt.state.house.devices[0].state_line, "100%");
         rt.frame(0.0);
         assert!(rt.find("house-dev-blind-living-name").is_some());
-        // Memory panel loads its board the same way (the rail mirrors React:
+        // Memory panel loads its board the same way (the rail mirrors the reference UI:
         // chats/projects/cloud only, so switch the panel directly).
         rt.update(|s, _| {
             s.canvas.rail = RailTab::Memory;
@@ -3248,7 +3248,7 @@ mod tests {
         assert!(rt.find("new-project-card").is_some());
         assert!(rt.find("new-project-name").is_some());
 
-        // Return in the focused name input keeps step 1 and reports React's
+        // Return in the focused name input keeps step 1 and reports the reference UI's
         // copy; the disabled Next itself takes no press.
         rt.key(KeyEvent {
             key: Key::Enter,
@@ -3291,7 +3291,7 @@ mod tests {
         assert!(rt.find("new-project-mode-solo").is_some());
         assert!(rt.find("new-project-task").is_some());
         assert!(rt.find("new-project-summary-path").is_some());
-        // Step 2 focuses the task, like React's `taskRef` effect.
+        // Step 2 focuses the task, like the reference UI's `taskRef` effect.
         rt.key(KeyEvent {
             key: Key::Text("x".to_string()),
             mods: Mods::default(),

@@ -1,10 +1,9 @@
-//! Full GFM markdown for transcript rows — mirrors `Markdown.tsx`
-//! (`react-markdown` + `remark-gfm`).
+//! Full GFM markdown for transcript rows.
 //!
 //! Parsing is `pulldown-cmark` (tables, strikethrough, task lists, autolinks,
 //! nested lists, quotes, rules, links, images). Rendering stays in
-//! `stark-rune-app` so every margin, colour and line box can match React's
-//! Tailwind classes exactly. `std` only; byte offsets are always
+//! `stark-rune-app` so every margin, colour and line box can match the reference UI's
+//! reference layout classes exactly. `std` only; byte offsets are always
 //! char-boundary safe.
 
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
@@ -30,7 +29,7 @@ pub enum Inline {
 }
 
 /// One list item: its blocks and a GFM task checkbox when the source marks it.
-/// `tight` mirrors remark: no blank lines around the item content, so React
+/// `tight` mirrors remark: no blank lines around the item content, so the reference UI
 /// renders no `<p>` wrapper and no paragraph margins apply.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ListItem {
@@ -306,7 +305,7 @@ pub fn parse(text: &str) -> Vec<Block> {
         match event {
             Event::Start(tag) => match tag {
                 Tag::Paragraph => {
-                    // A real paragraph inside an item makes it loose (React
+                    // A real paragraph inside an item makes it loose (the reference UI
                     // wraps loose content in `<p>`); the nearest item owns it.
                     for frame in frames.iter_mut().rev() {
                         if let Frame::Item { tight, .. } = frame {

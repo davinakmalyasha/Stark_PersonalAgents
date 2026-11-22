@@ -455,7 +455,7 @@ pub fn stats_sheet<S: 'static>(
             move |s: &mut S| close(s)
         })
         // Separate backdrop and panel, like `modal-backdrop-enter` +
-        // `modal-panel-enter` in React.
+        // `modal-panel-enter` in the reference UI.
         .child(
             rune::el()
                 .key("stats-backdrop")

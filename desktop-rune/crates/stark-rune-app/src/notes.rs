@@ -10,9 +10,9 @@
 //! All writes are explicit button presses (user go-ahead at press time, like
 //! composer send). Delete is two-tap: Rune has no `window.confirm`, so the
 //! first tap arms (`confirm_delete`) and the second fires. Amber card
-//! language mirrors the React panel. Mounts: transcript header (chat scope,
+//! language mirrors the reference UI panel. Mounts: transcript header (chat scope,
 //! like `ChatView.tsx`). Group scope (`GroupProjectModal.tsx`) arrives with
-//! the modal port — the state is already scope-driven.
+//! The modal port — the state is already scope-driven.
 
 use crate::keys::EnterPress;
 use rune::{col, row, text, text_input, El, TextEdit};
@@ -28,7 +28,7 @@ pub fn now_millis() -> u64 {
     crate::clock::now_millis()
 }
 
-/// Mint an opaque thread id (`rune-<millis>`). React reuses the persistent
+/// Mint an opaque thread id (`rune-<millis>`). The reference UI reuses the persistent
 /// `chat.id`; Rune threads mint one at construction so notes/abort have a
 /// stable scope before the first send.
 pub fn mint_id(prefix: &str) -> String {
@@ -182,7 +182,7 @@ impl NotesState {
     }
 }
 
-/// Open the sheet for a scope and load it (React's `useEffect` on `[open]`).
+/// Open the sheet for a scope and load it (the reference UI's `useEffect` on `[open]`).
 pub fn open_notes(s: &mut NotesState, scope_type: &str, scope_id: &str) {
     s.scope_type = scope_type.to_string();
     s.scope_id = scope_id.to_string();

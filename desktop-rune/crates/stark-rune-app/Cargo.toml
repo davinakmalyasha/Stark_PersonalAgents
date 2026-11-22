@@ -81,7 +81,7 @@ features = ["embedded-fonts"]
 optional = true
 
 # OpenCode's syntax scanners and diff engine, reused without its skin or block
-# layout: Stark renders every margin/line box itself to match React exactly.
+# layout: Stark renders every margin/line box itself to match the reference layout exactly.
 [dependencies.rune-kit]
 path = "../../vendor/rune/crates/rune-kit"
 package = "rune-kit"

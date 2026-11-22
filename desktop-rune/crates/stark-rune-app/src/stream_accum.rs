@@ -1,5 +1,5 @@
 //! Shared SSE stream accumulator — direct port of
-//! the former React stream accumulator.
+//! The original design stream accumulator.
 //!
 //! Every surface (chat, pipeline, subagents) folds deltas through this one
 //! implementation so live reasoning, tool pills, retries and the final
@@ -86,7 +86,7 @@ pub struct TraceStep {
 }
 
 impl TraceStep {
-    /// React `hasRenderableTraceSteps` for one step.
+    /// The reference UI `hasRenderableTraceSteps` for one step.
     pub fn renderable(&self) -> bool {
         self.child_id.is_some()
             || self.kind == "tool"
@@ -193,14 +193,14 @@ pub struct StreamAccum {
     /// Tok/s smoothing for the live dock pill.
     pub rate: RateAccum,
     /// `state.artifacts` (kept for parity; chats never render the panel, but
-    /// the persisted metadata shape matches React).
+    /// The persisted metadata shape matches the reference UI).
     pub artifacts: Option<Value>,
     /// Last backend state error, if any.
     pub state_error: Option<String>,
 }
 
 /// One delta frame, normalized from JSON. `usage` is handled separately by
-/// the transport layer (it feeds the dock totals too).
+/// The transport layer (it feeds the dock totals too).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Delta {
     pub kind: String,
@@ -364,7 +364,7 @@ impl StreamAccum {
 
     /// Append a completed durable item. Unlike a live delta it is neither a
     /// token fragment nor a retry notice, so it appends verbatim and leaves
-    /// the token-rate meter alone.
+    /// The token-rate meter alone.
     pub fn apply_snapshot(&mut self, delta: &Delta) -> bool {
         match delta.kind.as_str() {
             "text_snapshot" => {
@@ -396,7 +396,7 @@ impl StreamAccum {
             return rate.rounded();
         }
         // A finished compaction notice is one-shot; let it clear as soon as
-        // the run produces its next output instead of pinning it all turn.
+        // The run produces its next output instead of pinning it all turn.
         if self
             .status
             .as_ref()

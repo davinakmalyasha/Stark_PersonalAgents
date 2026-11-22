@@ -11,9 +11,9 @@ Stark is two Rust programs and one shared HTTP contract:
 - **Stark server** (`backend-rs`) — agent runtime, tools, persistence, API.
 - **Transport** — JSON + SSE over `http://127.0.0.1:8124` by default.
 
-There is no React client, Tauri shell, Python backend, or server-rendered SPA.
-The backend is API-only. The Rune wasm build is served independently by its own
-static host or dev proxy.
+There is no legacy web client, desktop wrapper, non-Rust backend, or
+server-rendered SPA. The backend is API-only. The Rune wasm build is served
+independently by its own static host or dev proxy.
 
 ## Rune client
 
@@ -150,7 +150,7 @@ tasks, not part of the Stark application stack.
   lifecycle, and rollback.
 - `.github/workflows/rune-release.yml` publishes the signed Rune feed.
 - `.github/workflows/build-linux.yml` and `deploy-vps.yml` ship the API-only
-  Linux server; no frontend build is part of the artifact.
+  Linux server; no web client build is part of the artifact.
 - Windows x86_64 is the primary installed target today.
 
 ## Source map

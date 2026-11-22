@@ -1,9 +1,9 @@
-//! Shared CSS timing tokens from the former React reference.
+//! Shared CSS timing tokens from the original design.
 //!
 //! Two families live here, because Rune splits what CSS calls a "transition":
 //!
 //! - [`Curve`]s drive the paint-only **hover tracks** (`hover`, `group_color`,
-//!   `group_opacity`). Tailwind's default is 150 ms
+//!   `group_opacity`). The reference default is 150 ms
 //!   `cubic-bezier(.4,0,.2,1)`.
 //! - [`Spring`]s drive **presence transitions** (message entrances, menus,
 //!   panels) and [`Live`] hover smoothing. CSS keyframes are time-based, so a
@@ -19,7 +19,7 @@
 //! messages are 200 ms, agent messages 240 ms, generic fades 140 ms, modal
 //! panels 240 ms, menus 160 ms, trace shells 340 ms, sidebar rows 260 ms.
 //!
-//! Every presence transition here removes with [`Spring::NONE`]: React
+//! Every presence transition here removes with [`Spring::NONE`]: the reference UI
 //! unmounts menus and modals in the frame they close, so the removal effect is
 //! identity and the exit lands at once. Only accordions keep a two-way glide,
 //! and those use the growth stack instead of `Transition`.
@@ -131,7 +131,7 @@ pub const SIDEBAR_OUT: Spring = Spring::smooth(0.22, 0.0);
 pub const DRAWER: Spring = Spring::smooth(0.28, 0.0);
 
 /// An insertion spring with an instant removal. The removal effect is identity,
-/// so a menu or modal disappears in the frame it unmounts, like React.
+/// so a menu or modal disappears in the frame it unmounts, like the reference UI.
 fn enter(spring: Spring, effect: Transition) -> Transition {
     Transition::asymmetric(effect, Transition::none())
         .springs(SpringPair::new(spring, Spring::NONE))
@@ -339,7 +339,7 @@ pub fn hover_icon(size: f32, base: rune::Shape, hovered: rune::Shape) -> El {
 /// Rune has no built-in hover transform or border track, but `Live` values
 /// provide the same thing: a stable handle per key that `live_scale`,
 /// `live_offset` and `live_border` bind to, with [`Live::smooth`] supplying
-/// the CSS transition curve. The registry is behind an `Arc<Mutex<_>>` so a
+/// The CSS transition curve. The registry is behind an `Arc<Mutex<_>>` so a
 /// view (which only sees `&State`) can obtain or reuse a handle without
 /// rebuilding, and `on_hover_change` can publish into it with `tx.live_only()`.
 #[derive(Clone, Default)]

@@ -1,4 +1,4 @@
-//! Stark byte-identical design tokens, extracted from the former React frontend.
+//! Stark byte-identical design tokens, extracted from the original design.
 //!
 //! Sources (`:root`, premium surfaces, send button, house and canvas layout):
 //! - index tokens and `.premium-surface` / `.send-button`

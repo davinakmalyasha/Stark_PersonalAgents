@@ -2,7 +2,7 @@
 //!
 //! Mirrors `@opencode/ui`-style naming from the Rune `rune-kit` pattern, but
 //! with Stark's byte-identical geometry. Ports the pure logic of the former
-//! React canvas and message-stream reference:
+//! The reference UI canvas and message-stream reference:
 //! - (`draftId`, `makeItem`, `DEFAULT_VIEW`)
 //! - (`clamp`, wheel zoom, `fitView`, `focusChat`, edge bezier path, auto-map
 //!   sync signature)

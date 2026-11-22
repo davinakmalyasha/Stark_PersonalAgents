@@ -807,8 +807,8 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
         .grow(1.0)
         .min_h(0.0)
         .scroll(rune::ScrollSpec { stick_bottom: true })
-        // React's focus-not-obscured padding: reveal a control 56 pt inside
-        // the viewport rather than flush against the composer.
+        // The reference UI's focus-not-obscured padding: reveal a control 56 pt inside
+        // The viewport rather than flush against the composer.
         .scroll_margin(56.0)
         .child(scroll_list);
 
@@ -841,7 +841,7 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
     }
     let target_menu = if show_menu {
         // The @ button opens the mention popup before any `@` is typed; it
-        // must still leave focus in the field. The header follows React's
+        // must still leave focus in the field. The header follows the reference UI's
         // `mentionMatch`, which is only true for a typed `@query`.
         let mention_mode = g.menu == Menu::Mention || mention.is_some();
         let mut menu = col()
@@ -852,7 +852,7 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
             } else {
                 "Message target"
             })
-            // React `.gp-target-menu`: absolute above the composer, 262 wide,
+            // The reference UI `.gp-target-menu`: absolute above the composer, 262 wide,
             // max-height 270, 2 pt overlap with the composer wrap (here 6 pt
             // clear of the 8 pt wrap padding).
             .anchored_fit("gp-composer", rune::Side::Top, rune::Align::Start, 6.0)
@@ -1075,7 +1075,7 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
                         .help("Mention an agent")
                         .focusable(true)
                         .focus_ring(2.0, 2.0, rgba(255.0, 255.0, 255.0, 0.55))
-                        // React re-focuses the textarea after opening the @
+                        // The reference UI re-focuses the textarea after opening the @
                         // menu; keep the field's model focus.
                         .preserve_focus_on_press(true)
                         .on_press_enter(|s: &mut S| {
@@ -1104,7 +1104,7 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
                     .on_submit(|s: &mut S, _tx: &mut rune::Tx| {
                         s.projects_mut().group.send();
                     })
-                    // React closes the @/target popup on Escape; the field
+                    // The reference UI closes the @/target popup on Escape; the field
                     // keeps focus, so typing never stops.
                     .on_key(|s: &mut S, key, _tx| {
                         if key.key == rune::Key::Escape {

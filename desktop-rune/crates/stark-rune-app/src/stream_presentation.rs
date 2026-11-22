@@ -1,4 +1,4 @@
-//! Port of the former React stream presentation.
+//! Stream presentation for chat rows.
 //!
 //! Splits one stream into the two visual lanes the chat renders: the ordered
 //! activity feed (reasoning, tools, intermediate updates) and the final
@@ -78,7 +78,7 @@ fn clean_stream_segments(segments: &[StreamSegment]) -> Vec<StreamSegment> {
 }
 
 /// Some older runs persisted one assistant string containing the handoff and
-/// the completion (`Handed to General … ✓ Done — …`).
+/// The completion (`Handed to General … ✓ Done — …`).
 fn split_handoff_text(text: &str) -> Option<(String, String)> {
     let lower = text.to_ascii_lowercase();
     let mut search = 0;

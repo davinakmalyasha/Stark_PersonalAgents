@@ -2,7 +2,7 @@
 //!
 //! The UI talks to the Rust backend over the HTTP API (`stark-server` on
 //! `127.0.0.1:8124`) and uses in-process `stark-*` crates for shared models.
-//! The former React/Tauri client has been removed; this crate is the UI.
+//! This crate is the UI.
 //!
 //! Rune mapping (1:1 when the real `rune` dep is enabled):
 //! - `El` below mirrors `rune`'s element (`key/role/label/checked/focusable`).
@@ -89,7 +89,7 @@ mod voice_ws;
 
 /// Lucide draws its 2-unit stroke at a 24-unit viewBox and scales it with the
 /// icon. Rune's `view_box` leaves stroke widths in points, so callers pass the
-/// icon's point size here to keep the drawn weight identical to React.
+/// icon's point size here to keep the drawn weight identical to the reference UI.
 #[cfg(feature = "rune-real")]
 pub(crate) fn lucide_stroke(size: f32) -> f32 {
     size * (2.0 / 24.0)
@@ -254,9 +254,10 @@ pub(crate) fn lucide_download(size: f32, color: rune::Color) -> rune::Shape {
         .view_box(24.0, 24.0)
 }
 
-/// Base path. Desktop talks to `127.0.0.1:8124`; Vite PWA proxies `/api`.
+/// Base path. Desktop talks to `127.0.0.1:8124`; the browser build proxies
+/// `/api` from its own origin.
 pub const API_BASE: &str = "/api";
-/// Resolved dev default (Rust server). Python legacy is `:8123`.
+/// Resolved dev default for the Rust server.
 pub const DEV_API_ORIGIN: &str = "http://127.0.0.1:8124";
 
 /// Frozen route table (subset the Rune UI needs first: transcript/canvas).

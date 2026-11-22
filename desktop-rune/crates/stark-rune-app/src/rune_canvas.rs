@@ -20,7 +20,7 @@ pub const MAP_W: f32 = 1280.0;
 pub const MAP_H: f32 = 900.0;
 /// Side panel width (icon rail + panel, like the desktop layout).
 pub const MAP_SIDEBAR_W: f32 = 300.0;
-/// Icon rail width (React `HouseRail`: 36pt button + 6pt gutters + hairline).
+/// Icon rail width (the reference UI `HouseRail`: 36pt button + 6pt gutters + hairline).
 pub const RAIL_W: f32 = 49.0;
 pub const DOT_STEP: f32 = 26.0;
 /// Chat kinds (the workspace dropdown). Chats are the only type — no
@@ -34,7 +34,7 @@ pub const GENERAL_PAGE: usize = 15;
 /// (`HouseSidebar.PROJECT_PAGE`).
 pub const PROJECT_PAGE: usize = 7;
 
-/// Native mode label → React `ChatsFilter` (persisted in `/api/ui/state`).
+/// Native mode label → the reference UI `ChatsFilter` (persisted in `/api/ui/state`).
 pub fn filter_for_kind(kind: &str) -> &'static str {
     match kind {
         "Coding" => "coding",
@@ -44,7 +44,7 @@ pub fn filter_for_kind(kind: &str) -> &'static str {
     }
 }
 
-/// React `ChatsFilter` → native mode label. Unknown/empty values keep the
+/// The reference UI `ChatsFilter` → native mode label. Unknown/empty values keep the
 /// current mode (the server may predate a filter name).
 pub fn kind_for_filter(filter: &str) -> Option<&'static str> {
     match filter {
@@ -101,7 +101,7 @@ pub const CAM_MAX_SCALE: f32 = 1.8;
 /// no element-level Rune equivalent — zoom steps through the HUD buttons
 /// (`zoomBy(0.86)` / `zoomBy(1.16)`, same factors) about the viewport centre,
 /// pan drags the background. Chrome (sidebar, dock, HUD) stays fixed, like
-/// React's `[data-canvas-ui]`.
+/// The reference UI's `[data-canvas-ui]`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Camera {
     pub x: f32,
@@ -131,7 +131,7 @@ impl Camera {
         self.fit_in(cards, MAP_W - MAP_SIDEBAR_W, MAP_H);
     }
 
-    /// `fitView` against a live stage size: React's paddings and clamps
+    /// `fitView` against a live stage size: the reference UI's paddings and clamps
     /// (`paddingX` 36 under 720pt, else 90; top 120, bottom 70; scale
     /// 0.45–1.15 for a fit).
     pub fn fit_in(&mut self, cards: &[MapCard], vw: f32, vh: f32) {
@@ -267,7 +267,7 @@ pub struct Sessions {
     pub search: rune::TextEdit,
     pub kind: String,
     /// Pinned chats (`workspace:chat`), persisted via `/api/ui/state` and
-    /// sorted first inside the active sidebar filter (React `pinnedChats`).
+    /// sorted first inside the active sidebar filter (the reference UI `pinnedChats`).
     pub pinned: Vec<String>,
     /// Inputs for inline rename: session id + draft. `None` renders rows.
     pub editing: Option<(String, rune::TextEdit)>,
@@ -275,10 +275,10 @@ pub struct Sessions {
     /// frame: Rune syncs focus into the old node before the tree drops it,
     /// and the accessor must still return a field.
     pub rename_spare: rune::TextEdit,
-    /// First click on Delete: session id + expiry (React 2.5s confirm).
+    /// First click on Delete: session id + expiry (the reference UI 2.5s confirm).
     pub confirm_delete: Option<(String, u64)>,
     /// Confirmed delete in its 220ms fade-out: session id, start ms, remove-at
-    /// ms (React `.is-deleting`).
+    /// ms (the reference UI `.is-deleting`).
     pub deleting: Option<(String, u64, u64)>,
     /// Collapsed spawn nests (`HouseSidebar.collapsedSpawns`): parents with
     /// spawned children start collapsed, so lower agents live inside their
@@ -389,7 +389,7 @@ pub struct CanvasState {
     /// Side panel tab (icon rail). The canvas always stays; the panel swaps.
     pub rail: RailTab,
     /// Sessions: one transcript thread per chat card, the open sheet, and
-    /// the sidebar's search + kind filter. Chats are the only type, so all
+    /// The sidebar's search + kind filter. Chats are the only type, so all
     /// threads live here — no per-route transcript states.
     pub sessions: Sessions,
     /// Camera (pan + zoom); chrome stays fixed while the world scales.
@@ -404,11 +404,11 @@ pub struct CanvasState {
     pub grid_live: rune::Live<[f32; 2]>,
     /// Hover tracks for sidebar rows, project headers and canvas cards.
     pub hover: crate::motion::HoverSet,
-    /// Camera follows the content (React `fitView`) until the first manual
+    /// Camera follows the content (the reference UI `fitView`) until the first manual
     /// pan/zoom; the shell refits when the window resizes.
     pub cam_auto: bool,
     /// `fittedRef`: the map fits once when the first cards arrive, never
-    /// again on a session poll (React preserves the user's pan/zoom).
+    /// again on a session poll (the reference UI preserves the user's pan/zoom).
     pub cam_fitted: bool,
     /// Auto-card structure from the last graph sync, mirroring the fields
     /// `CanvasStage` compares before preserving a card's position.
@@ -428,11 +428,11 @@ pub struct CanvasState {
     pub voice: crate::voice::VoiceBus,
     /// Prompts staged from the map dock, awaiting run dispatch.
     /// Per-card message drafts (`canvas-card-input`): keyed by card id, like
-    /// React's per-card `draft` state. The send button mirrors
+    /// The reference UI's per-card `draft` state. The send button mirrors
     /// `disabled={sending || running || empty}` — type-ahead while running,
     /// no double-send.
     pub inputs: std::collections::HashMap<String, rune::TextEdit>,
-    /// Card dock attachment drafts (React's per-card `files` state). Kept
+    /// Card dock attachment drafts (the reference UI's per-card `files` state). Kept
     /// separate from the thread's composer deck: opening the full chat must
     /// not inherit files staged on the map.
     pub card_attachments: std::collections::HashMap<String, Vec<crate::chats::ChatAttachment>>,
@@ -449,7 +449,7 @@ pub struct CanvasState {
     pub add_tab: String,
     pub add_search: rune::TextEdit,
     /// Closed chats available for re-adding (id, title). Threads survive
-    /// the close, so reopening restores history.
+    /// The close, so reopening restores history.
     pub closed: Vec<(String, String)>,
     /// Every chat on the server (sidebar rows), newest first. Empty until the
     /// first real snapshot lands (or when the server is unreachable).
@@ -457,7 +457,7 @@ pub struct CanvasState {
     /// Every workspace on the server (paths + flags; sidebar filters and the
     /// active-run → tab mapping).
     pub workspaces: Vec<crate::chats::ChatWorkspace>,
-    /// Open tab keys (`workspace:chat`, React `open_tabs`) and the active one.
+    /// Open tab keys (`workspace:chat`, the reference UI `open_tabs`) and the active one.
     pub open_tabs: Vec<String>,
     pub active_tab: String,
     /// Keys the server knew at the previous snapshot (`knownChatIdsRef`):
@@ -466,7 +466,7 @@ pub struct CanvasState {
     /// Tabs whose history the shell still has to fetch (boot fallback +
     /// auto-opened project chats).
     pub pending_chat_fetches: Vec<(String, String)>,
-    /// The chat with a live backend run (`workspace:chat`, React
+    /// The chat with a live backend run (`workspace:chat`, the reference UI
     /// `runningTabId`); drives the dot on sidebar rows and tabs.
     pub running_tab: Option<String>,
     /// True once a real snapshot replaced the seeded scene.
@@ -666,7 +666,7 @@ impl CanvasState {
         if self.active_id.is_empty() {
             self.active_id = self.sessions.order.first().cloned().unwrap_or_default();
         }
-        // The home chat overlay always shows the active session (React's
+        // The home chat overlay always shows the active session (the reference UI's
         // bottom `HouseChat` card); keep it in sync with the selection.
         if !self.active_id.is_empty() {
             self.sessions.sheet = Some(self.active_id.clone());
@@ -683,7 +683,7 @@ impl CanvasState {
         }
     }
 
-    /// Rebuild the map cards from `open_tabs` + `chat_rows` using the React
+    /// Rebuild the map cards from `open_tabs` + `chat_rows` using the reference UI
     /// tidy-tree layout. Local draft cards survive the rebuild.
     fn sync_graph_cards(&mut self) {
         let snapshot = crate::chats::ChatSnapshot {
@@ -707,7 +707,7 @@ impl CanvasState {
         for g in graph {
             let running = old.get(&g.id).map(|c| c.running).unwrap_or(false);
             // `CanvasStage` auto-sync: preserve the user's arrangement unless
-            // the card's structural slot (depth / parent / tab) changed.
+            // The card's structural slot (depth / parent / tab) changed.
             let (x, y) = match (old.get(&g.id), previous_meta.get(&g.id)) {
                 (Some(prev), Some(meta))
                     if meta.is_tab == g.is_tab
@@ -845,7 +845,7 @@ impl CanvasState {
 
     /// Adopt a later sessions poll: server chats are authoritative, local UI
     /// layout is not. Prunes dead tabs/pins, auto-opens new project chats,
-    /// and keeps the selected local draft (React's 30s poll semantics).
+    /// and keeps the selected local draft (the reference UI's 30s poll semantics).
     pub fn apply_chat_snapshot(&mut self, snapshot: &crate::chats::ChatSnapshot) {
         if snapshot.open_tabs.is_empty() && snapshot.chats.is_empty() {
             return;
@@ -858,7 +858,7 @@ impl CanvasState {
             self.chat_rows.iter().map(|c| c.key()).collect();
         // Auto-open new project chats (coding tasks); General/House/Personal
         // chats only open when the user creates them explicitly. Spawned
-        // children never auto-open as flat tabs (React `useSessions` poll).
+        // children never auto-open as flat tabs (the reference UI `useSessions` poll).
         let mut fresh = Vec::new();
         for chat in &self.chat_rows {
             let key = chat.key();
@@ -909,7 +909,7 @@ impl CanvasState {
     }
 
     /// Seed every parent with spawned children as collapsed on first sight
-    /// (React's default-collapse effect). User expansions are never touched.
+    /// (the reference UI's default-collapse effect). User expansions are never touched.
     fn seed_spawn_collapsed(&mut self) {
         let known: std::collections::HashSet<String> =
             self.chat_rows.iter().map(|chat| chat.key()).collect();
@@ -962,7 +962,7 @@ impl CanvasState {
 
     /// Keep the selected card coherent with `active_tab`. `preserve_local`
     /// keeps a locally opened draft selected across polls; boot always takes
-    /// the persisted layout.
+    /// The persisted layout.
     fn sync_active_card(&mut self, preserve_local: bool) {
         let want = format!("chat:{}", self.active_tab);
         let keep = preserve_local && self.card(&self.active_id).is_some();
@@ -990,7 +990,7 @@ impl CanvasState {
     }
 
     /// The persisted layout payload (`PUT /api/ui/state`), filtered to chats
-    /// the server knows (React prunes before saving). Never writes local
+    /// The server knows (the reference UI prunes before saving). Never writes local
     /// draft keys.
     pub fn ui_state_json(&self) -> serde_json::Value {
         let known: std::collections::HashSet<String> =
@@ -1019,7 +1019,7 @@ impl CanvasState {
         })
     }
 
-    /// React `runningTabId`: map the backend's active run to its open tab.
+    /// The reference UI `runningTabId`: map the backend's active run to its open tab.
     /// A path-less run belongs to the general workspace.
     pub fn running_tab_for(&self, run: Option<&crate::cloud::CloudActive>) -> Option<String> {
         let run = run.filter(|run| run.running)?;
@@ -1135,7 +1135,7 @@ impl CanvasState {
     }
 
     /// Resize the canvas stage (shell poll). The camera keeps its view across
-    /// resizes, like React (only the first card set triggers `fitView`).
+    /// resizes, like the reference UI (only the first card set triggers `fitView`).
     pub fn set_viewport(&mut self, w: f32, h: f32) -> bool {
         let w = w.max(320.0);
         let h = h.max(240.0);
@@ -1158,7 +1158,7 @@ impl CanvasState {
         ]);
     }
 
-    /// React `relayout` (Reset layout): auto cards snap back to their tidy-tree
+    /// The reference UI `relayout` (Reset layout): auto cards snap back to their tidy-tree
     /// slots, manual drafts stay put, then the map refits.
     pub fn relayout(&mut self) {
         let snapshot = crate::chats::ChatSnapshot {
@@ -1333,7 +1333,7 @@ impl CanvasState {
             .or_insert_with(|| rune::TextEdit::new(""))
     }
 
-    /// Files staged on a canvas card dock (React `CanvasItemCard.files`).
+    /// Files staged on a canvas card dock (the reference UI `CanvasItemCard.files`).
     pub fn card_attachments(&self, id: &str) -> &[crate::chats::ChatAttachment] {
         self.card_attachments
             .get(id)
@@ -1449,7 +1449,7 @@ impl CanvasState {
         id
     }
 
-    /// Workspace a "+ New chat" lands in for the active mode (React's
+    /// Workspace a "+ New chat" lands in for the active mode (the reference UI's
     /// adaptive +): projects for Coding, the personal room for General.
     fn draft_workspace_id(&self, kind: &str) -> String {
         let by_kind = |pick: &dyn Fn(&crate::chats::ChatWorkspace) -> bool| {
@@ -1474,7 +1474,7 @@ impl CanvasState {
 
     /// Close a session: the card and tab go, but the thread stays — reopening
     /// from the Add menu restores its history (closing a tab never deletes
-    /// the chat, like React). Selection and sheet fall back to the first
+    /// The chat, like the reference UI). Selection and sheet fall back to the first
     /// remaining session.
     pub fn close_session(&mut self, id: &str) {
         if let Some(card) = self.cards.iter().find(|c| c.id == id) {
@@ -1517,7 +1517,7 @@ impl CanvasState {
         if !fallback.is_empty() {
             let _ = self.thread_mut(&fallback);
         }
-        // Keep the persisted active tab in step with the selection React's
+        // Keep the persisted active tab in step with the selection the reference UI's
         // `closeTab` would make (`next[min(index, len-1)]`).
         if let Some(key) = self
             .active_id
@@ -1535,7 +1535,7 @@ impl CanvasState {
         self.sessions.pinned.iter().any(|pin| pin == key)
     }
 
-    /// React `togglePin`: append new pins, remove existing ones.
+    /// The reference UI `togglePin`: append new pins, remove existing ones.
     pub fn toggle_pin(&mut self, key: &str) {
         if let Some(index) = self.sessions.pinned.iter().position(|pin| pin == key) {
             self.sessions.pinned.remove(index);
@@ -1544,7 +1544,7 @@ impl CanvasState {
         }
     }
 
-    /// Start inline rename (React `startRename`): seed the field with the
+    /// Start inline rename (the reference UI `startRename`): seed the field with the
     /// current title and clear any armed delete.
     pub fn start_rename(&mut self, sid: &str) {
         let title = self
@@ -1558,7 +1558,7 @@ impl CanvasState {
             })
             .unwrap_or_default();
         self.sessions.confirm_delete = None;
-        // React focuses the input and selects the title. Rune has no
+        // The reference UI focuses the input and selects the title. Rune has no
         // imperative focus call, but a model field marked focused takes focus
         // when it first mounts; `anchor..focus` selects the whole title
         // (blur writes `focused = false` back here, which the shell tick
@@ -1571,8 +1571,8 @@ impl CanvasState {
     }
 
     /// Commit the inline rename: a trimmed non-empty title that differs from
-    /// the row's current one becomes an optimistic rename. Returns the write
-    /// the shell still has to send (`PUT …/title`).
+    /// The row's current one becomes an optimistic rename. Returns the write
+    /// The shell still has to send (`PUT …/title`).
     pub fn commit_editing(&mut self) -> Option<(String, String, String)> {
         let (sid, edit) = self.sessions.editing.take()?;
         let title = edit.text.trim().to_string();
@@ -1599,7 +1599,7 @@ impl CanvasState {
         Some((workspace_id.to_string(), chat_id.to_string(), title))
     }
 
-    /// First/second Delete press (React `handleDelete`): arm the 2.5s confirm,
+    /// First/second Delete press (the reference UI `handleDelete`): arm the 2.5s confirm,
     /// then start the 220ms fade-out.
     pub fn press_delete(&mut self, sid: &str) {
         if self.sessions.deleting.is_some() {
@@ -1652,7 +1652,7 @@ impl CanvasState {
         self.delete_progress(sid).map(|t| 1.0 - t)
     }
 
-    /// Optimistic rename (React `renameChatLocal`): title + timestamp update
+    /// Optimistic rename (the reference UI `renameChatLocal`): title + timestamp update
     /// everywhere before the `PUT …/title` lands.
     pub fn rename_chat_local(&mut self, workspace_id: &str, chat_id: &str, title: &str) {
         let now = crate::rune_transcript::now_iso();
@@ -1670,7 +1670,7 @@ impl CanvasState {
         }
     }
 
-    /// Optimistic delete (React `removeChatLocal` + `closeTab`): drop the row,
+    /// Optimistic delete (the reference UI `removeChatLocal` + `closeTab`): drop the row,
     /// pin, tab and card; the `DELETE` runs in the background.
     pub fn remove_chat_local(&mut self, workspace_id: &str, chat_id: &str) {
         let key = format!("{workspace_id}:{chat_id}");
@@ -1903,7 +1903,7 @@ impl crate::rune_transcript::TranscriptHost for CanvasState {
     }
 }
 
-/// Commit (or drop) an inline rename once the field lost focus, React's
+/// Commit (or drop) an inline rename once the field lost focus, the reference UI's
 /// `onBlur`. The shell calls this from its poll, so the input's old node is
 /// gone before the draft is dropped.
 pub fn settle_sidebar_editing<S: CanvasHost + 'static>(s: &mut S) -> bool {
@@ -2169,7 +2169,7 @@ fn pick_card_attachments<S: CanvasHost + 'static>(_s: &mut S, id: &str, tx: &mut
     }
 }
 
-/// Lucide `Paperclip` approximation at a 24-unit box, matching React's card
+/// Lucide `Paperclip` approximation at a 24-unit box, matching the reference UI's card
 /// dock attach control.
 fn paperclip_icon(size: f32, color: rune::Color) -> Shape {
     let p = Path::new()
@@ -2563,7 +2563,7 @@ fn card_view<S: CanvasHost + crate::rune_transcript::TranscriptHost + 'static>(
         Some(t) if !t.rows.is_empty() => (false, "done"),
         _ => (false, "idle"),
     };
-    // Status badge (`StatusBadge`): static running dot (React's
+    // Status badge (`StatusBadge`): static running dot (the reference UI's
     // `.canvas-card-status-dot` has no animation), ✓ done, ✕ failed, quiet
     // dot idle. Rune has no icon font — glyphs, same geometry.
     let badge: El = {
@@ -2759,7 +2759,7 @@ fn card_view<S: CanvasHost + crate::rune_transcript::TranscriptHost + 'static>(
                     s.canvas_mut().close_session(&close_id);
                 }),
         );
-    // Conversation (`canvas-card-conversation`): React shows the latest user
+    // Conversation (`canvas-card-conversation`): the reference UI shows the latest user
     // and agent rows, top-aligned in a flex-1 scroll area (2/16/14 padding,
     // 14pt gap). It must grow, or the dock rides up under the content.
     let convo = {
@@ -2874,7 +2874,7 @@ fn card_view<S: CanvasHost + crate::rune_transcript::TranscriptHost + 'static>(
     // Canvas card dock. Pending questions replace the prompt dock with the
     // compact Ask panel on every card except the active one (whose full
     // transcript owns the question). The compact panel caps at 250pt, the
-    // same `canvas.css` cap as React.
+    // same `canvas.css` cap as the reference UI.
     let ask_batch = if active {
         None
     } else {
@@ -3176,7 +3176,7 @@ fn card_view<S: CanvasHost + crate::rune_transcript::TranscriptHost + 'static>(
 /// counts + rows. Chats are closed sessions (history intact); projects come
 /// from the Group list; addons have no Rune target yet ("No addons
 /// available"). Tap adds at the visible top-left (`addDraft` math) and closes
-/// the menu. No drag-drop onto the canvas (no DnD target — click only).
+/// The menu. No drag-drop onto the canvas (no DnD target — click only).
 pub fn add_menu<S: CanvasHost + 'static>(s: &CanvasState) -> El {
     let q = s.add_search.text.trim().to_lowercase();
     // Chats tab: closed sessions matching the query (all are addable —
@@ -3438,7 +3438,7 @@ pub fn canvas_body<S: CanvasHost + crate::rune_transcript::TranscriptHost + 'sta
     // World layer: everything that pans/zooms. Origin top-left so pan offsets
     // map 1:1; `scale` springs on the layout spring and hit tests follow the
     // scaled rect (`El::scale`). Chrome (HUD, chat overlay) stays fixed, like
-    // React's `[data-canvas-ui]`.
+    // The reference UI's `[data-canvas-ui]`.
     let mut world = col()
         .key("canvas-world")
         .absolute(0.0, 0.0)
@@ -3446,8 +3446,8 @@ pub fn canvas_body<S: CanvasHost + crate::rune_transcript::TranscriptHost + 'sta
         .size(vw, vh)
         .origin(0.0, 0.0)
         .live_scale(&s.cam_scale_live);
-    // Background pan surface: fixed, unscaled (React `CanvasStage` drag on
-    // the stage). Cards sit above it, so empty presses pan while header
+    // Background pan surface: fixed, unscaled (the reference UI `CanvasStage` drag on
+    // The stage). Cards sit above it, so empty presses pan while header
     // presses drag cards.
     let pan = rune::el()
         .key("canvas-pan")
@@ -3476,7 +3476,7 @@ pub fn canvas_body<S: CanvasHost + crate::rune_transcript::TranscriptHost + 'sta
                 }
             }
         });
-    // Fixed dotted grid (React `.canvas-grid`, map variant): 26pt tile,
+    // Fixed dotted grid (the reference UI `.canvas-grid`, map variant): 26pt tile,
     // 1pt dots, background position follows the camera pan (never its zoom).
     let mut grid = col()
         .key("canvas-grid")
@@ -3558,7 +3558,7 @@ pub fn canvas_body<S: CanvasHost + crate::rune_transcript::TranscriptHost + 'sta
         .min_h(0.0)
         .fill(ink("#08080a"))
         .clip_rounded(0.0)
-        // React: dotted grid + stage background are fixed under the
+        // The reference UI: dotted grid + stage background are fixed under the
         // transformed world (dots slide with pan, not zoom).
         .child(pan)
         .child(grid);
@@ -3566,7 +3566,7 @@ pub fn canvas_body<S: CanvasHost + crate::rune_transcript::TranscriptHost + 'sta
         // Empty canvas (`canvas-empty`, map variant): a transparent button
         // with a 27pt white circle and the copy under it, pinned top-left at
         // `left:24; top:16` (`.canvas-stage.is-map .canvas-empty`). The add
-        // FAB is not mounted in this state (React `items.length > 0`).
+        // FAB is not mounted in this state (the reference UI `items.length > 0`).
         let scale = s.hover.scale("canvas-empty-add-scale", 1.0);
         let fill = s.hover.fill("canvas-empty-add-fill", ink("#ffffff"));
         let set_scale = scale.clone();
@@ -3713,8 +3713,8 @@ pub fn canvas_body<S: CanvasHost + crate::rune_transcript::TranscriptHost + 'sta
         );
     }
     if s.add_open {
-        // Backdrop catcher (React's window pointerdown): anything outside
-        // the menu closes it. Transparent, below the menu.
+        // Backdrop catcher (the reference UI's window pointerdown): anything outside
+        // The menu closes it. Transparent, below the menu.
         canvas = canvas.child(
             rune::el()
                 .key("canvas-add-backdrop")
@@ -3735,7 +3735,7 @@ pub fn canvas_body<S: CanvasHost + crate::rune_transcript::TranscriptHost + 'sta
         );
         canvas = canvas.child(add_menu::<S>(s));
     }
-    // Camera HUD (`CanvasStage` map controls): zoom out/in at the React
+    // Camera HUD (`CanvasStage` map controls): zoom out/in at the reference UI
     // 0.86/1.16 steps, fit-to-view, and layout reset. Fixed chrome — never
     // scaled with the world.
     // (Add menu lives just above: `add_menu` + `add_row`.)
@@ -3808,7 +3808,7 @@ pub fn canvas_body<S: CanvasHost + crate::rune_transcript::TranscriptHost + 'sta
             .child(if !s.cards.is_empty() {
                 // `.canvas-map-hint`: bottom-left, 9pt dim copy (hidden behind the
                 // home chat card when it is open, and absent when the canvas is
-                // empty, exactly like React).
+                // empty, exactly like the reference UI).
                 text("Drag to pan · scroll to zoom · drag cards to arrange".to_string())
                     .key("cam-hint")
                     .absolute(18.0, vh - 26.0)
@@ -4227,7 +4227,7 @@ fn sidebar_actions<S: CanvasHost + 'static>(
     // `CloudBadge`: live runs carry the sky cloud (pulse + glow, sky-100 on
     // hover); idle shows zinc CloudOff, zinc-200 on hover. The badge is its
     // own hover group so its icon lights up only under the pointer, not when
-    // the row's action cluster merely appears.
+    // The row's action cluster merely appears.
     let mut cloud_icon = action_icon(
         12.0,
         if running {
@@ -4456,7 +4456,7 @@ fn plus_icon(size: f32, color: rune::Color) -> Shape {
         .view_box(24.0, 24.0)
 }
 
-/// `from X` badge under a top-level spawned row (React `renderRow`'s
+/// `from X` badge under a top-level spawned row (the reference UI `renderRow`'s
 /// `auto` pill + `from {parentTitle}`): violet pill, 10pt zinc-600 label.
 fn sidebar_from_badge(card_id: &str, parent_title: Option<&str>) -> El {
     let mut pill_style = rune::tok::TextStyle::new(9.0, 500.0);
@@ -4474,7 +4474,7 @@ fn sidebar_from_badge(card_id: &str, parent_title: Option<&str>) -> El {
                 .font(pill_style)
                 .color(rgba(196.0, 181.0, 253.0, 0.8))
                 .px(6.0)
-                // Pill text 13.5 + py 4 = 17.5 total, matching React's
+                // Pill text 13.5 + py 4 = 17.5 total, matching the reference UI's
                 // 9pt text + `py-px` + 1pt border (`code-xml` badge).
                 .py(2.0)
                 .radius(8.0)
@@ -4496,10 +4496,10 @@ fn sidebar_from_badge(card_id: &str, parent_title: Option<&str>) -> El {
 }
 
 /// One top-level sidebar row plus its nested spawn leaves, in list order
-/// (React `renderRow` + the nest group). `flat` is the search pose: no
+/// (the reference UI `renderRow` + the nest group). `flat` is the search pose: no
 /// nesting, spawned rows indent. `parent_title` is the resolved parent for
 /// a spawned top-level row: `Some` renders `from X`, `None` renders
-/// `spawned by agent` (React always badges spawned tops).
+/// `spawned by agent` (the reference UI always badges spawned tops).
 #[allow(clippy::too_many_lines)]
 fn sidebar_thread<S: CanvasHost + 'static>(
     s: &CanvasState,
@@ -4558,7 +4558,7 @@ fn sidebar_thread<S: CanvasHost + 'static>(
                     tx.live_only();
                 });
         }
-        // React row states: spawned rows carry `is-spawned`
+        // The reference UI row states: spawned rows carry `is-spawned`
         // (white/2.5%, hover 5%, active 7.5%); regular rows hover
         // white/4% and active at 9%.
         if spawned {
@@ -4612,7 +4612,7 @@ fn sidebar_thread<S: CanvasHost + 'static>(
                     } else if chat.workspace_kind == "general" {
                         chat_row_icon(12.0, ink("#52525b"))
                     } else {
-                        // React `renderRow`: non-spawned rows use the chat
+                        // The reference UI `renderRow`: non-spawned rows use the chat
                         // bubble only on the General workspace, `</>` elsewhere.
                         code_row_icon(12.0, ink("#52525b"))
                     }),
@@ -4633,7 +4633,7 @@ fn sidebar_thread<S: CanvasHost + 'static>(
             );
         if spawned && !deleting {
             let mut badge = sidebar_from_badge(&card_id, parent_title.as_deref());
-            // React `mt-0.5` (2pt) between the title and the badge.
+            // The reference UI `mt-0.5` (2pt) between the title and the badge.
             badge = badge.mt(2.0);
             title_col = title_col.child(badge);
         }
@@ -4669,12 +4669,12 @@ fn sidebar_thread<S: CanvasHost + 'static>(
     if editing {
         item = item.on_press(|_: &mut S| {});
     }
-    // React seeds every parent with spawned children as collapsed;
+    // The reference UI seeds every parent with spawned children as collapsed;
     // an explicit expand keeps it open across polls.
     let expanded = !kids.is_empty() && !s.sessions.spawn_collapsed.contains(&chat_key);
     // `flex items-center gap-0.5` + 20pt leading slot (`w-5`): the
     // role/expand gutter. Root rows leave it empty, so the row box
-    // starts at x=81 and spans 205pt (React `house-sidebar-row`).
+    // starts at x=81 and spans 205pt (the reference UI `house-sidebar-row`).
     let lead = if kids.is_empty() {
         rune::el()
             .key(format!("side-{card_id}-lead"))
@@ -4722,7 +4722,7 @@ fn sidebar_thread<S: CanvasHost + 'static>(
         .items_center()
         .gap(2.0);
     if let Some(t) = progress {
-        // React `.is-deleting` (`house-row-out`): 220 ms, eased with
+        // The reference UI `.is-deleting` (`house-row-out`): 220 ms, eased with
         // `cubic-bezier(.4,0,.2,1)`, `max-height:40px -> 0` with the margin
         // gone, opacity to 0 and `translateX(-8px)`. The row is 34.8 pt
         // (spawned tops cap at 40), so the slot shrinks on the same clock.
@@ -4755,8 +4755,8 @@ fn sidebar_thread<S: CanvasHost + 'static>(
     }
     let mut out = vec![wrap];
     if expanded {
-        // React nests kids in a `flex flex-col gap-0.5` group directly under
-        // the parent row: no gap to the first kid, 2pt between kids, and the
+        // The reference UI nests kids in a `flex flex-col gap-0.5` group directly under
+        // The parent row: no gap to the first kid, 2pt between kids, and the
         // parent's own `mb-0.5` (2pt) after the last one. The flat list gap
         // (6) would triple-space the nest, so the group pulls its bottom
         // back up. (When an expanded nest ends a project group the group
@@ -4794,9 +4794,9 @@ fn sidebar_thread<S: CanvasHost + 'static>(
 }
 
 /// Split one project workspace's chats into top-level rows + same-workspace
-/// kid nests (React `groupWorkspaceChats`). Only parents inside the group
+/// kid nests (the reference UI `groupWorkspaceChats`). Only parents inside the group
 /// nest; cross-workspace children stay top-level with a `from X` badge.
-/// Kids sort oldest-first (React `childrenByParent` sort).
+/// Kids sort oldest-first (the reference UI `childrenByParent` sort).
 fn coding_group<'a>(
     chats: &'a [crate::chats::ChatSummary],
     ws_id: &str,
@@ -4833,7 +4833,7 @@ fn coding_group<'a>(
     (tops, kids)
 }
 
-/// Coding project group header (React `codingGroups` heading): chevron
+/// Coding project group header (the reference UI `codingGroups` heading): chevron
 /// collapse toggle with the 10pt uppercase project name + loaded chat
 /// count, and a 20pt `+` button starting a chat in that project. Missing
 /// project folders render the name amber (`text-amber-500/70`).
@@ -4879,7 +4879,7 @@ fn sidebar_group_header<S: CanvasHost + 'static>(
                 } else {
                     format!("Collapse {ws_name}")
                 })
-                // React `hover:bg-zinc-800/50` + `hover:text-zinc-200`.
+                // The reference UI `hover:bg-zinc-800/50` + `hover:text-zinc-200`.
                 // The rest fill is transparent, so the hover overlay is the
                 // exact CSS wash; `group_color` lifts the label.
                 .hover(rgba(39.0, 39.0, 42.0, 0.5))
@@ -4987,7 +4987,7 @@ fn sidebar_load_more<S: CanvasHost + 'static>(
         .py(6.0)
         .mb(6.0)
         // The list gap already separates the button from the rows above
-        // (React: row `mb-1` + wrapper `mb-0.5` = 6).
+        // (the reference UI: row `mb-1` + wrapper `mb-0.5` = 6).
         .radius(8.0)
         .role("button")
         .focusable(true)
@@ -5074,11 +5074,11 @@ pub fn chats_panel<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                             text(s.sessions.kind.clone())
                                 .truncate()
                                 .font({
-                                    // `text-[15px]` at Tailwind's 1.5 line-height:
-                                    // the switcher is 34.5pt with py-1.5.
+                                    // `text-[15px]` at the reference 1.5 line-height:
+                                    // The switcher is 34.5pt with py-1.5.
                                     let mut style = rune::tok::TextStyle::new(15.0, 600.0);
                                     style.line_height = 22.5;
-                                    // React `tracking-tight`: -0.025em at 15pt.
+                                    // The reference UI `tracking-tight`: -0.025em at 15pt.
                                     style.tracking = -0.375;
                                     style
                                 })
@@ -5132,7 +5132,7 @@ pub fn chats_panel<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                         ),
                 ),
         );
-    // Floating menu under the switcher (React `absolute top-[calc(100%+6px)]`).
+    // Floating menu under the switcher (the reference UI `absolute top-[calc(100%+6px)]`).
     // Built separately and mounted after the list so it paints (and hits) on top.
     let mut kind_menu: Option<El> = None;
     if s.kind_open {
@@ -5193,7 +5193,7 @@ pub fn chats_panel<S: CanvasHost + 'static>(s: &CanvasState) -> El {
         .fill(ink("#0f0f0f"))
         .child(head)
         // Search: `mx-3.5 mb-2.5 px-2 py-1 rounded-md bg-white/[0.04]`
-        // (27.3pt tall at React's 11.5pt input). Rune draws its hairline
+        // (27.3pt tall at the reference UI's 11.5pt input). Rune draws its hairline
         // inside the box, so py-1 is py 5 to keep the same outer height.
         .child(
             row()
@@ -5269,13 +5269,13 @@ pub fn chats_panel<S: CanvasHost + 'static>(s: &CanvasState) -> El {
             }
         }
         let flat = !query.is_empty();
-        // React `pinnedSort`: pinned chats first, otherwise the server's
+        // The reference UI `pinnedSort`: pinned chats first, otherwise the server's
         // newest-first order (Rust's sort is stable).
         let mut ordered: Vec<&crate::chats::ChatSummary> = s.chat_rows.iter().collect();
         ordered.sort_by_key(|chat| !s.is_pinned(&chat.key()));
         let lookup = crate::chats::parent_lookup(&s.chat_rows);
         if s.sessions.kind == "Coding" && !flat {
-            // Coding filter: collapsible per-project groups (React
+            // Coding filter: collapsible per-project groups (the reference UI
             // `codingGroups`), each with its own 7-row page. Same-workspace
             // spawns nest under their parent; cross-workspace children stay
             // top-level with a `from X` badge. Search stays flat above.
@@ -5301,13 +5301,13 @@ pub fn chats_panel<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                     .count();
                 let mut header = sidebar_group_header::<S>(s, ws, total);
                 if gi > 0 {
-                    // List gap (6) + header margin (4) = React `mb-2.5` (10).
+                    // List gap (6) + header margin (4) = the reference UI `mb-2.5` (10).
                     header = header.mt(4.0);
                 }
                 if !s.sessions.collapsed_ws.contains(&ws.id) {
                     // The expanded header's own bottom margin cancels the
                     // list gap: header `pb-1` (4) then the first row, with
-                    // no extra gap (React stacks them in a plain div).
+                    // no extra gap (the reference UI stacks them in a plain div).
                     // Collapsed headers keep the margin for the 10pt group
                     // rhythm.
                     header = header.mb(-6.0);
@@ -5317,7 +5317,7 @@ pub fn chats_panel<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                     continue;
                 }
                 let (mut tops, group_kids) = coding_group(&s.chat_rows, &ws.id);
-                // React `pinnedSort`: pinned first, else the server's
+                // The reference UI `pinnedSort`: pinned first, else the server's
                 // newest-first order (Rust's sort is stable).
                 tops.sort_by_key(|chat| !s.is_pinned(&chat.key()));
                 if tops.is_empty() {
@@ -5370,7 +5370,7 @@ pub fn chats_panel<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                 }
             }
         } else {
-            // Flat list (React `pinnedSort` + per-section paging): pinned
+            // Flat list (the reference UI `pinnedSort` + per-section paging): pinned
             // chats first, otherwise the server's newest-first order (Rust's
             // sort is stable). The Main filter pages at 15 rows.
             let mut filt: Vec<&crate::chats::ChatSummary> = s.chat_rows.iter().collect();
@@ -5525,7 +5525,7 @@ pub fn chats_panel<S: CanvasHost + 'static>(s: &CanvasState) -> El {
         list = list.child(item);
     }
     if s.real && s.chat_rows.is_empty() && s.cards.is_empty() {
-        // React `HouseSidebar`: the empty list says so instead of leaving a
+        // The reference UI `HouseSidebar`: the empty list says so instead of leaving a
         // blank panel under the search field.
         let mut style = rune::tok::TextStyle::new(11.0, 400.0);
         style.line_height = 16.5;
@@ -5850,7 +5850,7 @@ mod tests {
         }
         let (rect, _) = rt.presented("chat:ws-general:chat-1").unwrap();
         assert!((rect[3] - 420.0).abs() < 2.0, "full card height 420");
-        // The map has no dock of its own (React: the home chat card owns the
+        // The map has no dock of its own (the reference UI: the home chat card owns the
         // prompt dock); chrome stays to the add FAB + camera HUD.
         for key in ["canvas-add", "cam-hud", "cam-fit", "cam-reset"] {
             assert!(rt.find(key).is_some(), "{key} mounted");
@@ -6103,7 +6103,7 @@ mod tests {
         let a = "chat:_general:a";
         let b = "chat:_general:b";
         let (ax, ay) = (state.card(a).unwrap().x, state.card(a).unwrap().y);
-        // A manual arrangement survives poll/resize (React keeps auto items'
+        // A manual arrangement survives poll/resize (the reference UI keeps auto items'
         // x/y and the saved view).
         {
             let card = state.cards.iter_mut().find(|c| c.id == a).unwrap();
@@ -6267,7 +6267,7 @@ mod tests {
         let mut rt = Runtime::new(CanvasState::map(), canvas_view, (MAP_W, MAP_H), env);
         rt.frame(0.0);
         // Drag from the grip: the head now carries buttons (title opens the
-        // sheet), so the grip is the drag-safe spot — like React's
+        // sheet), so the grip is the drag-safe spot — like the reference UI's
         // `GripVertical` handle inside `data-canvas-drag-handle`.
         let (x, y) = rt.find("chat:ws-general:chat-1-grip").unwrap();
         let (x0, y0) = (rt.state.cards[0].x, rt.state.cards[0].y);

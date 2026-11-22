@@ -1,5 +1,5 @@
 //! Group-project detail models — the `GroupProjectDetail` wire shape from
-//! the former React types, parsed once into owned Rust values.
+//! the original wire types, parsed once into owned Rust values.
 
 use serde_json::Value;
 

@@ -12,7 +12,7 @@
 //! - `POST /api/provider {provider}` (switch active; fires the provider
 //!   refresh on the next 30s poll).
 //!
-//! React uses `<select>` dropdowns; Rune has no select element, so provider,
+//! The reference UI uses `<select>` dropdowns; Rune has no select element, so provider,
 //! model and thinking pickers are tap-row option lists (the kind-dropdown
 //! pattern). Everything else maps 1:1. All writes are explicit button
 //! presses. Opened from the provider pill in either dock.
@@ -104,7 +104,7 @@ impl ConfigProvider {
     }
 }
 
-/// Override form state. Empty provider/model = inherit (React's blank
+/// Override form state. Empty provider/model = inherit (the reference UI's blank
 /// selects); tools/skills/mcp are comma/newline lists (`valueToLines`).
 #[derive(Debug, Clone, Default)]
 pub struct ConfigForm {
@@ -261,7 +261,7 @@ impl Default for AgentConfigState {
     }
 }
 
-/// Open the modal and load (React's `useEffect` on `[isOpen]`).
+/// Open the modal and load (the reference UI's `useEffect` on `[isOpen]`).
 pub fn open_agent_config(s: &mut AgentConfigState) {
     s.open = true;
     s.status.clear();
@@ -1124,7 +1124,7 @@ pub fn agent_config_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
         .modal(true, move |s: &mut S| {
             s.thread_mut(which).agent_config.open = false;
         })
-        // React mounts a separate `modal-backdrop-enter` layer; keeping it a
+        // The reference UI mounts a separate `modal-backdrop-enter` layer; keeping it a
         // sibling lets the card fade/rise on its own clock.
         .child(
             rune::el()

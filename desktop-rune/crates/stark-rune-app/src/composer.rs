@@ -25,7 +25,7 @@ pub type DropHover<S> = std::rc::Rc<dyn Fn(&mut S, bool)>;
 /// Level meter: five bars lit by bucket, plus the capture note (no-device
 /// reason) when present. Mounted beside the voice toggle while live.
 fn attach_button<S: 'static>(attach: PressTx<S>) -> El {
-    // `.tool-button` (Plus 18): React's file picker.
+    // `.tool-button` (Plus 18): the reference UI's file picker.
     let plus = |color: rune::Color| {
         rune::Shape::new()
             .line(
@@ -332,7 +332,7 @@ pub struct ComposerMeta<'a> {
     pub models: &'a [super::rune_transcript::ModelOption],
     /// Model menu open.
     pub model_open: bool,
-    /// Dock attachments (`files` + `restored` in React — one deck here).
+    /// Dock attachments (`files` + `restored` in the reference UI — one deck here).
     pub attachments: &'a [super::chats::ChatAttachment],
     /// Amber validation/upload line under the input.
     pub attachments_error: Option<&'a str>,
@@ -348,7 +348,7 @@ pub struct ComposerMeta<'a> {
 /// Run-target toggle (`radiogroup`): Local active is zinc-on-zinc-800,
 /// Cloud active is sky with a pulsing cloud; inactive sides are dim zinc.
 /// Flipping only re-marks the next prompt (the transfer lands next — sends
-/// behave identically either way, same as React).
+/// behave identically either way, same as the reference UI).
 /// Lucide `CloudOff` / `Cloud` at a 12pt box for the run-target toggle.
 fn cloud_icon(off: bool, color: rune::Color) -> rune::Shape {
     if off {
@@ -373,7 +373,7 @@ fn target_toggle<S: 'static>(
             ink(if cloud_active { "#7dd3fc" } else { "#71717a" }),
         ));
     if cloud_active {
-        // React pulses the cloud icon (`animate-pulse`); same rhythm here.
+        // The reference UI pulses the cloud icon (`animate-pulse`); same rhythm here.
         cloud = cloud.looping(rune::LoopSpec::opacity(2.0, 0.0, 0.4, 1.0));
     }
     row()
@@ -390,7 +390,7 @@ fn target_toggle<S: 'static>(
                 .focusable(true)
                 .label("Run on Local — click to target Cloud (VPS)")
                 .font({
-                    // `text-[11px]` at Tailwind's 1.5 line-height.
+                    // `text-[11px]` at the reference 1.5 line-height.
                     let mut style = rune::tok::TextStyle::new(11.0, 500.0);
                     style.line_height = 16.5;
                     style
@@ -439,7 +439,7 @@ fn target_toggle<S: 'static>(
 
 /// While `running` the send circle becomes the Stop square
 /// (`index.css .send-button.stop`: white circle, dark square, "Stop
-/// execution") and presses `on_cancel` — React's `isRunning && empty → Stop`
+/// execution") and presses `on_cancel` — the reference UI's `isRunning && empty → Stop`
 /// simplified: a live run always stops first, a second prompt waits its turn.
 /// A smooth circle as four cubic arcs (Rune has no arc primitive; the usage
 /// ring is a scaled SVG circle, so a tessellated track shows as dots).
@@ -458,7 +458,7 @@ fn circle_path(cx: f32, cy: f32, r: f32) -> rune::Path {
 /// A translucent annulus as a single fill: Rune blends translucent strokes
 /// twice wherever neighbouring segments meet, which brightens a stroked ring
 /// (~13% track renders at ~24%). Outer ring clockwise, inner reversed, with
-/// the slit tucked under the 12 o'clock progress cap.
+/// The slit tucked under the 12 o'clock progress cap.
 fn ring_fill(cx: f32, cy: f32, r_in: f32, r_out: f32) -> Vec<[f32; 2]> {
     const N: usize = 96;
     let mut pts = Vec::with_capacity(N * 2);
@@ -476,7 +476,7 @@ fn ring_fill(cx: f32, cy: f32, r_in: f32, r_out: f32) -> Vec<[f32; 2]> {
 }
 
 /// Usage orb (`usage-orb`): 31px circle, tabular number = context percent,
-/// ring track underneath. React scales a 40-unit SVG circle (r16, stroke 3)
+/// ring track underneath. The reference UI scales a 40-unit SVG circle (r16, stroke 3)
 /// into a 29pt box inset 1pt, so the drawn radius is 11.6 and the stroke
 /// 2.175. The progress arc is tessellated (round caps, 3px-equivalent).
 fn usage_orb<S: 'static>(
@@ -574,7 +574,7 @@ fn usage_orb<S: 'static>(
 }
 
 /// Usage popover: Cost / Tokens / Context / Cache rows + View details.
-/// React portals it above the orb (or below when the window is short); the
+/// The reference UI portals it above the orb (or below when the window is short); the
 /// anchored overlay reproduces that placement and flips at the edges.
 fn usage_popover<S: 'static>(
     usage: &super::rune_transcript::UsageTotals,
@@ -645,7 +645,7 @@ fn usage_popover<S: 'static>(
 
 /// Provider pill (`provider-trigger`): live gateway label, amber when the
 /// key is missing or the provider reports an error. Opens the agents &
-/// providers modal, like React.
+/// providers modal, like the reference UI.
 fn provider_pill<S: 'static>(
     label: &str,
     warn: bool,
@@ -813,8 +813,8 @@ fn model_dropup<S: 'static>(
             .label("Model")
             .focus_group()
             .focus_return("composer-model-trigger")
-            // React `.model-menu`: width 264, max-height 280, absolute above
-            // the trigger with an 8 pt gap. `anchored_fit` flips it below and
+            // The reference UI `.model-menu`: width 264, max-height 280, absolute above
+            // The trigger with an 8 pt gap. `anchored_fit` flips it below and
             // bounds it at small window heights.
             .anchored_fit(
                 "composer-model-trigger",
@@ -1161,7 +1161,7 @@ pub fn composer_card<S: 'static>(
                 tx.live_only();
             });
     }
-    // React's dock is its own drop target (`onDragEnter/Leave/Over/Drop`).
+    // The reference UI's dock is its own drop target (`onDragEnter/Leave/Over/Drop`).
     card = card
         .accepts_files(|_| true)
         .on_drop_files({
@@ -1197,7 +1197,7 @@ pub fn composer_card<S: 'static>(
         deck = deck.child(attachment_add(buttons.attach.clone(), meta.hover));
         card = card.child(deck);
     }
-    // React's `.prompt-dock` has no padding of its own: the input wrapper
+    // The reference UI's `.prompt-dock` has no padding of its own: the input wrapper
     // is 54pt (10/4 + 40pt textarea) and the toolbar 54pt (border + 9/10
     // + 34pt controls), so the bordered dock is exactly 110pt.
     card = card.child(
@@ -1299,8 +1299,8 @@ pub fn composer_card<S: 'static>(
                     .child(if meta.models.is_empty() {
                         // Map dock: no model list (HouseChat never passes
                         // `onModelChange`). The negative margin cancels
-                        // the flex gap so the right cluster still packs
-                        // provider → voice at 8pt like React.
+                        // The flex gap so the right cluster still packs
+                        // provider → voice at 8pt like the reference UI.
                         rune::el()
                             .key("composer-model-empty")
                             .size(0.0, 0.0)

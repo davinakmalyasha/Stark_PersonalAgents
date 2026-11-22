@@ -317,7 +317,7 @@ pub fn refresh_cloud(s: &mut CloudState) {
 }
 
 /// Refresh status + handoffs + workspaces + the selected workspace's chats.
-/// One worker, sequential reads; any failure keeps last state (React's
+/// One worker, sequential reads; any failure keeps last state (the reference UI's
 /// `catch {}`), except the status read which must succeed to count.
 pub fn refresh_board(s: &mut CloudState) {
     if s.board_loading {
@@ -345,7 +345,7 @@ fn fetch_board_native(host: &str, port: u16, workspace_id: &str) -> Result<Cloud
         port,
         "/api/cloud/status",
     )?));
-    // Handoffs + pickers are best-effort (`catch → []` on the React side).
+    // Handoffs + pickers are best-effort (`catch → []` on the reference UI side).
     let handoffs = crate::transport::get_json(host, port, "/api/cloud/handoffs")
         .ok()
         .and_then(|v| {
@@ -495,7 +495,7 @@ async fn fetch_board_wasm(workspace_id: &str) -> Result<CloudBoard, String> {
 
 /// Send the selected workspace/chat + task to the cloud (explicit press).
 /// The notice mirrors `handleSend`: `sent` names the branch, `staged` names
-/// the carry-over package.
+/// The carry-over package.
 pub fn send_cloud(s: &mut CloudState) {
     if s.sending || s.workspace_id.trim().is_empty() {
         return;
@@ -640,7 +640,7 @@ pub fn poll_cloud_state(s: &mut CloudState, clock: f64) -> bool {
 }
 
 /// `Nov 9, 14:30` (`formatTime`): absolute, locale-free. Unparseable input
-/// passes through (React returns the raw value).
+/// passes through (the reference UI returns the raw value).
 pub fn format_time(value: &str) -> String {
     if value.trim().is_empty() {
         return "—".to_string();
@@ -681,7 +681,7 @@ fn stat_cell(label: &str, value: String, key: String) -> El {
 
 /// Full CloudRuns board: live dot, status grid, send form, handoffs.
 /// Stateful pickers use tap rows (Rune has no `<select>`): workspaces, then
-/// the selected workspace's chats with a "Whole workspace" head row.
+/// The selected workspace's chats with a "Whole workspace" head row.
 pub fn cloud_view<S: CloudHost + 'static>(s: &CloudState) -> El {
     let running = s.active.as_ref().is_some_and(|a| a.running);
     let status_label = match &s.active {

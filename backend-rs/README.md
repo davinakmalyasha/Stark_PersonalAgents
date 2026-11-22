@@ -2,7 +2,7 @@
 
 Stark's Rust backend: an OpenAI-compatible streaming provider, the hand-rolled
 agent loop, tool dispatch, SQLite/JSONL persistence, and the run/SSE server.
-This is the only backend; there is no Python server.
+This is the only backend; there is no second server implementation.
 
 ## Toolchain
 

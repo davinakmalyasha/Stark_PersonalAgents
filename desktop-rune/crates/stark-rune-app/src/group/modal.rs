@@ -537,7 +537,7 @@ pub fn group_modal<S: ProjectsHost + 'static>(g: &GroupState, w: f32, h: f32) ->
         .border(1.0, ink("#27272a"))
         .border_layout()
         .clip_rounded(16.0)
-        // Tailwind `shadow-2xl`: 0 25px 50px -12px rgb(0 0 0 / .25).
+        // Reference `shadow-2xl`: 0 25px 50px -12px rgb(0 0 0 / .25).
         .box_shadow(rune::Shadow {
             x: 0.0,
             y: 25.0,

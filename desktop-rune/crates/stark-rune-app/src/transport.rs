@@ -235,7 +235,7 @@ pub fn send_json(
 }
 /// Hand-built `multipart/form-data` upload (the backend's `/attachments`
 /// handler), returning the parsed `{attachments:[…]}` body. Native only:
-/// the picker and local paths exist only there. File reads stay synchronous
+/// The picker and local paths exist only there. File reads stay synchronous
 /// because the composer's send is synchronous for the same reason.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn upload_attachments(
@@ -319,8 +319,8 @@ pub async fn create_chat_wasm(workspace_id: &str, title: &str) -> Result<String,
 }
 
 /// Blocking `POST /api/abort {chat_id}`: tells the backend to actually cancel
-/// the run, not just detach this client. Fire-and-forget from Stop handlers;
-/// the response body is a bare `{ok}`. Empty `chat_id` is a no-op. Native only.
+/// The run, not just detach this client. Fire-and-forget from Stop handlers;
+/// The response body is a bare `{ok}`. Empty `chat_id` is a no-op. Native only.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn post_abort(host: &str, port: u16, chat_id: &str) -> bool {
     if chat_id.trim().is_empty() {
@@ -707,7 +707,7 @@ pub async fn download_web(path: &str, filename: &str) -> Result<String, String> 
 }
 
 /// Stable upload target. Cards carry their id (not a map order index) because
-/// the upload outlives the frame that opened the picker.
+/// The upload outlives the frame that opened the picker.
 #[cfg(target_arch = "wasm32")]
 #[derive(Clone, PartialEq, Eq)]
 pub enum WebTarget {
@@ -718,7 +718,7 @@ pub enum WebTarget {
 
 /// Fetch an attachment with the pairing header and hand it to an
 /// `HtmlAudioElement` through an object URL. The caller revokes the URL when
-/// the clip stops. Relative API paths are resolved against `api_origin()`.
+/// The clip stops. Relative API paths are resolved against `api_origin()`.
 #[cfg(target_arch = "wasm32")]
 pub async fn fetch_blob_url(url: &str) -> Result<(String, bool), String> {
     use wasm_bindgen::JsCast;
@@ -766,7 +766,7 @@ pub struct WebPick {
 }
 
 /// Completed browser upload. `created` means the picker had to create the
-/// chat first (React creates it at send time; uploading first needs an id).
+/// chat first (the reference UI creates it at send time; uploading first needs an id).
 #[cfg(target_arch = "wasm32")]
 pub struct WebUpload {
     pub target: WebTarget,
@@ -792,7 +792,7 @@ thread_local! {
 }
 
 /// True while a browser picker may still answer or an upload is in flight;
-/// the shell schedules a wake so the async result is applied promptly.
+/// The shell schedules a wake so the async result is applied promptly.
 #[cfg(target_arch = "wasm32")]
 pub fn web_busy() -> bool {
     let now = crate::clock::now_millis();
@@ -967,7 +967,7 @@ pub async fn upload_backup_web(projects_root: &str) -> Result<serde_json::Value,
     serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))
 }
 
-/// Upload picked browser files with the same multipart contract React uses.
+/// Upload picked browser files with the same multipart contract the reference UI uses.
 #[cfg(target_arch = "wasm32")]
 async fn upload_web_files(
     workspace_id: &str,
@@ -1235,7 +1235,7 @@ fn attachment_filename(value: &str) -> Option<String> {
 
 /// Upload one Stark backup zip with the optional projects root
 /// (`POST /api/data/import`), returning the staged-import JSON. Native only:
-/// the picker and local file paths exist only there.
+/// The picker and local file paths exist only there.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn upload_backup(
     host: &str,
@@ -1623,7 +1623,7 @@ mod tests {
     }
 
     /// Multipart upload over a real socket: path, boundary, file part, and
-    /// the parsed attachment ids the composer puts back in its draft deck.
+    /// The parsed attachment ids the composer puts back in its draft deck.
     #[test]
     fn upload_attachments_posts_multipart_and_reads_ids() {
         let dir = std::env::temp_dir().join(format!(

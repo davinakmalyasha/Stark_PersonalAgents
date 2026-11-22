@@ -1,5 +1,5 @@
 //! Mic capture + level metering behind the voice toggle. Dictation prefers
-//! the backend bridge ([`crate::voice_ws`]): captured 16 kHz mono PCM is
+//! The backend bridge ([`crate::voice_ws`]): captured 16 kHz mono PCM is
 //! streamed to `stark-server`, whose VAD/STT answers with
 //! [`VoiceMsg::Transcript`]. When no server is reachable the on-device
 //! producer (`stt`, MSVC builds) takes over, else capture degrades to
@@ -7,7 +7,7 @@
 //!
 //! Native: cpal default input streams RMS blocks into an `mpsc` channel the
 //! poll hook drains into `voice_level`. Web: `getUserMedia` binds later —
-//! the toggle owns the affordance, and capture reports honestly when there
+//! The toggle owns the affordance, and capture reports honestly when there
 //! is no device. Pure math (`rms_f32`, `decay_level`, `lit_bars`) is tested;
 //! hardware paths degrade to notes, never panics.
 
@@ -24,9 +24,9 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 pub enum VoiceMsg {
     Level(f32),
     /// Interim (`is_final: false`) or final (`true`) dictation text from the
-    /// speech thread. React's overlay protocol is the reference: `transcript`
+    /// speech thread. The reference UI's overlay protocol is the reference: `transcript`
     /// events refresh the live bubble in place, `pipeline-start` swaps it for
-    /// the single canonical user message. Produced by the `stt` worker on
+    /// The single canonical user message. Produced by the `stt` worker on
     /// MSVC + `voice-stt`; elsewhere the variant is exercised by tests.
     #[allow(dead_code)]
     Transcript {
@@ -54,7 +54,7 @@ pub struct VoiceBus {
     pub breathe_start_ms: u64,
     pub note: Option<String>,
     /// Latest interim dictation (`transcript` events overwrite it in place,
-    /// like React's `voice-live-input` bubble content).
+    /// like the reference UI's `voice-live-input` bubble content).
     pub live_text: String,
     /// A finished utterance waiting for the poll hook to stage it into the
     /// composer draft (`take_final` consumes it once).
@@ -244,7 +244,7 @@ impl VoiceBus {
     }
 
     /// Consume a finished utterance once (the poll hook stages it into the
-    /// composer draft, like React's `voiceInputText` dock effect).
+    /// composer draft, like the reference UI's `voiceInputText` dock effect).
     pub fn take_final(&mut self) -> Option<String> {
         self.pending_final.take()
     }
@@ -330,7 +330,7 @@ pub fn probe_input() -> Option<String> {
 /// 16 kHz capture mode for the STT frontend: the config plus whether the
 /// mono mixdown applies (stereo fallback). Mono F32/I16/U16 first, then
 /// stereo with downmix. When no exact mode exists the caller falls back to
-/// the device default rate and [`LinearResampler`] converts to 16 kHz.
+/// The device default rate and [`LinearResampler`] converts to 16 kHz.
 #[cfg(not(target_arch = "wasm32"))]
 fn prefer_16k(device: &cpal::Device) -> Option<(cpal::SupportedStreamConfig, bool)> {
     let mut best: Option<(u8, cpal::SupportedStreamConfig, bool)> = None;
@@ -406,7 +406,7 @@ impl LinearResampler {
             let index = pos.floor() as isize;
             let frac = (pos - index as f64) as f32;
             // An interpolating partner lives in the next block, except when
-            // the position lands exactly on the last sample (nothing to
+            // The position lands exactly on the last sample (nothing to
             // interpolate): keep the fractional position for the next call
             // so the join is seamless.
             if frac > 0.0 && index + 1 >= n as isize {
@@ -473,7 +473,7 @@ impl PcmForward {
 }
 
 /// When `pcm` is `Some`, every block is downmixed to mono and forwarded to
-/// the STT worker at 16 kHz (dropped on overflow, like the backend): an
+/// The STT worker at 16 kHz (dropped on overflow, like the backend): an
 /// exact 16 kHz device mode is used when offered, otherwise the captured
 /// rate is resampled ([`LinearResampler`]) — WASAPI shared mode usually
 /// exposes only 48 kHz. Owns the cpal `Stream` (dropping it stops the
@@ -496,9 +496,9 @@ pub fn capture_loop(
         return;
     };
     // 16 kHz mono is the STT frontend's native rate: prefer an exact mode so
-    // the common case ships no resampling. Any other rate still works — the
+    // The common case ships no resampling. Any other rate still works — the
     // bridge resamples rather than disabling dictation (48 kHz-only mics are
-    // the norm on Windows shared mode).
+    // The norm on Windows shared mode).
     let forward = pcm;
     let mut stereo = false;
     let config = if forward.is_none() {
@@ -780,7 +780,7 @@ mod tests {
         })
         .expect("send interim");
         assert!(bus.drain(1.0 / 60.0));
-        // Interim events overwrite in place (React's `voice-live-input`).
+        // Interim events overwrite in place (the reference UI's `voice-live-input`).
         assert_eq!(bus.live_text, "hello world");
         assert!(bus.live);
         tx.send(VoiceMsg::Transcript {

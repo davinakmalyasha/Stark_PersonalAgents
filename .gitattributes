@@ -1,0 +1,3 @@
+desktop-rune/vendor/** linguist-vendored
+desktop-rune/web/** linguist-vendored
+desktop-rune/web/pkg/** linguist-generated

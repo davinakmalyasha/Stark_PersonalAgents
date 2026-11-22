@@ -9,11 +9,11 @@
 //! - `POST /api/agents/{id}/message {message}` → `{ok, steered?, error?}`.
 //! - `POST /api/agents/{id}/cancel` (explicit press, like composer Stop).
 //! - `POST /api/agents/{id}/merge|discard` → `{ok, error?}` — both move real
-//!   files, so both sit behind React's own two-tap `confirmAction` gate: the
+//!   files, so both sit behind the reference UI's own two-tap `confirmAction` gate: the
 //!   first tap arms, the second fires. That confirm tap IS the user go-ahead.
 //!
 //! Mount: a section in the Home sidebar (delegations surface per-workspace,
-//! like the React coding sidebar) with the detail drawer as a modal sheet.
+//! like the reference UI coding sidebar) with the detail drawer as a modal sheet.
 
 use crate::keys::EnterPress;
 use std::collections::{HashMap, HashSet};
@@ -338,7 +338,7 @@ pub fn children_of(agents: &[AgentNode]) -> HashMap<Option<String>, Vec<usize>> 
 }
 
 /// Spawn a worker for `op`. List/detail refreshes run even while another op
-/// is in flight; writes serialize on `busy` (React disables while
+/// is in flight; writes serialize on `busy` (the reference UI disables while
 /// `detailBusy`).
 pub fn dispatch_agent(s: &mut AgentsState, op: AgentOp) {
     let is_write = matches!(
@@ -633,7 +633,7 @@ async fn run_agent_op_wasm(op: AgentOp) -> AgentThreadMsg {
     }
 }
 
-/// Drain the inbox; auto-refresh the list at most every 5s (React's panel
+/// Drain the inbox; auto-refresh the list at most every 5s (the reference UI's panel
 /// interval). After a write op lands, refresh list + detail like
 /// `refreshAll`.
 pub fn poll_agents_state(s: &mut AgentsState, clock: f64) -> bool {
@@ -707,7 +707,7 @@ pub trait AgentsHost {
 
 /// Parse a chat/agent timestamp: bare epoch seconds or ISO-8601
 /// `YYYY-MM-DDTHH:MM:SSZ` (the server's wire shape). Naive stamps are local
-/// wall time, matching `new Date()` in the React sidebar.
+/// wall time, matching `new Date()` in the reference UI sidebar.
 pub fn parse_timestamp(value: &str) -> Option<i64> {
     if let Ok(secs) = value.trim().parse::<i64>() {
         return Some(secs);
@@ -973,7 +973,7 @@ pub fn agents_section<S: AgentsHost + 'static>(s: &AgentsState) -> El {
 
 /// Agent detail drawer: status head, overview/mailbox/worktree tabs, and the
 /// action row. Merge/discard sit behind the two-tap `confirmAction` gate
-/// (that confirm tap is the user go-ahead — both move real files). React's
+/// (that confirm tap is the user go-ahead — both move real files). The reference UI's
 /// "Open chat" has no Rune target (no per-agent chat view) and is dropped.
 pub fn agent_sheet<S: AgentsHost + 'static>(s: &AgentsState) -> El {
     let selected: Option<AgentNode> = s

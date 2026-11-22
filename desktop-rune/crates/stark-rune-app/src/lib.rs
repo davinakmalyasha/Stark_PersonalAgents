@@ -95,7 +95,7 @@ pub mod voice_ws;
 
 /// Lucide draws its 2-unit stroke at a 24-unit viewBox and scales it with the
 /// icon. Rune's `view_box` leaves stroke widths in points, so callers pass the
-/// icon's point size here to keep the drawn weight identical to React.
+/// icon's point size here to keep the drawn weight identical to the reference UI.
 #[cfg(feature = "rune-real")]
 pub(crate) fn lucide_stroke(size: f32) -> f32 {
     size * (2.0 / 24.0)

@@ -1,8 +1,7 @@
 # Stark — Rune UI
 
 Stark's native and browser interface, built with
-[Rune](https://github.com/anomalyco/rune). This is the only UI; the former
-React/Tauri client has been removed.
+[Rune](https://github.com/anomalyco/rune). This is the only UI.
 
 This README is context only. It explains the project, the Rune concepts the
 port relies on, and the architecture. The code is the source of truth.
@@ -145,8 +144,9 @@ State is plain Rust. `TranscriptHost`, `CanvasHost`, `ProjectsHost`,
 or panel without borrowing the whole app. Handlers capture stable IDs or
 keys, never row indices, because virtual rows and memo reuse can move a row.
 
-The former React CSS values remain the reference for colors, spacing, radii,
-type and timing. Where CSS names a property Rune does not expose directly,
-look for a behavior primitive in Rune's source first. When the behavior
-genuinely does not exist, keep the closest honest implementation and record
-the boundary here rather than approximating silently.
+`stark-theme` and the Rune layout primitives are the source of truth for
+colors, spacing, radii, type and timing. Where a CSS-like name describes
+behavior Rune does not expose directly, look for a behavior primitive in
+Rune's source first. When the behavior genuinely does not exist, keep the
+closest honest implementation and record the boundary here rather than
+approximating silently.

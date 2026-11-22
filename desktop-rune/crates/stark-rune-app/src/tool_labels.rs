@@ -1,4 +1,4 @@
-//! Tool labels — port of the former React labels plus the historical names
+//! Tool labels plus the historical names
 //! kept for old transcripts.
 
 /// `TOOL_VERBS` + `LEGACY_VERBS`.
@@ -235,7 +235,7 @@ pub fn delegation_target(args: Option<&str>) -> (String, String) {
     (String::new(), String::new())
 }
 
-/// `primaryArg` — the compact tool subject. JSON object fields in React's
+/// `primaryArg` — the compact tool subject. JSON object fields in the reference UI's
 /// exact priority order; parallel fan-out summarises agent names.
 pub fn primary_arg(args: Option<&str>) -> String {
     let Some(args) = args else {

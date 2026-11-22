@@ -29,12 +29,12 @@ use crate::stream_accum::{
 
 /// Result of the blocking `/rewind` + `GET chat` work: the restored prompt
 /// and the canonical truncated history. The clicked id is kept so the UI can
-/// apply React's defensive slice even though the server already truncated.
+/// apply the reference UI's defensive slice even though the server already truncated.
 #[derive(Debug, Clone)]
 pub struct RewindOk {
     pub row_id: String,
     pub prompt: String,
-    /// The clicked user message's `metadata.attachments`; React restores the
+    /// The clicked user message's `metadata.attachments`; the reference UI restores the
     /// draft deck from the clicked message, not from the rewind response.
     pub attachments: Vec<ChatAttachment>,
     pub rows: Vec<ChatMsgRow>,
@@ -70,7 +70,7 @@ pub struct RowData {
     pub event_tokens_before: u64,
     pub event_input: u64,
     pub event_output: u64,
-    /// `metadata.usage` present: React shows the token/time footer only then.
+    /// `metadata.usage` present: the reference UI shows the token/time footer only then.
     pub has_usage: bool,
     /// `metadata.usage.total_input_tokens` / `total_output_tokens`.
     pub tokens_in: u64,
@@ -97,7 +97,7 @@ pub struct RowData {
     /// clock (180 ms) while the completed row folds; `None` means the body is
     /// already settled (history rows loaded open, or a finished close).
     pub trace_anim_at: Option<u64>,
-    /// Per-tool-group open state. Absence means React's default.
+    /// Per-tool-group open state. Absence means the reference UI's default.
     pub tool_open: std::collections::HashMap<String, bool>,
     /// Live fold owned by the row (never duplicated in app state).
     pub accum: Option<StreamAccum>,
@@ -115,7 +115,7 @@ pub struct RowData {
 /// Accumulated usage for one thread (`combinedTokenUsage` in `useChat.ts`):
 /// totals grow from `delta kind:"usage"` frames (`input/output`,
 /// `cached_tokens?`, `cost?`); `active` is the last call's input and drives
-/// the context orb (`activeContextTokens = lastCall?.input || 0`).
+/// The context orb (`activeContextTokens = lastCall?.input || 0`).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct UsageTotals {
     pub input: u64,
@@ -124,7 +124,7 @@ pub struct UsageTotals {
     pub cost: f64,
     pub active: u64,
     /// Per-call rows (`TokenCall`) for the stats modal. `agent` is always
-    /// `"chat"` — usage deltas carry no agent name (React merges server-side
+    /// `"chat"` — usage deltas carry no agent name (the reference UI merges server-side
     /// rows that do); model/timestamp stamp at record time.
     pub calls: Vec<UsageCall>,
 }
@@ -642,7 +642,7 @@ fn local_parts_from_secs(secs: i64) -> Option<(i32, u32, u32, u32, u32)> {
 }
 
 /// Non-Windows native fallback: UTC (the browser and Windows builds carry
-/// the real local zone).
+/// The real local zone).
 #[cfg(all(not(target_arch = "wasm32"), not(windows)))]
 fn local_parts_from_secs(secs: i64) -> Option<(i32, u32, u32, u32, u32)> {
     let days = secs.div_euclid(86_400);
@@ -686,7 +686,7 @@ impl SubagentDrill {
 }
 
 /// Undo state for one artifact panel (`ArtifactSummary` undo pill):
-/// React's `undoState` (`idle` is the map's absence).
+/// The reference UI's `undoState` (`idle` is the map's absence).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ArtifactUndo {
     #[default]
@@ -705,7 +705,7 @@ pub struct RuneTranscriptState {
     pub api_host: String,
     pub api_port: u16,
     /// Chat id used by `POST /api/chats/{id}/run` and `POST /api/abort` —
-    /// mirrors the React `chat.id` the run command and `abortRun` both use
+    /// mirrors the reference UI `chat.id` the run command and `abortRun` both use
     /// carry. Empty until the first send stages one.
     pub chat_id: String,
     /// Real workspace id (`_general`, `_personal`, or a project id).
@@ -734,11 +734,11 @@ pub struct RuneTranscriptState {
     /// Run target (`PromptDock runTarget`, persisted per chat — here per
     /// thread, the session's lifetime). `"local"` default; `"cloud"` only
     /// changes where the NEXT prompt is marked to go — the transfer itself
-    /// lands next, same as React, so sends behave identically either way.
+    /// lands next, same as the reference UI, so sends behave identically either way.
     pub run_target: String,
     /// Usage totals for the orb + popover (`combinedTokenUsage`).
     pub usage: UsageTotals,
-    /// Usage popover open (tap the orb; React hovers — tap is the honest
+    /// Usage popover open (tap the orb; the reference UI hovers — tap is the honest
     /// native equivalent, no hover targeting headlessly).
     pub usage_open: bool,
     /// Usage stats modal open (`TokenStatsModal`, per thread).
@@ -747,7 +747,7 @@ pub struct RuneTranscriptState {
     /// dock, so every thread owns its modal).
     pub agent_config: crate::agent_config::AgentConfigState,
     /// Model options (`GET /api/models` → `{models:[{id,name}]}`), fetched
-    /// once per thread lifetime (React fetches on mount; 60s retry keeps a
+    /// once per thread lifetime (the reference UI fetches on mount; 60s retry keeps a
     /// cold start honest).
     pub models: Vec<ModelOption>,
     pub models_loading: bool,
@@ -759,7 +759,7 @@ pub struct RuneTranscriptState {
     /// Live provider pill (`fetchProvider`, 30s refresh).
     pub provider: ProviderState,
     /// Background status fetches (`/api/provider`, `/api/models`) run only in
-    /// the real app entry; unit tests and headless scenes stay offline.
+    /// The real app entry; unit tests and headless scenes stay offline.
     pub services_auto: bool,
     /// Settings modal data + visibility (global in the shell; this thread
     /// owns the standalone transcript scene's copy).
@@ -774,7 +774,7 @@ pub struct RuneTranscriptState {
     pub inbox: Option<std::sync::mpsc::Receiver<crate::stream::SseFrame>>,
     /// The key of the code block whose copy button shows the Check state.
     pub copied_code: Option<String>,
-    /// When that copy happened (`clock::now_millis`), cleared after React's
+    /// When that copy happened (`clock::now_millis`), cleared after the reference UI's
     /// 1.8s. Milliseconds, not `Instant`: wasm has no clock behind `Instant`.
     pub copied_at: Option<u64>,
     /// Diff blocks whose "Show all N lines" button has been pressed.
@@ -785,13 +785,13 @@ pub struct RuneTranscriptState {
     pub expanded_artifacts: std::collections::HashSet<String>,
     /// Row key whose Review modal is open (`artifact-review-*` layer).
     pub artifact_review: Option<String>,
-    /// Undo pill per artifact row (`run_id` runs only; React disables the
+    /// Undo pill per artifact row (`run_id` runs only; the reference UI disables the
     /// pill otherwise). Absence is `idle`.
     pub artifact_undo: std::collections::HashMap<String, ArtifactUndo>,
     /// In-flight `POST /runs/{id}/undo` (`(row_key, Ok(status)|Err)`).
     /// `None` on clone: a copied state never inherits a live request.
     pub artifact_undo_inbox: Option<std::sync::mpsc::Receiver<(String, Result<String, String>)>>,
-    /// Row keys whose copy button is showing React's 1.5s Check state
+    /// Row keys whose copy button is showing the reference UI's 1.5s Check state
     /// (`clock::now_millis` timestamps).
     pub copied_messages: std::collections::HashMap<String, u64>,
     /// User rows armed for the two-step rewind (3.2s, like `rewindArmed`).
@@ -822,7 +822,7 @@ pub struct RuneTranscriptState {
     pub pending_rekey: Option<(String, String)>,
     /// Row keys that have already appeared on screen. The virtual list unmounts
     /// rows outside its window, so without this a scroll back would replay the
-    /// CSS entrance on rows the user has already seen. React animates a message
+    /// CSS entrance on rows the user has already seen. The reference UI animates a message
     /// once, on mount, and never again.
     pub seen_rows: std::collections::HashSet<String>,
     /// Bumped whenever code-copy or diff-expand state changes. Markdown bodies
@@ -1287,7 +1287,7 @@ fn bg() -> rune::Color {
 }
 
 /// Standalone window size (the shell has its own static): keeps the
-/// full-viewport lightbox at React's 92vw/86vh without threading dimensions
+/// full-viewport lightbox at the reference UI's 92vw/86vh without threading dimensions
 /// through every transcript builder.
 static mut TRANSCRIPT_WINDOW: (f32, f32) = (468.0, 720.0);
 
@@ -1327,7 +1327,7 @@ pub const MAX_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
 /// Shared send path (button + Enter): stage the field as a user row, mark the
 /// run live, and spawn the blocking chat-run thread into `inbox`.
 /// Attachments count as content, so an attachment-only send is allowed; the
-/// text is only cleared once staging succeeded (React's guard keeps a live
+/// text is only cleared once staging succeeded (the reference UI's guard keeps a live
 /// run's draft in place).
 pub fn stage_send(s: &mut RuneTranscriptState) {
     let prompt = s.edit.text.trim().to_string();
@@ -1339,14 +1339,14 @@ pub fn stage_send(s: &mut RuneTranscriptState) {
         s.edit.text.clear();
         s.edit.anchor = 0;
         s.edit.focus = 0;
-        // React's PromptDock clears both dock lists after `handleSend`.
+        // The reference UI's PromptDock clears both dock lists after `handleSend`.
         s.draft_attachments.clear();
         s.attachments_error = None;
     }
 }
 
 /// One picked path becomes a local draft card (`id` empty until upload).
-/// React's `addFiles`: drop >20 MB files, dedupe by name+size, cap at eight,
+/// The reference UI's `addFiles`: drop >20 MB files, dedupe by name+size, cap at eight,
 /// and report the matching amber line.
 ///
 /// Shared by the transcript composer and canvas card docks so both surfaces
@@ -1413,7 +1413,7 @@ pub fn add_attachment_paths(s: &mut RuneTranscriptState, paths: &[std::path::Pat
 
 /// Remove one deck card. Local picks have no id yet (the composer passes
 /// `local:<index>`); restored uploads pass their id. Clearing back under the
-/// cap also drops React's "up to 8" line.
+/// cap also drops the reference UI's "up to 8" line.
 pub fn remove_attachment_from(
     attachments: &mut Vec<ChatAttachment>,
     error: &mut Option<String>,
@@ -1481,7 +1481,7 @@ pub fn drop_attachment_files(s: &mut RuneTranscriptState, files: &[std::path::Pa
     s.attachments_dragging = false;
 }
 
-/// React `chat.title` for a fresh conversation: first 32 chars + ellipsis.
+/// The reference UI `chat.title` for a fresh conversation: first 32 chars + ellipsis.
 fn chat_title(prompt: &str) -> String {
     let trimmed = prompt.trim();
     let head: String = trimmed.chars().take(32).collect();
@@ -1933,7 +1933,7 @@ pub fn stage_send_prompt(s: &mut RuneTranscriptState, prompt: String) {
 
 /// Stage a send with its dock attachments. Restored files already have ids;
 /// local picks are uploaded synchronously first (after creating the chat, so
-/// the upload has somewhere to land). A failure leaves the draft intact and
+/// The upload has somewhere to land). A failure leaves the draft intact and
 /// reports through the dock's amber line, exactly where the send came from.
 pub fn stage_send_prompt_with_attachments(
     s: &mut RuneTranscriptState,
@@ -1944,7 +1944,7 @@ pub fn stage_send_prompt_with_attachments(
     if (prompt.is_empty() && attachments.is_empty()) || s.live || s.aborting {
         return false;
     }
-    // React keeps the two dock lists separate: restored files are sent
+    // The reference UI keeps the two dock lists separate: restored files are sent
     // as-is, picked files upload now, and the wire order is restored first.
     #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
     let mut send_attachments: Vec<ChatAttachment> = attachments
@@ -2031,7 +2031,7 @@ pub fn stage_send_prompt_with_attachments(
         attachments: send_attachments.clone(),
         ..RowData::default()
     });
-    // Show the live bubble immediately (React appends `house-live` on send,
+    // Show the live bubble immediately (the reference UI appends `house-live` on send,
     // before the first delta) with the same Thinking placeholder.
     s.rows.push(RowData {
         key: crate::stream::LIVE_ROW_KEY.to_string(),
@@ -2151,7 +2151,7 @@ fn queue_save(
 
 /// Freeze the live row into a normal agent row and queue its persistence.
 ///
-/// - `error`: an inline error follows the partial response (React's `onError`
+/// - `error`: an inline error follows the partial response (the reference UI's `onError`
 ///   path persists the partial first, then the error).
 /// - `stopped`: Stop button, `metadata.stopped = true`.
 ///
@@ -2201,7 +2201,7 @@ pub fn finalize_run(s: &mut RuneTranscriptState, error: Option<String>, stopped:
         || run_usage.cache_hit > 0
         || run_usage.cost > 0.0;
 
-    // An error with no partial output removes the empty placeholder; React's
+    // An error with no partial output removes the empty placeholder; the reference UI's
     // live bubble disappears and only the error row remains.
     if is_error && !has_partial {
         s.rows.remove(index);
@@ -2281,7 +2281,7 @@ pub fn finalize_run(s: &mut RuneTranscriptState, error: Option<String>, stopped:
 }
 
 /// Shared stop path (composer Stop button): persist the partial immediately
-/// (React's `handleCancel`), then fire-and-forget `POST /api/abort`.
+/// (the reference UI's `handleCancel`), then fire-and-forget `POST /api/abort`.
 pub fn stage_abort(s: &mut RuneTranscriptState) {
     if !s.live || s.aborting {
         return;
@@ -2303,7 +2303,7 @@ pub fn stage_abort(s: &mut RuneTranscriptState) {
 }
 
 /// Host access for views composed into a larger shell: handlers stay typed to
-/// the shell state while reading transcript data. The standalone transcript
+/// The shell state while reading transcript data. The standalone transcript
 /// view hosts itself. `Main` is the fallback thread; `Open` is the transcript
 /// sheet's card thread (resolved through the sessions map — one page, chat
 /// types only, no workspace routes). `Card` targets one canvas card by its
@@ -2384,7 +2384,7 @@ pub fn transcript_view_body<S: TranscriptHost + crate::settings::SettingsHost + 
 struct HomeRows {
     visible: Vec<bool>,
     dividers: Vec<Option<String>>,
-    /// `retryMap`: the last user prompt at or before each row. React builds it
+    /// `retryMap`: the last user prompt at or before each row. The reference UI builds it
     /// over the deduped list, so hidden internal/duplicate rows never leak a
     /// prompt. Empty prompt is a valid value (the retry button is still shown).
     retry_prompts: Vec<String>,
@@ -2422,7 +2422,7 @@ fn attachment_has_src(s: &RuneTranscriptState, file: &ChatAttachment) -> bool {
         || (!file.path.is_empty() && std::path::Path::new(&file.path).exists())
 }
 
-/// Open a message attachment the way React's anchor does: the explicit URL,
+/// Open a message attachment the way the reference UI's anchor does: the explicit URL,
 /// or the local upload path as a `file:` URL. Server-only attachments have
 /// no native download endpoint, so they keep the anchor's visual but no press.
 fn attachment_open_url(s: &RuneTranscriptState, file: &ChatAttachment) -> Option<String> {
@@ -2513,7 +2513,7 @@ fn audio_clock(seconds: f64) -> String {
     format!("{}:{:02}", total / 60, total % 60)
 }
 
-/// Inline player for one attachment. The row keeps React's `.message-audio`
+/// Inline player for one attachment. The row keeps the reference UI's `.message-audio`
 /// container; the controls are Stark-native, so play/pause, seek, time and
 /// mute read the same on every desktop.
 fn home_audio_row<S: TranscriptHost + 'static>(
@@ -2883,7 +2883,7 @@ fn home_message_attachments<S: TranscriptHost + 'static>(
 }
 
 /// `message-lightbox`: fixed full-viewport preview, blurred backdrop, and a
-/// close button. Any press dismisses it, matching React's backdrop handler.
+/// close button. Any press dismisses it, matching the reference UI's backdrop handler.
 pub fn attachment_lightbox<S: 'static>(
     file: &ChatAttachment,
     window_w: f32,
@@ -2982,7 +2982,7 @@ pub fn attachment_lightbox<S: 'static>(
 }
 
 /// `MessageBubble.copyMessage`: write the row's raw text and, for user and
-/// error rows only, hold React's 1.5s Check state. Agent copy has no feedback.
+/// error rows only, hold the reference UI's 1.5s Check state. Agent copy has no feedback.
 fn copy_message<S: TranscriptHost + 'static>(
     s: &mut S,
     which: Thread,
@@ -3001,7 +3001,7 @@ fn copy_message<S: TranscriptHost + 'static>(
     }
 }
 
-/// First press arms the row; the 3.2s poll timeout disarms it. React keeps
+/// First press arms the row; the 3.2s poll timeout disarms it. The reference UI keeps
 /// this state local to each `MessageBubble`.
 fn arm_rewind<S: TranscriptHost + 'static>(s: &mut S, which: Thread, key: &str, tx: &mut rune::Tx) {
     s.thread_mut(which)
@@ -3114,10 +3114,10 @@ fn start_rewind(s: &mut RuneTranscriptState, row_id: String, attachments: Vec<Ch
     });
 }
 
-/// Apply React's `handleRewind` result: defensive slice before the clicked
+/// Apply the reference UI's `handleRewind` result: defensive slice before the clicked
 /// id, restore the prompt and the clicked message's attachments, then refresh
-/// the sidebar. Failures stay silent: `HouseChat` declares `notification` but
-/// never renders it, so the React UI shows nothing either.
+/// The sidebar. Failures stay silent: `HouseChat` declares `notification` but
+/// never renders it, so the reference UI shows nothing either.
 fn apply_rewind(s: &mut RuneTranscriptState, result: RewindOk) {
     let cut = result
         .rows
@@ -3145,7 +3145,7 @@ fn apply_rewind(s: &mut RuneTranscriptState, result: RewindOk) {
 }
 
 /// Open the session-keyed drill (`SubagentSessionView`): replace the body
-/// with the child chat. The workspace hint resolves like React's
+/// with the child chat. The workspace hint resolves like the reference UI's
 /// `workspaceMatches` fallback — an explicit hint wins, else the parent
 /// thread's workspace.
 pub fn open_subagent(
@@ -3370,7 +3370,7 @@ fn home_ink(hex: &'static str) -> rune::Color {
 }
 
 fn home_rgba(r: f32, g: f32, b: f32, a: f32) -> rune::Color {
-    // Rune `Color` is linear RGB; CSS/React values here are sRGB.
+    // Rune `Color` is linear RGB; CSS/the reference UI values here are sRGB.
     fn linear(c: f32) -> f32 {
         let c = c / 255.0;
         if c <= 0.04045 {
@@ -3387,7 +3387,7 @@ fn home_rgba(r: f32, g: f32, b: f32, a: f32) -> rune::Color {
     }
 }
 
-/// Home message type scale: 15.5pt at React's `leading-[1.85]`.
+/// Home message type scale: 15.5pt at the reference UI's `leading-[1.85]`.
 fn home_body_style() -> rune::tok::TextStyle {
     let mut style = rune::tok::TextStyle::new(15.5, 400.0);
     style.line_height = 15.5 * 1.85;
@@ -3616,7 +3616,7 @@ fn home_user_row<S: TranscriptHost + 'static>(s: &S, which: Thread, r: &RowData,
                 .px(8.0)
                 .radius(6.0)
                 .fill(home_rgba(239.0, 68.0, 68.0, 0.15))
-                // React's confirm button has no hover state of its own.
+                // The reference UI's confirm button has no hover state of its own.
                 .on_press_tx_enter(move |s: &mut S, _tx: &mut rune::Tx| {
                     start_rewind(
                         s.thread_mut(which),
@@ -3771,7 +3771,7 @@ fn home_agent_row<S: TranscriptHost + 'static>(
             render_body_styled::<S>(s, which, &r.key, &final_text, "#e4e4e7", home_body_style())
         }
         .pt(12.0)
-        // React's `.agent-message-response` ends after the last block's
+        // The reference UI's `.agent-message-response` ends after the last block's
         // own bottom margin (`mb-12`/`mb-20`), not at the final glyph.
         .pb(md_render::last_margin(&final_text));
         group = group.child(response);
@@ -3788,7 +3788,7 @@ fn home_agent_row<S: TranscriptHost + 'static>(
     }
 
     // File summary panel (`MessageBubble.ArtifactSummary`): live rows read
-    // the accumulator's copy, completed rows the persisted metadata.
+    // The accumulator's copy, completed rows the persisted metadata.
     let artifacts = r
         .accum
         .as_ref()
@@ -3930,7 +3930,7 @@ pub fn start_artifact_undo(s: &mut RuneTranscriptState, row_key: &str, run_id: &
 
 /// Drain the undo inbox: `conflict` stays visible, anything else marks the
 /// run undone; transport failures re-arm the pill (`Failed` → label back to
-/// `Undo`, like React's `error` fallthrough).
+/// `Undo`, like the reference UI's `error` fallthrough).
 pub fn poll_artifact_undo(s: &mut RuneTranscriptState) -> bool {
     let Some(rx) = s.artifact_undo_inbox.as_ref() else {
         return false;
@@ -3960,7 +3960,7 @@ pub fn poll_artifact_undo(s: &mut RuneTranscriptState) -> bool {
     changed
 }
 
-/// Status glyph for one artifact file row (React `statusIcon`): plus for
+/// Status glyph for one artifact file row (the reference UI `statusIcon`): plus for
 /// added, minus for deleted, pencil for modified — Lucide strokes in the
 /// summary's status colors.
 fn artifact_status_icon(status: crate::chats::ArtifactStatus, size: f32) -> El {
@@ -4056,7 +4056,7 @@ fn artifact_panel<S: TranscriptHost + 'static>(
         (false, ArtifactUndo::Conflict) => "Conflict",
         (false, ArtifactUndo::Failed) => "Undo",
     };
-    // The pill is disabled without a run id or while working/undone (React
+    // The pill is disabled without a run id or while working/undone (the reference UI
     // mirrors `disabled` onto the same conditions).
     let undo_enabled = !art.run_id.is_empty()
         && !matches!(
@@ -4336,7 +4336,7 @@ fn artifact_review_overlay<S: TranscriptHost + 'static>(
         return col().key("artifact-review-empty");
     };
     // Title/count come from the data snapshot; file sections render through
-    // the host (diff copy buttons resolve there), so the scroll body is a
+    // The host (diff copy buttons resolve there), so the scroll body is a
     // `virtual_rows` stack — direct child of the viewport, Rune `collapsible`
     // rule for conditional content.
     let file_total = s
@@ -4464,7 +4464,7 @@ fn artifact_review_overlay<S: TranscriptHost + 'static>(
                 },
             )
     };
-    // Viewport-aware card: React's review modal is `min(860px,100%)` /
+    // Viewport-aware card: the reference UI's review modal is `min(860px,100%)` /
     // `min(760px,100vh-48px)`; the native card was a fixed 640px / 480px
     // scroll. Expand to the same caps (still a centered modal over the
     // chats-only transcript — no map/coding workspace takeover) so large
@@ -4588,9 +4588,9 @@ fn thousands(n: u64) -> String {
     out
 }
 
-/// Hover-revealed agent actions (React reserves the 25pt row at rest).
+/// Hover-revealed agent actions (the reference UI reserves the 25pt row at rest).
 /// Retry hides while the answer streams; copy always stays. Agent copy has
-/// no Check feedback (React writes to the clipboard only).
+/// no Check feedback (the reference UI writes to the clipboard only).
 fn home_agent_actions<S: TranscriptHost + 'static>(
     _s: &S,
     which: Thread,
@@ -5020,7 +5020,7 @@ fn row_entrance(
 }
 
 /// One home row (`MessageStream` + `MessageBubble`): local-day divider, then
-/// the role's flat layout — no avatars, no bubble names, 24pt group spacing.
+/// The role's flat layout — no avatars, no bubble names, 24pt group spacing.
 fn home_row<S: TranscriptHost + 'static>(
     s: &S,
     which: Thread,
@@ -5034,7 +5034,7 @@ fn home_row<S: TranscriptHost + 'static>(
         .key(r.key.clone())
         .w_full()
         // A row leaving the window or a refreshed history unmounts at once,
-        // like React. The entrance belongs to the message group below, so the
+        // like the reference UI. The entrance belongs to the message group below, so the
         // day divider stays put and the row never leaves a fading ghost.
         .transition(rune::Transition::none());
     if r.role == "user" {
@@ -5045,7 +5045,7 @@ fn home_row<S: TranscriptHost + 'static>(
     if r.show_trace && !r.is_streaming {
         // `.trace-collapsible` collapses its grid row over 280 ms. A
         // completed trace row is a growth-stack row, so `fold_glide` gives
-        // the row the same disclosure curve while the body fades.
+        // The row the same disclosure curve while the body fades.
         root = root.fold_glide(crate::motion::TRACE_FOLD);
     }
     if let Some(label) = &meta.dividers[i] {
@@ -5076,7 +5076,7 @@ fn home_row<S: TranscriptHost + 'static>(
 }
 
 /// `ConversationRail`: up to six 7×2 turn dashes centered in a 24pt column
-/// at the scroll area's left edge (React hides it below two turns).
+/// at the scroll area's left edge (the reference UI hides it below two turns).
 fn conversation_rail(rows: &[RowData]) -> Option<El> {
     let mut turns: Vec<Vec<&RowData>> = Vec::new();
     let mut current: Vec<&RowData> = Vec::new();
@@ -5162,7 +5162,7 @@ pub fn home_transcript_body<S: TranscriptHost + crate::settings::SettingsHost + 
     window_h: f32,
     minimized: bool,
 ) -> El {
-    // React caps the user bubble at 85% of the message column: card width
+    // The reference UI caps the user bubble at 85% of the message column: card width
     // minus its 8pt side gutters, hairlines, and the scroll area's pl-8/pr-4.
     let max_w = ((card_w - 18.0 - 48.0) * 0.85).max(120.0);
     transcript_body_with::<S>(s, which, false, true, false, max_w, window_h, minimized)
@@ -5467,7 +5467,7 @@ fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'sta
     folded: bool,
 ) -> El {
     // Session-keyed drill (`SubagentSessionView`): conditional content replaces
-    // the body, Rune `collapsible` style — no height animation, just open content.
+    // The body, Rune `collapsible` style — no height animation, just open content.
     // A folded home card skips the drill with the rest of the message area.
     if s.active_subagent.is_some() && !folded {
         return subagent_drill_view::<S>(s, which, home_max_w);
@@ -5479,7 +5479,7 @@ fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'sta
     // user rows `justify_end` with content-sized bubbles like
     // `.canvas-bubble-row.is-user`; agent bubbles `grow` full width.
     let home = !show_head;
-    // React's home scroll area is `pl-8 pr-4 py-3`; the sheet keeps 12pt.
+    // The reference UI's home scroll area is `pl-8 pr-4 py-3`; the sheet keeps 12pt.
     // One selection group around the virtual list: a drag crosses messages,
     // and Rune pins offscreen rows so the selection survives the window.
     let mut stack = col()
@@ -5497,11 +5497,11 @@ fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'sta
         None
     };
     // Empty home thread (`MessageStream` isEmpty): a 60vh drop surface with
-    // the centered "What to do Boss?" prompt. It lives inside the scroll
+    // The centered "What to do Boss?" prompt. It lives inside the scroll
     // area, so the card caps at 74vh and the prompt sits at the bottom
-    // (stick-to-bottom), exactly like React. A live voice bubble counts as
+    // (stick-to-bottom), exactly like the reference UI. A live voice bubble counts as
     // content: speaking into an empty chat shows the interim bubble, not the
-    // empty surface (React's `voice-live-input` is a real message).
+    // empty surface (the reference UI's `voice-live-input` is a real message).
     let voice_extra = usize::from(home && s.voice.live && !s.voice.live_text.trim().is_empty());
     let stack = if home && s.rows.is_empty() && voice_extra == 0 {
         stack.child(
@@ -5532,7 +5532,7 @@ fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'sta
                     if i < s.thread(which).rows.len() {
                         Cow::Borrowed(s.thread(which).rows[i].key.as_str())
                     } else {
-                        // React's stable `voice-live-input` id for the interim
+                        // The reference UI's stable `voice-live-input` id for the interim
                         // bubble (overwritten in place per `transcript` event).
                         Cow::Owned("voice-live-input".to_string())
                     }
@@ -5541,7 +5541,7 @@ fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'sta
                     let t = s.thread(which);
                     if i >= t.rows.len() {
                         // Trailing interim dictation bubble (no meta entry, no
-                        // actions — like React's plain live bubble).
+                        // actions — like the reference UI's plain live bubble).
                         return voice_live_bubble::<S>(s, which, &t.voice.live_text, home_max_w);
                     }
                     if let Some(meta) = &home_rows {
@@ -5559,7 +5559,7 @@ fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'sta
                     let r = &s.thread(which).rows[i];
                     // Role palette from `canvas.css` `.canvas-bubble*`: per-role
                     // fills, hairlines (agent .05 / user .075 / live .10), and
-                    // the translucent rose error system; 22px avatars, 11px/650
+                    // The translucent rose error system; 22px avatars, 11px/650
                     // `#f0f0f3` name headers, role-tinted 12.5px bodies
                     // (`#dedee5` user, `#d2d2da` agent).
                     let (fill, hair_a, avatar_bg, initial, initial_ink, name, body_ink) =
@@ -5620,7 +5620,7 @@ fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'sta
                         .child(render_body::<S>(s, which, &r.key, &r.body, body_ink));
                     // Bubble foot (`canvas-bubble-foot`): `hh:MM AM/PM`, nothing
                     // else. The compact card bubble stays display-only; the
-                    // full transcript owns copy/rewind, as React's card does.
+                    // full transcript owns copy/rewind, as the reference UI's card does.
                     let bubble = match clock(&r.at) {
                         t if t.is_empty() => bubble,
                         t => bubble.child(
@@ -5729,7 +5729,7 @@ fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'sta
         .min_h(0.0)
         .scroll(ScrollSpec { stick_bottom: true })
         .on_scroll_offset(move |at| {
-            // React shows the pill past 120pt from the bottom; fade it in
+            // The reference UI shows the pill past 120pt from the bottom; fade it in
             // over the following 40pt so it never pops.
             let distance = (at.max[1] - at.offset[1]).max(0.0);
             pill.set(((distance - 120.0) / 40.0).clamp(0.0, 1.0));
@@ -5787,7 +5787,7 @@ fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'sta
         );
     }
     // `MessageStream` wrapper: scroll area plus the turn-mark rail pinned to
-    // its left edge (React mounts the rail above the scroller).
+    // its left edge (the reference UI mounts the rail above the scroller).
     let mut view = col()
         .key("transcript-body")
         .w_full()
@@ -5855,7 +5855,7 @@ fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'sta
     }
     // Thread-local running banner: the standalone view carries it here; the
     // shell's sheet drops it (sheet keeps its own). The folded home card hides
-    // the whole message area and keeps only the prompt dock.
+    // The whole message area and keeps only the prompt dock.
     if s.live && !folded {
         root = root.child(
             text("Running".to_string())
@@ -5888,7 +5888,7 @@ fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'sta
                 provider_warn: s.provider.warn,
                 model: &s.model,
                 // HouseChat's PromptDock never passes `onModelChange`, so the
-                // home card has no model dropup (React renders provider only).
+                // home card has no model dropup (the reference UI renders provider only).
                 models: if dock_compact { &[] } else { &s.models },
                 model_open: s.model_open,
                 attachments: &s.draft_attachments,
@@ -5947,7 +5947,7 @@ fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'sta
     };
     let dock = if dock_compact {
         // Inside the home chat card the outer card owns the 8pt gutter and
-        // React nests two wrappers here: HouseChat `pt-1` then PromptDock's
+        // The reference UI nests two wrappers here: HouseChat `pt-1` then PromptDock's
         // `px-2 pt-1.5 pb-1.5` (safe-area inline override = 6pt bottom).
         // The ask slot has the same 6pt top/bottom (its inline paddingBottom
         // overrides `md:pb-2`), while the composer dock keeps the tuned 10pt
@@ -6027,7 +6027,7 @@ fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'sta
 }
 
 /// Interim dictation bubble (`voice-live-input`): the trailing user bubble
-/// while the mic is live. Same Stark user-bubble visuals, no actions — React
+/// while the mic is live. Same Stark user-bubble visuals, no actions — the reference UI
 /// renders the interim words as a plain bubble, overwritten per event.
 fn voice_live_bubble<S: TranscriptHost + 'static>(
     s: &S,
@@ -6455,7 +6455,7 @@ pub fn drain_run_inbox(s: &mut RuneTranscriptState, clock: f64, tx: &mut rune::T
             changed = true;
         }
         Some(Ok(Err(_message))) => {
-            // No visible error banner in React's HouseChat.
+            // No visible error banner in the reference UI's HouseChat.
             s.rewind_inbox = None;
             changed = true;
         }
@@ -6503,7 +6503,7 @@ pub fn drain_run_inbox(s: &mut RuneTranscriptState, clock: f64, tx: &mut rune::T
     // Voice levels ride the same poll at 60fps steps.
     changed |= s.voice.drain(1.0 / 60.0);
     // Finished utterance (`pipeline-start`): stage the canonical prompt into
-    // the composer draft, like React's `voiceInputText` dock effect. Runs
+    // The composer draft, like the reference UI's `voiceInputText` dock effect. Runs
     // after `drain` so this frame's final is staged immediately.
     if let Some(prompt) = s.voice.take_final() {
         if !prompt.trim().is_empty() {
@@ -6561,7 +6561,7 @@ mod tests {
 
     #[test]
     fn clock_shapes() {
-        // The clock is local time (React `toLocaleTimeString`), so only the
+        // The clock is local time (the reference UI `toLocaleTimeString`), so only the
         // shape is timezone-independent; the date math itself is covered by
         // `day_label_groups_a_fresh_stamp_as_today`.
         for iso in [
@@ -6578,7 +6578,7 @@ mod tests {
         }
         assert_eq!(clock(""), "");
         assert_eq!(clock("garbage"), "");
-        // Naive stamps are local wall time (React `new Date()`), not UTC.
+        // Naive stamps are local wall time (the reference UI `new Date()`), not UTC.
         assert_eq!(clock("2026-11-09T14:44:00"), "02:44 PM");
         assert_eq!(day_label("2026-11-01T14:44:00"), "Nov 1");
     }
@@ -7110,7 +7110,7 @@ mod tests {
     }
 
     /// The home transcript with the shell's root lightbox, for tests that need
-    /// the persisted user-row cards (the standalone sheet body has none).
+    /// The persisted user-row cards (the standalone sheet body has none).
     fn home_attachments_view(s: &RuneTranscriptState, _cx: &mut Cx<RuneTranscriptState>) -> El {
         let mut root = col().key("test-home-root").w_full().h_full().fill(bg());
         root = root.child(home_transcript_body::<RuneTranscriptState>(
@@ -7201,7 +7201,7 @@ mod tests {
         let (rect, _) = rt.presented("u-audio-file-audio-1").unwrap();
         assert!(
             (rect[2] - 280.0).abs() < 0.6,
-            "React .message-audio max width, got {}",
+            "reference .message-audio max width, got {}",
             rect[2]
         );
         let _ = std::fs::remove_file(wav);
@@ -7286,7 +7286,7 @@ mod tests {
             s.attachments_error.as_deref(),
             Some("You can attach up to 8 files at once.")
         );
-        // Duplicates are dropped and re-report the cap, like React's
+        // Duplicates are dropped and re-report the cap, like the reference UI's
         // `next.length < current.length + valid.length` check.
         add_attachment_paths(&mut s, &paths[..1]);
         assert_eq!(s.draft_attachments.len(), MAX_ATTACHMENTS);
@@ -7351,7 +7351,7 @@ mod tests {
                 ],
             },
         );
-        // Everything from the clicked message on is gone, like React's
+        // Everything from the clicked message on is gone, like the reference UI's
         // defensive slice before `message_id`.
         assert_eq!(s.rows.len(), 2);
         assert_eq!(s.rows[0].key, "u1");
@@ -7454,7 +7454,7 @@ mod tests {
         assert_eq!(drill.parent_title, "Parent");
         assert!(drill.loading);
         assert_eq!(s.drill_key.as_deref(), Some("ws-alpha:child-1"));
-        // Empty hint falls back to the parent thread's workspace (React
+        // Empty hint falls back to the parent thread's workspace (the reference UI
         // `workspaceFallback`).
         open_subagent(&mut s, "child-2", "", None);
         assert_eq!(
@@ -7653,7 +7653,7 @@ mod tests {
         let env = Env::new(true, 2.0);
         let mut rt = Runtime::new(s, home_attachments_view, (468.0, 720.0), env);
         rt.frame(0.0);
-        // Interim words render as the trailing bubble (React id kept).
+        // Interim words render as the trailing bubble (the reference UI id kept).
         assert!(rt.find("voice-live-input").is_some(), "bubble placed");
         assert!(
             rt.find("transcript-empty").is_none(),
@@ -7810,7 +7810,7 @@ mod tests {
         let env = Env::new(true, 2.0);
         let mut rt = Runtime::new(s, home_attachments_view, (468.0, 720.0), env);
         rt.frame(0.0);
-        // Pill renders but carries no press (React `disabled`).
+        // Pill renders but carries no press (the reference UI `disabled`).
         assert!(rt.find("a1-artifact-undo").is_some(), "pill placed");
         let (x, y) = rt.find("a1-artifact-undo").expect("pill placed");
         rt.pointer_down(x, y);
@@ -7912,7 +7912,7 @@ mod tests {
         let env = Env::new(true, 2.0);
         let mut rt = Runtime::new(s, home_attachments_view, (468.0, 720.0), env);
         rt.frame(0.0);
-        // Right-aligned columns stay left-aligned (React `text-left` carries
+        // Right-aligned columns stay left-aligned (the reference UI `text-left` carries
         // no alignment override either); the well, header and rows mount.
         assert!(rt.find("t1-b0-table-wrap").is_some(), "well placed");
         assert!(rt.find("t1-b0-thead").is_some(), "header placed");

@@ -550,7 +550,7 @@ mod tests {
     use crate::group::data::{GroupEvent, GroupItem};
 
     #[test]
-    fn actor_labels_and_clocks_match_the_react_helpers() {
+    fn actor_labels_and_clocks_match_the_reference_helpers() {
         assert_eq!(actor_label("member:dev"), "Dev");
         assert_eq!(actor_label("supervisor"), "Orchestrator");
         assert_eq!(actor_label("owner"), "You");

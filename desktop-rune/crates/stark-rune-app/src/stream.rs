@@ -165,7 +165,7 @@ fn live_accum(state: &mut RuneTranscriptState) -> &mut StreamAccum {
 }
 
 /// Refresh the row's mirrored live-state fields after a fold. The row owns
-/// the accumulator; these copies are only for cheap rendering/tests.
+/// The accumulator; these copies are only for cheap rendering/tests.
 fn sync_live(row: &mut RowData) {
     let Some(acc) = &row.accum else { return };
     row.retry = acc.retry.clone();
@@ -191,7 +191,7 @@ pub fn apply_frame(state: &mut RuneTranscriptState, frame: &SseFrame) -> &'stati
                 state.chat_id = id.to_string();
                 state.chat_ready = true;
                 // A draft card created from the map rides a `local:*` key;
-                // the shell renames it once this real id exists. Harmless for
+                // The shell renames it once this real id exists. Harmless for
                 // already-real chats (the rekey checks the key prefix).
                 let workspace = frame
                     .data
@@ -201,7 +201,7 @@ pub fn apply_frame(state: &mut RuneTranscriptState, frame: &SseFrame) -> &'stati
                     .unwrap_or(&state.workspace_id)
                     .to_string();
                 state.pending_rekey = Some((workspace, id.to_string()));
-                // React refreshes the sidebar right after creating a chat.
+                // The reference UI refreshes the sidebar right after creating a chat.
                 state.refresh_list = true;
             }
             if let Some(workspace) = frame.data.get("workspace_id").and_then(Value::as_str) {
@@ -217,7 +217,7 @@ pub fn apply_frame(state: &mut RuneTranscriptState, frame: &SseFrame) -> &'stati
         "log.synced" => "synced",
         "delta" => {
             // Late frames after the terminal event must not resurrect a
-            // finished live row (React's `settled` runs no further UI work).
+            // finished live row (the reference UI's `settled` runs no further UI work).
             if !state.live {
                 return "ignored";
             }

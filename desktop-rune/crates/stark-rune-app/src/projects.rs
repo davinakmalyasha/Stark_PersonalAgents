@@ -5,7 +5,7 @@
 //! milestones_done,milestones_total,items_done,items_total,
 //! awaiting_approval,goal,…}], scoped}`.
 //! Read-only: detail/ops (`pause`/`resume`/`close`) stay server-side until
-//! the modal port. Empty board is the honest state when none exist.
+//! The modal port. Empty board is the honest state when none exist.
 
 use crate::keys::EnterPress;
 use rune::{col, row, text, El};
@@ -352,7 +352,7 @@ fn reset_focus(d: &mut NewProjectDialog) {
     d.task.focused = false;
 }
 
-/// Open `NewProjectDialog` on step 1, as a fresh mount: React's dialog owns
+/// Open `NewProjectDialog` on step 1, as a fresh mount: the reference UI's dialog owns
 /// its name/path/task state, so reopening starts empty.
 pub fn open_new_project(s: &mut ProjectsState) {
     let d = &mut s.dialog;
@@ -378,7 +378,7 @@ pub fn open_new_project(s: &mut ProjectsState) {
     d.name.focused = true;
 }
 
-/// Close the dialog; busy creations keep it up (React disables close/cancel
+/// Close the dialog; busy creations keep it up (the reference UI disables close/cancel
 /// until the create settles).
 pub fn close_new_project(s: &mut ProjectsState) {
     let d = &mut s.dialog;
@@ -390,14 +390,14 @@ pub fn close_new_project(s: &mut ProjectsState) {
 }
 
 /// Step 1 → 2. Enter in the name or path input calls this; an empty path
-/// keeps step 1 and reports the same message as React.
+/// keeps step 1 and reports the same message as the reference UI.
 pub fn new_project_next(s: &mut ProjectsState) {
     let d = &mut s.dialog;
     if d.busy || !d.open {
         return;
     }
     if d.path.text.trim().is_empty() {
-        // React keeps the current focus and only shows the note.
+        // The reference UI keeps the current focus and only shows the note.
         d.error = Some("Choose a folder first.".to_string());
         return;
     }
@@ -407,7 +407,7 @@ pub fn new_project_next(s: &mut ProjectsState) {
     d.task.focused = true;
 }
 
-/// Group/solo radiogroup selection; clears the validation note like React.
+/// Group/solo radiogroup selection; clears the validation note like the reference UI.
 pub fn new_project_mode(s: &mut ProjectsState, mode: NewProjectMode) {
     let d = &mut s.dialog;
     if d.busy {
@@ -425,7 +425,7 @@ pub fn new_project_back(s: &mut ProjectsState) {
     }
     d.step = 1;
     d.error = None;
-    // React remounts step 1 without autofocus; the Back button simply goes.
+    // The reference UI remounts step 1 without autofocus; the Back button simply goes.
     reset_focus(d);
 }
 
@@ -488,7 +488,7 @@ fn workspace_from_json(
 }
 
 /// `POST /api/workspaces` → `POST /api/workspaces/{id}/chats` → optional
-/// `POST /api/groups`, the exact sequence behind React's two-step dialog.
+/// `POST /api/groups`, the exact sequence behind the reference UI's two-step dialog.
 /// Nothing is created before this point, so Back has no side effects.
 pub fn create_new_project(s: &mut ProjectsState) {
     let d = &mut s.dialog;
@@ -551,7 +551,7 @@ fn complete_new_project(
         &format!("/api/workspaces/{}/chats", workspace.id),
         &serde_json::json!({ "title": "New Chat", "model": "Automatic Fallback" }),
     )
-    // React's `handleCreateProject` returns null on any failure, so the
+    // The reference UI's `handleCreateProject` returns null on any failure, so the
     // dialog reports the folder-path copy for a failed chat too.
     .map_err(|_| "Could not create the project — check the folder path.".to_string())?;
     let chat_id = json_id(&chat)
@@ -721,7 +721,7 @@ pub fn projects_section<S: ProjectsHost + 'static>(s: &ProjectsState) -> El {
         );
     }
     // The full `NewProjectDialog` is a top-level modal; the rail only owns
-    // the entry point.
+    // The entry point.
     body = body.child(
         text("+ New project".to_string())
             .key("side-projects-new")
@@ -779,7 +779,7 @@ fn pick_project_folder<S: ProjectsHost + 'static>(_s: &mut S, tx: &mut rune::Tx)
     }
 }
 
-/// The live New Project dialog from the former React reference:
+/// The live New Project dialog from the original design:
 /// a 390 pt two-step card over a 60% blurred backdrop. Step 1 creates
 /// nothing; step 2 registers the workspace, creates its first chat, and (in
 /// group mode) the durable team board.
@@ -1026,7 +1026,7 @@ pub fn new_project_dialog<S: ProjectsHost + 'static>(s: &ProjectsState, w: f32, 
                 .shape(crate::icons::arrow_right(12.0, ink("#0a0a0d"))),
         );
     if busy || path_empty {
-        // React's disabled Next takes no press; the inputs' Enter still calls
+        // The reference UI's disabled Next takes no press; the inputs' Enter still calls
         // `next()` and reports the missing folder.
         next = next.opacity(0.4);
     } else {
@@ -1283,7 +1283,7 @@ pub fn new_project_dialog<S: ProjectsHost + 'static>(s: &ProjectsState, w: f32, 
             crate::icons::plus(12.0, ink("#0a0a0d"))
         });
     if busy {
-        // React's `Loader2 animate-spin`: one linear turn per second.
+        // The reference UI's `Loader2 animate-spin`: one linear turn per second.
         create_icon = create_icon.looping(rune::LoopSpec::rotation(1.0));
     }
     let mut create = row()
@@ -1367,7 +1367,7 @@ pub fn new_project_dialog<S: ProjectsHost + 'static>(s: &ProjectsState, w: f32, 
         .role("dialog")
         .label("New project")
         // The card is the modal root: the backdrop sits outside it, so a
-        // backdrop press dismisses (React's `onMouseDown` check) while a press
+        // backdrop press dismisses (the reference UI's `onMouseDown` check) while a press
         // on the card's own padding stays inside.
         .modal(true, |s: &mut S| close_new_project(s.projects_mut()))
         .child(head)
@@ -1467,8 +1467,8 @@ fn p_waiting_note(s: &ProjectsState) -> bool {
 }
 
 /// 4pt progress track with a fractional fill. The fill width is a fraction of
-/// the track: implemented as a row where the fill grows and a spacer takes
-/// the rest, so no absolute measuring is needed. `stem` is the full key stem
+/// The track: implemented as a row where the fill grows and a spacer takes
+/// The rest, so no absolute measuring is needed. `stem` is the full key stem
 /// (`projects-p1`, `side-projects-p1`) — the bar/fill/rest keys hang off it.
 fn progress_bar(stem: &str, fraction: f32) -> El {
     let fill = (fraction.clamp(0.0, 1.0) * 1000.0).round() / 10.0;

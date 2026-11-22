@@ -2,7 +2,7 @@
 //!
 //! One visual language for reasoning, tool calls and intermediate updates.
 //! The DOM/CSS values are ported literally from `index.css`; geometry follows
-//! the same flex/gap/padding rules as the React components.
+//! The same flex/gap/padding rules as the reference UI components.
 
 use crate::keys::EnterPress;
 use rune::{col, row, text, Easing, El, TextStyle};
@@ -69,7 +69,7 @@ fn check_circle(size: f32, color: rune::Color) -> rune::Shape {
 }
 
 /// One down chevron, rotated up while open. CSS rotates the same glyph, so
-/// the disclosure keeps its shape and springs instead of swapping bitmaps.
+/// The disclosure keeps its shape and springs instead of swapping bitmaps.
 fn rotating_chevron(size: f32, open: bool, color: rune::Color, hover: rune::Color) -> El {
     rune::el()
         .size(size, size)
@@ -204,7 +204,7 @@ fn toggle_tool<S: TranscriptHost + 'static>(
         return;
     }
     // Drill rows own the same per-group open map (the drill renders through
-    // the host, so its toggles resolve here too).
+    // The host, so its toggles resolve here too).
     if let Some(drill) = thread.active_subagent.as_mut() {
         if let Some(row) = drill.rows.iter_mut().find(|row| row.key == row_key) {
             let open = row.tool_open.get(item_key).copied().unwrap_or(default_open);
@@ -952,7 +952,7 @@ fn delegation_card<S: TranscriptHost + 'static>(
     };
     // Session-keyed drill (`structuredDelegationSteps`): a live child with a
     // chat id opens the child session. Static cards keep the current visual
-    // with no press (React `is-static`).
+    // with no press (the reference UI `is-static`).
     let drill = step.filter(|c| !c.chat_id.trim().is_empty()).map(|c| {
         (
             c.chat_id.clone(),
@@ -988,7 +988,7 @@ fn delegation_card<S: TranscriptHost + 'static>(
         },
     ));
     if drill.is_some() {
-        // React `activity-delegation-open`: 650-weight zinc prompt, and a
+        // The reference UI `activity-delegation-open`: 650-weight zinc prompt, and a
         // 1 pt hover slide (`.subagent-open:hover`).
         status_row = status_row.child(open_label::<S>(
             format!("{}-delegation-open-{index}", event.id),
@@ -1043,7 +1043,7 @@ fn delegation_card<S: TranscriptHost + 'static>(
         )
         .child(status_row);
     // Rune `collapsible` trigger rule: the pressable card is a button with a
-    // label; the static card carries no press. Hover matches React's
+    // label; the static card carries no press. Hover matches the reference UI's
     // border/fill lift (no translate animation in Rune).
     if let Some((child_id, label, workspace)) = drill {
         card = card
@@ -1411,7 +1411,7 @@ pub(super) fn live_delegation_cards<S: TranscriptHost + 'static>(
     Some(list)
 }
 
-/// React `ThinkingPlaceholder`.
+/// The reference UI `ThinkingPlaceholder`.
 pub(super) fn thinking_placeholder(key: &str) -> El {
     let mut dots = row().items_center().gap(2.0).ml(2.0);
     for (n, delay) in [0.0, 0.14, 0.28].into_iter().enumerate() {

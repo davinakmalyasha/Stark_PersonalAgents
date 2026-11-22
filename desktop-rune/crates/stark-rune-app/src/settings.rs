@@ -1,4 +1,4 @@
-//! Settings — port of the former React Settings modal.
+//! Settings — port of the original Settings modal.
 //!
 //! Contract:
 //! - `GET /api/migration/status` → `{active, candidates:[{id,path,active,
@@ -8,8 +8,8 @@
 //! - `POST /api/data/import` multipart `{file, projects_root?}` →
 //!   `{ok,restart_required,from_root,to_root}`
 //!
-//! The sheet is global like React's modal: one state on the shell, opened by
-//! the rail gear (and by the standalone transcript scene for goldens). The
+//! The sheet is global like the reference UI's modal: one state on the shell, opened by
+//! The rail gear (and by the standalone transcript scene for goldens). The
 //! updater is the signed, staged Rune feed in `updater.rs`; the web build is
 //! updated with the server deploy.
 
@@ -196,7 +196,7 @@ pub struct UpdateState {
     pub version: String,
     pub message: String,
     pub restart_required: bool,
-    /// When the last event landed, so transient toasts hide after React's 6s.
+    /// When the last event landed, so transient toasts hide after the reference UI's 6s.
     pub shown_at: Option<u64>,
 }
 
@@ -335,7 +335,7 @@ impl SettingsState {
         self.open = false;
     }
 
-    /// Reload `/api/migration/status`; failures stay silent like React's
+    /// Reload `/api/migration/status`; failures stay silent like the reference UI's
     /// `.catch(() => null)` so a cold backend never blocks the modal.
     pub fn load(&mut self) {
         if self.loading {
@@ -431,7 +431,7 @@ impl SettingsState {
     }
 
     /// `runExport()` on the native app: choose a destination, then download
-    /// the server's consistent zip snapshot into it.
+    /// The server's consistent zip snapshot into it.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn export_to(&mut self, path: PathBuf) {
         if self.backup_busy {
@@ -710,7 +710,7 @@ fn label_style() -> rune::tok::TextStyle {
 }
 
 fn text_style(size: f32, weight: f32) -> rune::tok::TextStyle {
-    // Tailwind's arbitrary text sizes inherit the body's 1.5 line-height:
+    // Reference arbitrary text sizes inherit the body's 1.5 line-height:
     // 12/18, 11/16.5, 10.5/15.75, 11.5/17.25, 10/15.
     rune::tok::TextStyle::new(size, weight).lh(size * 1.5)
 }
@@ -836,7 +836,7 @@ fn action_button<S: SettingsHost + 'static>(
 }
 
 /// `file:...` control: Rune has no DOM file input, so the picker row draws
-/// Chrome's two pieces (styled button + filename) with Tailwind's values.
+/// The browser's two pieces (styled button + filename) with reference values.
 fn file_row(key: &'static str, file: Option<&PathBuf>) -> El {
     let name = file
         .and_then(|path| path.file_name())
@@ -931,7 +931,7 @@ fn pick_import_folder<S: SettingsHost + 'static>(tx: &mut rune::Tx) {
 }
 
 /// Settings sheet. `width`/`height` are the window (or standalone view)
-/// bounds, so the panel uses React's viewport-relative min() caps.
+/// bounds, so the panel uses the reference UI's viewport-relative min() caps.
 pub fn settings_sheet<S: SettingsHost + 'static>(s: &SettingsState, width: f32, height: f32) -> El {
     let card_w = 680.0_f32.min((width - 32.0).max(0.0));
     let card_h = 640.0_f32.min((height - 40.0).max(0.0));
@@ -1228,7 +1228,7 @@ pub fn settings_sheet<S: SettingsHost + 'static>(s: &SettingsState, width: f32, 
                 .wrap()
                 .font({
                     // The mono `.bak` span adds 2pt to Rune's line box;
-                    // 16.0 keeps the two-line paragraph on React's 34pt.
+                    // 16.0 keeps the two-line paragraph on the reference UI's 34pt.
                     let mut style = text_style(11.0, 400.0);
                     style.line_height = 16.0;
                     style
@@ -1377,15 +1377,15 @@ pub fn settings_sheet<S: SettingsHost + 'static>(s: &SettingsState, width: f32, 
         .child(head)
         .child(body);
     if card_h > 0.0 {
-        // The body scrolls only inside a bounded card; React's max-height
+        // The body scrolls only inside a bounded card; the reference UI's max-height
         // clamps at the same cap once the three sections overflow it.
         card = card.h(card_h);
     }
-    // `.modal-panel-enter`: 240 ms fade + 10 pt rise + 0.98 settle. React
+    // `.modal-panel-enter`: 240 ms fade + 10 pt rise + 0.98 settle. The reference UI
     // unmounts the sheet on close, so the removal is instant.
     card = card.transition(crate::motion::modal_enter());
 
-    // Backdrop and panel are siblings, like React's two animated elements:
+    // Backdrop and panel are siblings, like the reference UI's two animated elements:
     // fading the full-screen container would fade the panel twice.
     let backdrop = rune::el()
         .key("settings-backdrop")
@@ -1474,7 +1474,7 @@ mod tests {
     }
 
     #[test]
-    fn panel_uses_reacts_viewport_caps() {
+    fn panel_uses_reference_viewport_caps() {
         for (w, h, expected_w, expected_h) in [
             (1280.0, 900.0, 680.0, 640.0),
             (800.0, 573.0, 680.0, 533.0),
@@ -1549,12 +1549,12 @@ mod tests {
         assert!(!rt.state.settings.open, "backdrop dismisses");
         assert!(
             rt.find("settings-card").is_none(),
-            "React unmounts the sheet in the frame it closes"
+            "the reference UI unmounts the sheet in the frame it closes"
         );
     }
 
     #[test]
-    fn status_and_error_surfaces_match_react_copy() {
+    fn status_and_error_surfaces_match_reference_copy() {
         let settings = SettingsState {
             open: true,
             error: Some("Migration failed.".to_string()),

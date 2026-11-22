@@ -132,7 +132,7 @@ pub(crate) fn arrow_left(size: f32, color: rune::Color) -> Shape {
     lucide(&["m12 19-7-7 7-7", "M19 12H5"], size, 2.0, color)
 }
 
-/// Lucide `LoaderCircle`: the open arc React spins while creating.
+/// Lucide `LoaderCircle`: the open arc the reference UI spins while creating.
 pub(crate) fn loader(size: f32, color: rune::Color) -> Shape {
     lucide(&["M21 12a9 9 0 1 1-6.219-8.56"], size, 2.0, color)
 }

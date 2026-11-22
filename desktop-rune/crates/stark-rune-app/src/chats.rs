@@ -2,7 +2,7 @@
 //!
 //! Ports the boot half of `hooks/useSessions.ts` (open tabs + every chat
 //! summary) and the tidy-tree layout of `canvas/Graph.ts` so the map shows
-//! the same cards React does, at the same coordinates.
+//! The same cards the reference UI does, at the same coordinates.
 //!
 //! Contract:
 //! - `GET /api/ui/state` → `{open_tabs:["ws:chat"], active_tab}`
@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 
-/// Global parent lookup across every workspace (React `buildGlobalLookup`):
+/// Global parent lookup across every workspace (the reference UI `buildGlobalLookup`):
 /// chat id → (title, workspace name), first workspace wins. Powers the
 /// coding groups' `from X` badges for cross-workspace spawned children.
 pub fn parent_lookup(chats: &[ChatSummary]) -> HashMap<String, (String, String)> {
@@ -82,7 +82,7 @@ pub fn relative_time_short(value: &str) -> String {
     }
 }
 
-/// One workspace in `GET /api/workspaces` (React `WorkspaceInfo`). Kept
+/// One workspace in `GET /api/workspaces` (the reference UI `WorkspaceInfo`). Kept
 /// alongside the chats so the session layer can map an active run's
 /// `workspace_path` back to its workspace id and pick the workspace behind
 /// each sidebar filter (Coding → projects, General → personal, …).
@@ -110,7 +110,7 @@ impl ChatWorkspace {
         self.kind == "personal"
     }
 
-    /// React `projects`: real project folders only (never general/house/
+    /// The reference UI `projects`: real project folders only (never general/house/
     /// personal/dfd). The Coding sidebar filter lists these.
     pub fn is_project(&self) -> bool {
         !self.is_general() && !self.is_house() && !self.is_personal() && self.kind != "dfd"
@@ -135,12 +135,12 @@ pub struct ChatSummary {
 }
 
 impl ChatSummary {
-    /// Stable page key (`workspaceId:chatId`, React `chatKey`).
+    /// Stable page key (`workspaceId:chatId`, the reference UI `chatKey`).
     pub fn key(&self) -> String {
         format!("{}:{}", self.workspace_id, self.id)
     }
 
-    /// Canvas card id (`chat:workspaceId:chatId`, React `itemId`).
+    /// Canvas card id (`chat:workspaceId:chatId`, the reference UI `itemId`).
     pub fn card_id(&self) -> String {
         format!("chat:{}", self.key())
     }
@@ -166,13 +166,13 @@ impl ChatSummary {
 
 /// One uploaded (or restored) file (`ChatAttachment` in `types/index.ts`).
 /// `id` is the server's stored filename; a local draft file has no id until
-/// the composer uploads it. `path` is the on-disk path the backend returns,
+/// The composer uploads it. `path` is the on-disk path the backend returns,
 /// which is what the native image cache decodes.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ChatAttachment {
     pub id: String,
     pub name: String,
-    /// MIME type (`file.type` in React).
+    /// MIME type (`file.type` in the reference UI).
     pub file_type: String,
     pub size: u64,
     pub path: String,
@@ -182,7 +182,7 @@ pub struct ChatAttachment {
 
 impl ChatAttachment {
     /// Parse one `metadata.attachments` entry; unknown fields are ignored,
-    /// exactly like React reading the typed object.
+    /// exactly like the reference UI reading the typed object.
     pub fn from_json(v: &serde_json::Value) -> Self {
         Self {
             id: str_of(v, "id"),
@@ -199,7 +199,7 @@ impl ChatAttachment {
     }
 
     /// Wire shape sent inside the user message metadata and the chat run
-    /// (`RunRequest.attachments`). Field order follows the React object.
+    /// (`RunRequest.attachments`). Field order follows the reference UI object.
     pub fn to_json(&self) -> serde_json::Value {
         let mut value = serde_json::json!({
             "id": self.id,
@@ -245,7 +245,7 @@ impl ChatAttachment {
 }
 
 /// Browser `File.type` stand-in for a picked path; the backend stores this
-/// MIME with the upload and React's card kind reads from it.
+/// MIME with the upload and the reference UI's card kind reads from it.
 pub fn mime_for_path(path: &std::path::Path) -> &'static str {
     let ext = path
         .extension()
@@ -303,7 +303,7 @@ pub struct ArtifactFile {
 pub struct RunArtifacts {
     pub run_id: String,
     pub files: Vec<ArtifactFile>,
-    /// Explicit totals; `None` falls back to the per-file sum (React's `??`).
+    /// Explicit totals; `None` falls back to the per-file sum (the reference UI's `??`).
     pub total_additions: Option<u64>,
     pub total_deletions: Option<u64>,
     pub tests_passing: bool,
@@ -324,7 +324,7 @@ impl RunArtifacts {
             .unwrap_or_else(|| self.files.iter().map(|f| f.deletions).sum())
     }
 
-    /// Parse `metadata.artifacts`; `None` when no files are listed (React
+    /// Parse `metadata.artifacts`; `None` when no files are listed (the reference UI
     /// renders nothing then).
     pub fn from_json(v: &serde_json::Value) -> Option<Self> {
         let status_of = |s: &str| match s {
@@ -415,10 +415,10 @@ pub struct ChatMsgRow {
     pub at: String,
     /// `metadata.duration` (`8s`) — trace header label.
     pub duration: String,
-    /// `metadata.isTrace` and the run has an activity segment/steps: React
+    /// `metadata.isTrace` and the run has an activity segment/steps: the reference UI
     /// renders the collapsed "Worked for …" divider above the answer.
     pub show_trace: bool,
-    /// Timeline ends in a tool/reasoning segment: React keeps the flattened
+    /// Timeline ends in a tool/reasoning segment: the reference UI keeps the flattened
     /// content out of the answer lane (trace-only row).
     pub hide_body: bool,
     /// `metadata.kind`: `"aborted"` or `"compaction"` renders
@@ -428,7 +428,7 @@ pub struct ChatMsgRow {
     pub event_tokens_before: u64,
     pub event_input: u64,
     pub event_output: u64,
-    /// `metadata.usage` is present: React renders the per-message token/time
+    /// `metadata.usage` is present: the reference UI renders the per-message token/time
     /// footer only then.
     pub has_usage: bool,
     /// `metadata.usage.total_input_tokens` / `total_output_tokens`.
@@ -500,7 +500,7 @@ pub enum ChatsMsg {
     RefreshNeeded,
     /// `/api/runs/active` result for the session running dot.
     ActiveRun(Result<crate::cloud::CloudActive, String>),
-    /// Deferred layout write finished. Failures are non-fatal (React's
+    /// Deferred layout write finished. Failures are non-fatal (the reference UI's
     /// `saveUiState` swallows them); the next change retries.
     Saved(Result<(), String>),
 }
@@ -864,7 +864,7 @@ fn build_snapshot(
             }
         }
     }
-    // React's sidebar orders by recency across workspaces.
+    // The reference UI's sidebar orders by recency across workspaces.
     chats.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     let mut message_map = HashMap::new();
     for (key, payload) in messages {
@@ -892,7 +892,7 @@ fn fetch_snapshot(host: &str, port: u16) -> Result<ChatSnapshot, String> {
     if let Some(list) = workspaces.get("workspaces").and_then(|x| x.as_array()) {
         for w in list {
             let (id, _, _, chat_count) = parse_workspace(w);
-            // Missing project workspaces return no chats; React still polls
+            // Missing project workspaces return no chats; the reference UI still polls
             // them, but a cold boot with 100 stale entries is all round-trip.
             let exists = w.get("exists").and_then(|x| x.as_bool()).unwrap_or(true);
             if id.is_empty() || chat_count <= 0 || !exists {
@@ -981,9 +981,9 @@ pub fn refresh_messages(chats: &mut ChatsState, workspace_id: &str, chat_id: &st
     });
 }
 
-/// Poll `/api/runs/active` (React `RUN_POLL_MS = 2500`). One request at a
+/// Poll `/api/runs/active` (the reference UI `RUN_POLL_MS = 2500`). One request at a
 /// time; a failure leaves the last known dot in place (`fetchActiveRun` is
-/// caught in React too).
+/// caught in the reference UI too).
 pub fn refresh_active_run(chats: &mut ChatsState) {
     if chats.run_loading {
         return;
@@ -1007,7 +1007,7 @@ pub fn refresh_active_run(chats: &mut ChatsState) {
     });
 }
 
-/// Persist the session layout (`PUT /api/ui/state`), React's 400ms debounce
+/// Persist the session layout (`PUT /api/ui/state`), the reference UI's 400ms debounce
 /// handled by the caller (`ui_dirty_at`). Fire-and-forget: a failure clears
 /// `ui_saved` so the next poll retries.
 pub fn save_ui_state(chats: &mut ChatsState, payload: serde_json::Value) {
@@ -1035,7 +1035,7 @@ pub fn save_ui_state(chats: &mut ChatsState, payload: serde_json::Value) {
 }
 
 /// Optimistic rename's write (`PUT …/title`). A failure asks the UI to refetch
-/// the server list, which restores the old title (React `.catch(forceRefresh)`).
+/// The server list, which restores the old title (the reference UI `.catch(forceRefresh)`).
 pub fn rename_chat(chats: &mut ChatsState, workspace_id: &str, chat_id: &str, title: &str) {
     let body = serde_json::json!({ "title": title });
     write_chat(chats, workspace_id, chat_id, "PUT", "title", body);
@@ -1093,8 +1093,8 @@ fn write_chat(
     });
 }
 
-/// Write a batch of finished messages, then fetch the chat once. React does
-/// the same (`finishHouseMessage` posts, then `fetchChat`), so the transcript
+/// Write a batch of finished messages, then fetch the chat once. The reference UI does
+/// The same (`finishHouseMessage` posts, then `fetchChat`), so the transcript
 /// settles on the server's canonical ids/timestamps.
 pub fn persist_messages(chats: &mut ChatsState, saves: Vec<ChatSave>) {
     if saves.is_empty() {
@@ -1199,7 +1199,7 @@ async fn fetch_snapshot_wasm() -> Result<ChatSnapshot, String> {
     if let Some(list) = workspaces.get("workspaces").and_then(|x| x.as_array()) {
         for w in list {
             let (id, _, _, chat_count) = parse_workspace(w);
-            // Missing project workspaces return no chats; React still polls
+            // Missing project workspaces return no chats; the reference UI still polls
             // them, but a cold boot with 100 stale entries is all round-trip.
             let exists = w.get("exists").and_then(|x| x.as_bool()).unwrap_or(true);
             if id.is_empty() || chat_count <= 0 || !exists {
@@ -1481,7 +1481,7 @@ pub fn layout(snapshot: &ChatSnapshot) -> (Vec<GraphCard>, Vec<(String, String)>
             &mut total,
         );
     }
-    // Unvisited tabs are still roots (React promotes them before layout).
+    // Unvisited tabs are still roots (the reference UI promotes them before layout).
     for key in &tab_keys {
         if let Some(&ix) = index.get(key) {
             if !visited.contains(key) {
@@ -1555,7 +1555,7 @@ mod tests {
     }
 
     #[test]
-    fn layout_matches_react_root_position_for_one_tab() {
+    fn layout_matches_reference_root_position_for_one_tab() {
         let chat = chat("_general", "a", "hello", "2026-01-01T00:00:00Z");
         let snapshot = ChatSnapshot {
             open_tabs: vec!["_general:a".to_string()],
@@ -1625,7 +1625,7 @@ mod tests {
         assert_eq!(row.event, "aborted");
         assert_eq!(row.timeline.len(), 1);
         assert_eq!(row.activity.len(), 1);
-        // React's timeline is authoritative: a thinking-only timeline has no
+        // The reference UI's timeline is authoritative: a thinking-only timeline has no
         // trailing text run, so the flattened content is not shown.
         assert_eq!(row.final_text, "");
         assert!(row.hide_body);

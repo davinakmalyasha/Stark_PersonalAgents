@@ -479,7 +479,7 @@ pub fn refresh_memory(s: &mut MemoryState) {
 }
 
 /// Select a workspace and load its detail. Tapping the active row again
-/// collapses it (React's tab toggle).
+/// collapses it (the reference UI's tab toggle).
 pub fn select_memory(s: &mut MemoryState, id: &str) {
     if s.selected == id {
         s.selected.clear();

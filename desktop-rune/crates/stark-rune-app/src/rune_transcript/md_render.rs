@@ -1,8 +1,8 @@
 //! Markdown rendering for transcript rows — a direct port of
-//! the former React `Markdown` and `DiffView` components.
+//! The original design `Markdown` and `DiffView` components.
 //!
 //! `stark-kit::markdown` parses GFM; this module owns every visual value:
-//! Tailwind margins, line boxes, one-dark code colours, the code header and
+//! Reference margins, line boxes, one-dark code colours, the code header and
 //! copy button, the 800-line diff collapse, tables and task lists. It reuses
 //! rune-kit's syntax scanners (the OpenCode component crate) without its
 //! theme or block layout.
@@ -59,7 +59,7 @@ struct Runs {
     links: Vec<rune::Link>,
     strikes: Vec<(usize, usize, Option<rune::Color>)>,
     /// Byte ranges of inline-code runs: each carries a 6px pad and 1px border
-    /// in React, which `content_widths` alone cannot see.
+    /// in the reference UI, which `content_widths` alone cannot see.
     codes: Vec<(usize, usize)>,
     /// Paint-only boxes for the inline-code runs (fill + 1px inset ring),
     /// emitted into `rich` via `text_highlights`.
@@ -68,7 +68,7 @@ struct Runs {
 
 const INLINE_CODE_SIZE: f32 = 13.5;
 
-/// Leading space for task items: react-markdown renders `<input> text`,
+/// Leading space for task items: GFM markdown renders `<input> text`,
 /// keeping the source space in the DOM, so the first glyph starts one
 /// space width right of the content box. Plain items have no space.
 fn prepend_space(blocks: &[stark_kit::markdown::Block]) -> Vec<stark_kit::markdown::Block> {
@@ -79,17 +79,17 @@ fn prepend_space(blocks: &[stark_kit::markdown::Block]) -> Vec<stark_kit::markdo
     out
 }
 /// Inline code: 13.5pt mono indigo-300 on a zinc-800/80 well with the
-/// `border-zinc-700/50` 1px ring (React `code` component:
-/// the former React `Markdown` component
+/// `border-zinc-700/50` 1px ring (the reference UI `code` component:
+/// The original design `Markdown` component
 /// `bg-zinc-800/80 px-1.5 py-0.5 ... border border-zinc-700/50`).
 /// Horizontal chrome is exact: `pad(6.0)` == `px-1.5`, plus the 1px ring
 /// (table width fudge `+14.0` per code span). Vertical chrome is
 /// framework-controlled: `TextHighlight` paints `base - asc - 1px` to
 /// `base + desc + 1px` (`decorations.rs:226-227`), with no `pad_y` API —
-/// React's `py-0.5` (2px top/bottom) has no native equivalent without forking
-/// the pinned Rune rev, so the well stays horizontally exact and vertically
+/// The reference UI's `py-0.5` (2px top/bottom) has no native equivalent without forking
+/// The pinned Rune rev, so the well stays horizontally exact and vertically
 /// short. The well comes from a paint-only highlight so the border rides
-/// the same rounded rect.
+/// The same rounded rect.
 fn inline_code_span(start: usize, end: usize) -> (rune::Span, rune::TextHighlight) {
     (
         rune::Span::new(start, end)
@@ -218,7 +218,7 @@ fn rich<S: TranscriptHost + 'static>(
     e
 }
 
-/// React `Markdown.tsx` block margins (Tailwind `my-*`, collapsed like CSS).
+/// The reference block margins (`my-*`, collapsed like CSS).
 fn margins(block: &stark_kit::markdown::Block) -> (f32, f32) {
     use stark_kit::markdown::Block;
     match block {
@@ -250,7 +250,7 @@ fn margins_compact(block: &stark_kit::markdown::Block, compact: bool) -> (f32, f
     }
 }
 
-/// Bottom margin React keeps inside an agent response after its final block
+/// Bottom margin the reference UI keeps inside an agent response after its final block
 /// (`Markdown.tsx` block `mb-*`); the response box ends there, not at the
 /// last glyph.
 pub(super) fn last_margin(body: &str) -> f32 {
@@ -331,9 +331,9 @@ fn block<S: TranscriptHost + 'static>(
                     .gap(if *ordered { 6.0 } else { 4.0 });
             for (i, item) in items.iter().enumerate() {
                 // Task items render `<input> text` with a real space between
-                // (react-markdown keeps the source space in the DOM); plain
+                // (GFM markdown keeps the source space in the DOM); plain
                 // items have none. Without it every task glyph sits ~4px
-                // left of React's.
+                // left of the reference UI's.
                 let owned;
                 let blocks: &[stark_kit::markdown::Block] = if item.checked.is_some() {
                     owned = prepend_space(&item.blocks);
@@ -390,10 +390,10 @@ fn block<S: TranscriptHost + 'static>(
             align: _,
         } => table::<S>(key, headers, rows, body),
         Block::Quote(list) => {
-            // React's blockquote is fully italic (`italic` class on the
+            // The reference UI's blockquote is fully italic (`italic` class on the
             // container); the base style carries it so nested spans inherit.
             // Padded well (`py-8`): child margins cannot collapse out, so
-            // the first block keeps its full top and the last block's bottom
+            // The first block keeps its full top and the last block's bottom
             // margin lands as an explicit spacer (like `last_margin`).
             let inner = blocks_inner::<S>(
                 s,
@@ -425,7 +425,7 @@ fn block<S: TranscriptHost + 'static>(
                         .pl(16.0)
                         .py(8.0)
                         // `rounded-r-lg`: right corners only; the bar side
-                        // stays square like React's.
+                        // stays square like the reference UI's.
                         .corners([0.0, 8.0, 8.0, 0.0])
                         .fill(rgba(99.0, 102.0, 241.0, 0.05))
                         // `border-l-2`: Rune's sides are CSS-ordered
@@ -474,8 +474,8 @@ fn block<S: TranscriptHost + 'static>(
 /// padding, so the first block keeps its full top margin and the caller
 /// appends the last block's bottom margin (see the Quote arm). The
 /// unpadded response instead relies on its own 12pt top pad, keeping only
-/// the remainder above the first block.
-/// `tight_item` marks a tight list item: React renders no `<p>` wrapper,
+/// The remainder above the first block.
+/// `tight_item` marks a tight list item: the reference UI renders no `<p>` wrapper,
 /// so phantom paragraphs carry no margins and a nested list keeps its own
 /// `my-2.5` instead of collapsing with paragraph margins.
 #[allow(clippy::too_many_arguments)]
@@ -529,7 +529,7 @@ fn blocks_inner<S: TranscriptHost + 'static>(
             } else {
                 // First block under the unpadded response: its margin
                 // collapses out, and the response's own 12pt top pad covers
-                // the remainder (para/h4/lists stay 0, h1 keeps 12).
+                // The remainder (para/h4/lists stay 0, h1 keeps 12).
                 (mt - 12.0).max(0.0)
             }
         } else {
@@ -563,7 +563,7 @@ pub(super) fn render_body<S: TranscriptHost + 'static>(
 }
 
 /// Markdown renderer at a caller-chosen type scale (home rows are 15.5pt,
-/// the sheet keeps 12.5pt).
+/// The sheet keeps 12.5pt).
 pub(super) fn render_body_styled<S: TranscriptHost + 'static>(
     s: &S,
     which: Thread,
@@ -590,7 +590,7 @@ pub(super) fn render_body_styled<S: TranscriptHost + 'static>(
         // Selection belongs to the transcript's virtual list, not the row:
         // Rune's virtual selection needs one group around the list so a drag
         // can cross messages and pin rows that scroll out (a browser selects
-        // the whole message stream the same way).
+        // The whole message stream the same way).
         blocks_inner::<S>(
             s, which, key, &blocks, body_style, 0, false, false, body_color, false, false,
         )
@@ -704,7 +704,7 @@ pub(super) fn render_body_streaming<S: TranscriptHost + 'static>(
     )
 }
 
-/// Index where the stable prefix ends (React's `StreamingMarkdown` split).
+/// Index where the stable prefix ends (the reference UI's `StreamingMarkdown` split).
 fn stream_split(body: &str) -> usize {
     let fences: Vec<usize> = body.match_indices("```").map(|(at, _)| at).collect();
     if fences.len() % 2 == 1 {
@@ -842,7 +842,7 @@ fn list_marker(
 /// GFM task checkbox (`input[type=checkbox]`, 13pt). The Markdown renderer
 /// hardcodes `disabled`, and disabled controls render fully grayed out:
 /// checked is a gray `#9a9a9b` fill with a white 2px check, and unchecked
-/// is NOT hollow — Chrome paints the same gray `#a9a9aa` fill with a
+/// is NOT hollow — the browser paints the same gray `#a9a9aa` fill with a
 /// darker `#868687` 1px border (verified pixel-by-pixel against captures).
 /// Vertical centering follows `align-middle`.
 fn checkbox(checked: bool, line_height: f32) -> El {
@@ -968,7 +968,7 @@ fn rust_operator(code: &str, start: usize, end: usize) -> bool {
     )
 }
 
-/// React's code block: header (language + copy), then a horizontal code well.
+/// The reference UI's code block: header (language + copy), then a horizontal code well.
 fn code_block<S: TranscriptHost + 'static>(
     s: &S,
     which: Thread,
@@ -980,7 +980,7 @@ fn code_block<S: TranscriptHost + 'static>(
         return diff::<S>(s, which, key, code);
     }
     let highlighted = !lang.is_empty() && code.chars().count() <= 40_000;
-    // React's `code` renderer does `String(children).replace(/\n$/, '')`; the
+    // The reference UI's `code` renderer does `String(children).replace(/\n$/, '')`; the
     // markdown parser keeps that newline, and Rune would lay out an empty
     // sixteenth line for it.
     let code = code.strip_suffix('\n').unwrap_or(code);
@@ -1308,7 +1308,7 @@ fn diff<S: TranscriptHost + 'static>(s: &S, which: Thread, key: &str, raw: &str)
                     text(n.map(|n| n.to_string()).unwrap_or_default())
                         .font(mono)
                         .color(ink("#52525b"))
-                        // Chrome sits the glyphs one device pixel lower in this line
+                        // The browser sits the glyphs one device pixel lower in this line
                         // box than Rune; shift the paint, not the row.
                         .offset(0.0, 1.0),
                 )
@@ -1392,7 +1392,7 @@ fn diff<S: TranscriptHost + 'static>(s: &S, which: Thread, key: &str, raw: &str)
             style.line_height = 11.5 * 1.85;
             style
         };
-        // React keeps the expander inside the 420px scroller, below the table.
+        // The reference UI keeps the expander inside the 420px scroller, below the table.
         scroll = scroll.child(
             row()
                 .key(toggle_key.clone())
@@ -1445,7 +1445,7 @@ fn diff<S: TranscriptHost + 'static>(s: &S, which: Thread, key: &str, raw: &str)
         .child(card)
 }
 
-/// React's table: rounded well, uppercase 600 header, hairline row rules.
+/// The reference UI's table: rounded well, uppercase 600 header, hairline row rules.
 fn table<S: TranscriptHost + 'static>(
     key: &str,
     headers: &[Vec<stark_kit::markdown::Inline>],
@@ -1472,7 +1472,7 @@ fn table<S: TranscriptHost + 'static>(
     if cols == 0 {
         return col().key(format!("{key}-table"));
     }
-    // Inline code is a padded, bordered inline box in React; `content_widths`
+    // Inline code is a padded, bordered inline box in the reference UI; `content_widths`
     // measures the glyphs alone, so add the 6px pad + 1px border on each side.
     let measure = |list: &[stark_kit::markdown::Inline], style: TextStyle| {
         let mut runs = Runs::default();
@@ -1510,7 +1510,7 @@ fn table<S: TranscriptHost + 'static>(
             .px(20.0)
             .pt(14.0)
             // Rune snaps a 0.5pt border to one device pixel; take the half
-            // point out of padding so the header lands on React's 49.625.
+            // point out of padding so the header lands on the reference UI's 49.625.
             .pb(13.5)
             .border_sides([0.0, 0.0, 1.0, 0.0], rgba(255.0, 255.0, 255.0, 0.15))
             .border_layout();
@@ -1537,7 +1537,7 @@ fn table<S: TranscriptHost + 'static>(
             .px(20.0)
             .pt(14.0)
             // The mono line box runs 1.375pt taller than the 23.5625 line;
-            // React's inline box adds only 0.375, so take 1pt off the bottom.
+            // The reference UI's inline box adds only 0.375, so take 1pt off the bottom.
             .pb(if code_cell { 13.0 } else { 14.0 })
             .border_sides([0.0, 0.0, 1.0, 0.0], rgba(255.0, 255.0, 255.0, 0.08))
             .border_layout();
@@ -1553,7 +1553,7 @@ fn table<S: TranscriptHost + 'static>(
         .border_layout()
         .fill(rgba(9.0, 9.0, 11.0, 0.2))
         .clip_rounded(12.0)
-        // React's collapsed last-row border leaves half a point below the rows.
+        // The reference UI's collapsed last-row border leaves half a point below the rows.
         .pb(0.5)
         .child(table)
 }
@@ -1596,7 +1596,7 @@ mod streaming_tests {
 
     #[test]
     fn short_hunk_without_counts_starts_at_one() {
-        // React's hunk regex makes the `,count` optional; the native split
+        // The reference UI's hunk regex makes the `,count` optional; the native split
         // on `,`/space parses the same short form.
         let (lines, _, add, del) = parse_diff("@@ -1 +1 @@\n-old\n+new\n");
         assert_eq!(add, 1);

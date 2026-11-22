@@ -1,0 +1,35 @@
+# Pinned Rune fork for Stark. The only behavioural change is the border-gradient
+# paint primitive used by the canvas running-card sweep; everything else tracks
+# upstream a7f276c3630f85a06a0230295da4d2bd172d8d3b.
+[workspace]
+resolver = "3"
+members = [
+    "crates/rune",
+    "crates/rune-motion",
+    "crates/rune-staging",
+    "crates/rune-taffy",
+    "crates/rune-kit",
+    "crates/rune-mermaid",
+    "crates/procwatch",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+unsafe_code = "allow"
+
+[workspace.lints.clippy]
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+dbg_macro = "deny"
+disallowed_types = "deny"
+expect_used = "warn"
+todo = "warn"
+unwrap_used = "warn"
+undocumented_unsafe_blocks = "warn"
+let_underscore_must_use = "warn"
+disallowed_methods = "warn"

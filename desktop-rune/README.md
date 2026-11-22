@@ -9,15 +9,18 @@ port relies on, and the architecture. The code is the source of truth.
 
 ## Rune
 
-Pinned revision:
+Pinned upstream revision:
 
 ```
 a7f276c3630f85a06a0230295da4d2bd172d8d3b
 ```
 
-The dependency name is `rune` (package `rune`, crate `rune`), with `rune-kit`
-used only for its syntax/diff scanners. The local Cargo checkout is the
-authority for behavior; do not infer API shape from this document.
+The app depends on a vendored fork under `vendor/rune` whose only behavioural
+change is the `El::border_sweep` paint primitive (the running-card gradient
+ring). It tracks that upstream revision; update the fork deliberately, not as
+a side effect of a Cargo refresh. `rune-kit` supplies the syntax scanners.
+The code is the authority for behavior; do not infer API shape from this
+document.
 
 Rune builds a native element tree, lays it out, paints it, and owns motion,
 focus, text shaping, scrolling and accessibility. A Stark view is a function
@@ -32,6 +35,10 @@ tree. Layout, paint, animation and input stay inside Rune.
   math, edge paths and shared data types.
 - `crates/stark-theme` — Stark tokens and shared theme values.
 - `crates/stark-rune-web` — wasm entry point; it mounts the same app.
+- `crates/stark-launcher` — stable supervisor: versioned installs, server
+  lifecycle, pending-update application and rollback.
+- `vendor/rune` — pinned Rune fork, excluded from the app workspace.
+- `packaging/` — portable/versioned tree, updater payload and NSIS bootstrap.
 - `parity/` — capture fixtures and scripts used to compare against React.
   There is intentionally no parity write-up or historical log here.
 
@@ -75,6 +82,16 @@ over approximating a CSS property.
 - **Compositing** — `App::srgb_blend` is on by default, matching CSS alpha
   compositing over dark surfaces. `El::focus_within_flat` drops an element's
   shadows and hover fill while focus is inside it.
+- **Border sweep** — `El::border_sweep` samples the CSS linear gradient per
+  fragment and masks it with Rune's border-ring coverage. It is a paint-only
+  loop: no child overlay, no layout change, no per-frame app rebuild.
+- **Audio** — `audio::AudioEngine` owns playback. Native uses rodio/cpal with
+  Symphonia; web uses a hidden `HtmlAudioElement` fed by an authenticated
+  Blob URL. The engine lives in the thread, so virtual rows can unmount
+  without stopping a clip.
+- **Updates** — `updater.rs` checks a signed manifest, downloads and verifies
+  a payload, and stages it under `app/<version>`; `stark-launcher` switches
+  `current.json` after the UI exits and rolls back on a failed launch.
 - **Browser shell** — the wasm transport resolves the API origin from
   `__STARK_API_ORIGIN__` or the page origin, carries the pairing token on
   every request, and gates the app on a 401. The phone layout hides the rail,
@@ -83,13 +100,17 @@ over approximating a CSS property.
 
 ### Known boundaries
 
-- No exact `mask-composite` equivalent. The running canvas-card sweep is a
-  clipped sheen, not a true excluded border mask.
-- No audio element; audio attachments cannot play inside Rune.
+- The public Rune installer is Windows x86_64 today. The versioned layout and
+  feed carry a platform key so other targets can be added without changing the
+  app protocol.
+- First-run SmartScreen trust needs Authenticode signing; minisign protects
+  update integrity even when no Authenticode certificate is configured.
+- Web updates are server deployments; the browser build reports that instead
+  of checking the desktop feed.
+- Updates are full payloads, not deltas. Models live in a shared `models/`
+  directory so they are not duplicated per version.
 - Focus-within can add a ring or flatten shadows, but cannot swap arbitrary
   shadow stacks.
-- Auto-update is an honest stub: there is no signed Rune release feed or
-  in-app installer yet. The portable package ships a versioned zip.
 - Rune's native `role("button")` responds to Space; Return goes to links,
   highlighted rows, list rows and `default_button`. This port adds Enter to
   buttons with an `on_key` helper (`keys::EnterPress`) for web parity; keep
@@ -110,6 +131,16 @@ own attachment draft and send path, pending questions replace the dock with
 the compact Ask panel, and the latest bubbles carry copy and two-step rewind
 actions. Background cards poll Ask alongside the open transcript, so a
 question raised on the map is visible without opening the card.
+
+Installed builds run through `StarkRune.exe` (the launcher). It owns the
+bundled `stark-server`, starts the UI from `app/<version>`, and applies a
+staged update only after the UI exits. `current.json` is the atomic switch;
+`pending.json` is the handoff; `blocked.json` records a version that failed to
+start. A failed new build rolls back to the previous version automatically.
+The updater feed is a dedicated public Rune release repo, separate from the
+Tauri/NSIS feed. Rune keeps its data in `%LOCALAPPDATA%\StarkRune\data`
+(override with `STARK_HARNESS_ROOT`); use Settings' backup import to adopt an
+existing `D:\StarkData` tree instead of running two servers on one database.
 
 State is plain Rust. `TranscriptHost`, `CanvasHost`, `ProjectsHost`,
 `SettingsHost` and related traits let shared views resolve the active thread

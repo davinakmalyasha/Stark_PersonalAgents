@@ -19,6 +19,7 @@ use crate::rune_canvas::{canvas_body, chats_panel, CanvasHost, CanvasState, Rail
 use crate::rune_transcript::{
     drain_run_inbox, home_transcript_body, RuneTranscriptState, Thread, TranscriptHost,
 };
+use crate::settings::UpdatePhase;
 
 /// Live window size (from the root's laid-out rect at the top of every frame).
 /// The first frame before layout uses the spec size.
@@ -136,6 +137,20 @@ fn icon_cloud(size: f32, color: rune::Color) -> Shape {
     icon_shape(p, size, color)
 }
 
+fn icon_refresh(size: f32, color: rune::Color) -> Shape {
+    crate::icons::lucide(
+        &[
+            "M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8",
+            "M21 3v5h-5",
+            "M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16",
+            "M8 16H3v5",
+        ],
+        size,
+        2.0,
+        color,
+    )
+}
+
 fn icon_settings(size: f32, color: rune::Color) -> Shape {
     // Lucide v1.17 `settings`: six-lobed gear outline + centre circle.
     let p = Path::new()
@@ -248,6 +263,11 @@ pub struct ShellState {
     /// Phone drawer. Desktop ignores it; below `md` it is closed until the
     /// bottom nav asks for a panel.
     pub mobile_panel_open: bool,
+    /// Transcript whose audio is allowed to keep playing. Virtual rows unmount
+    /// freely; switching chats stops the previous thread's clips.
+    pub audio_owner: String,
+    /// Last audio-engine revision, so a load failure/end repaints once.
+    pub audio_rev: u64,
 }
 
 impl Default for ShellState {
@@ -271,6 +291,8 @@ impl Default for ShellState {
             settings: crate::settings::SettingsState::default(),
             pairing: PairingState::default(),
             mobile_panel_open: false,
+            audio_owner: "main".to_string(),
+            audio_rev: 0,
         }
     }
 }
@@ -1297,7 +1319,200 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
     if s.pairing.locked {
         root = root.child(pairing_gate(s, w, h));
     }
+    if let Some(toast) = update_toast(
+        s,
+        w,
+        h,
+        if folded {
+            MOBILE_NAV_H + safe_bottom
+        } else {
+            0.0
+        },
+    ) {
+        root = root.child(toast);
+    }
     root
+}
+
+/// Stop audio owned by the transcript that is no longer on screen. The home
+/// thread is `main`; an open card sheet is that card's id.
+fn sync_audio_owner(s: &mut ShellState) -> bool {
+    let owner = s
+        .canvas
+        .sessions
+        .sheet
+        .clone()
+        .unwrap_or_else(|| "main".to_string());
+    if owner == s.audio_owner {
+        return false;
+    }
+    match s.audio_owner.as_str() {
+        "main" => {
+            s.transcript.audio.stop_all();
+            s.personal.audio.stop_all();
+        }
+        id => {
+            if let Some(thread) = s.canvas.sessions.threads.get_mut(id) {
+                thread.audio.stop_all();
+            }
+        }
+    }
+    s.audio_owner = owner;
+    true
+}
+
+/// At least one clip is loading or playing; the shell polls those at 4 Hz so
+/// the scrub bar and clock advance without a continuous animation.
+fn poll_audio(s: &mut ShellState) -> bool {
+    let active = s.transcript.audio.has_active()
+        || s.personal.audio.has_active()
+        || s.canvas
+            .sessions
+            .threads
+            .values()
+            .any(|thread| thread.audio.has_active());
+    let revision = s.transcript.audio.revision()
+        ^ s.personal.audio.revision()
+        ^ s.canvas
+            .sessions
+            .threads
+            .values()
+            .map(|thread| thread.audio.revision())
+            .fold(0, u64::wrapping_add);
+    let changed = revision != s.audio_rev;
+    s.audio_rev = revision;
+    changed || active
+}
+
+/// True when restarting cannot lose an in-flight run or typed message.
+fn update_restart_safe(s: &ShellState) -> bool {
+    if s.transcript.live || s.personal.live {
+        return false;
+    }
+    if s.canvas.sessions.threads.values().any(|thread| thread.live) {
+        return false;
+    }
+    if !s.transcript.edit.text.trim().is_empty()
+        || !s.personal.edit.text.trim().is_empty()
+        || s.canvas
+            .inputs
+            .values()
+            .any(|input| !input.text.trim().is_empty())
+        || s.canvas
+            .sessions
+            .threads
+            .values()
+            .any(|thread| !thread.edit.text.trim().is_empty())
+        || s.canvas
+            .sessions
+            .threads
+            .values()
+            .any(|thread| !thread.draft_attachments.is_empty())
+        || s.canvas
+            .card_attachments
+            .values()
+            .any(|files| !files.is_empty())
+    {
+        return false;
+    }
+    true
+}
+
+/// Global updater toast: matches React's `UpdateToast` placement and keeps the
+/// downloading/ready states visible until they resolve.
+fn update_toast(s: &ShellState, w: f32, h: f32, bottom_inset: f32) -> Option<El> {
+    let update = &s.settings.update;
+    if matches!(update.phase, UpdatePhase::Idle | UpdatePhase::Unsupported) {
+        return None;
+    }
+    if matches!(update.phase, UpdatePhase::Error | UpdatePhase::UpToDate)
+        && update
+            .shown_at
+            .is_some_and(|at| crate::clock::now_millis().saturating_sub(at) > 6_000)
+    {
+        return None;
+    }
+    let tone = match update.phase {
+        UpdatePhase::Error => "#fcd34d",
+        UpdatePhase::UpToDate => "#a1a1aa",
+        _ => "#e4e4e7",
+    };
+    let width = 320.0_f32.min((w - 24.0).max(220.0));
+    let x = (w - width - 12.0).max(12.0);
+    let y = (h - 12.0 - 44.0 - bottom_inset).max(12.0);
+    let mut toast = row()
+        .key("update-toast")
+        .absolute(x, y)
+        .w(width)
+        .min_h(40.0)
+        .items_center()
+        .gap(8.0)
+        .px(12.0)
+        .py(8.0)
+        .radius(12.0)
+        .border(1.0, ink("#ffffff1a"))
+        .border_layout()
+        .fill(ink("#15151af2"))
+        .backdrop_blur(10.0)
+        .box_shadow(rune::Shadow {
+            x: 0.0,
+            y: 14.0,
+            blur: 36.0,
+            spread: 0.0,
+            color: ink("#00000073"),
+            inset: false,
+        })
+        .role("status")
+        .live_region(rune::LiveRegion::Polite);
+    let glyph = match update.phase {
+        UpdatePhase::Downloading => icon_refresh(13.0, ink(tone)),
+        UpdatePhase::UpToDate => crate::icons::circle_check(13.0, ink(tone)),
+        UpdatePhase::Error => crate::icons::triangle_alert(13.0, ink(tone)),
+        _ => icon_refresh(13.0, ink(tone)),
+    };
+    if update.phase == UpdatePhase::Downloading {
+        toast = toast.child(
+            rune::el()
+                .size(13.0, 13.0)
+                .inert()
+                .looping(rune::LoopSpec::rotation(0.9))
+                .child(rune::el().size(13.0, 13.0).inert().shape(glyph)),
+        );
+    } else {
+        toast = toast.child(rune::el().size(13.0, 13.0).inert().shape(glyph));
+    }
+    toast = toast.child(
+        text(update.message.clone())
+            .key("update-toast-message")
+            .grow(1.0)
+            .min_w(0.0)
+            .font(rune::tok::TextStyle::new(11.5, 400.0))
+            .wrap()
+            .color(ink(tone)),
+    );
+    if update.phase == UpdatePhase::Ready {
+        toast = toast.child(
+            rune::el()
+                .key("update-toast-restart")
+                .role("button")
+                .focusable(true)
+                .label("Restart now")
+                .help("Restart now")
+                .h(24.0)
+                .px(8.0)
+                .radius(6.0)
+                .center()
+                .hover(ink("#ffffff14"))
+                .hover_group()
+                .on_press_tx_enter(|_s: &mut ShellState, tx: &mut rune::Tx| tx.quit())
+                .child(
+                    text("Restart")
+                        .font(rune::tok::TextStyle::new(10.5, 600.0))
+                        .color(ink("#e4e4e7")),
+                ),
+        );
+    }
+    Some(toast)
 }
 
 /// Full-screen phone gate, shown when the server answered 401. The desktop
@@ -1601,6 +1816,18 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
     changed |= poll_projects(s, clock);
     changed |= crate::agents::poll_agents_state(&mut s.canvas.agents, clock);
     changed |= crate::settings::poll_settings(&mut s.settings);
+    s.settings.auto_update(clock);
+    changed |= sync_audio_owner(s);
+    if poll_audio(s) {
+        tx.wake_after(std::time::Duration::from_millis(250));
+        changed = true;
+    }
+    if s.settings.update_restart_ready() && update_restart_safe(s) {
+        // The launcher sees `pending.json`, applies it while this process
+        // exits, then starts the new UI and server together.
+        tx.quit();
+        return true;
+    }
     changed |= poll_cloud_state(&mut s.cloud, clock);
     changed |= poll_chats(s, clock);
     // Async results arrive on channels, not on input: keep polling until
@@ -2438,6 +2665,48 @@ pub fn run_shell_headless(extra_args: Vec<String>) {
 mod tests {
     use super::*;
     use rune::{Env, Runtime};
+
+    #[test]
+    fn update_toast_mounts_ready_and_downloading_states() {
+        let env = Env::new(true, 1.0);
+        let mut state = ShellState::default();
+        state.settings.update.phase = UpdatePhase::Ready;
+        state.settings.update.restart_required = true;
+        state.settings.update.message = "Stark 2.7.0 is ready.".to_string();
+        let mut rt = Runtime::new(state, shell_view, (1280.0, 900.0), env);
+        rt.frame(0.0);
+        assert!(rt.find("update-toast").is_some());
+        assert!(rt.find("update-toast-restart").is_some());
+
+        let env = Env::new(true, 1.0);
+        let mut state = ShellState::default();
+        state.settings.update.phase = UpdatePhase::Downloading;
+        state.settings.update.message = "Downloading Stark 2.7.0… 40%".to_string();
+        let mut rt = Runtime::new(state, shell_view, (390.0, 844.0), env);
+        rt.frame(0.0);
+        assert!(rt.find("update-toast").is_some());
+        assert!(rt.find("update-toast-restart").is_none());
+    }
+
+    #[test]
+    fn update_restart_waits_for_runs_and_drafts() {
+        let mut s = ShellState::default();
+        s.transcript.live = false;
+        s.personal.live = false;
+        for thread in s.canvas.sessions.threads.values_mut() {
+            thread.live = false;
+        }
+        assert!(update_restart_safe(&s));
+        s.transcript.edit.text = "half a message".to_string();
+        assert!(!update_restart_safe(&s));
+        s.transcript.edit.text.clear();
+        s.transcript.live = true;
+        assert!(!update_restart_safe(&s));
+        s.transcript.live = false;
+        let id = s.canvas.cards[0].id.clone();
+        s.canvas.thread_mut(&id).live = true;
+        assert!(!update_restart_safe(&s));
+    }
 
     #[test]
     fn home_card_width_matches_react_wrapper_gutters() {

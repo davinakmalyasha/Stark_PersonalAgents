@@ -28,7 +28,9 @@ jobs:
           workspaces: desktop-rune -> target
       - run: cargo fmt --all --check
       - run: cargo clippy -p stark-rune-app --features rune-real --all-targets -- -D warnings
+      - run: cargo clippy -p stark-launcher --all-targets -- -D warnings
       - run: cargo test -p stark-rune-app --features rune-real
+      - run: cargo test -p stark-launcher
       - run: cargo test
       # Native tests never compile the wasm path (SystemTime panics and
       # native-only transport fns slipped through twice). This is the gate.

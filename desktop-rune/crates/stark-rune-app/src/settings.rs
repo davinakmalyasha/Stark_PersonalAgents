@@ -10,10 +10,11 @@
 //!
 //! The sheet is global like React's modal: one state on the shell, opened by
 //! the rail gear (and by the standalone transcript scene for goldens). The
-//! Tauri updater plugin does not exist in Rune yet, so "Check" reports that
-//! honestly instead of pretending an update ran.
+//! updater is the signed, staged Rune feed in `updater.rs`; the web build is
+//! updated with the server deploy.
 
 use crate::keys::EnterPress;
+use crate::updater::UpdateEvent;
 use std::path::PathBuf;
 use std::sync::mpsc;
 
@@ -21,7 +22,7 @@ use rune::{col, row, text, El, TextEdit};
 
 /// Product version shown by Settings (`frontend/src/version.ts`), distinct
 /// from the Rune crate version stamped into the binary.
-pub const STARK_VERSION: &str = "2.6.4";
+pub const STARK_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn ink(hex: &'static str) -> rune::Color {
     rune::color::hex(hex).unwrap_or(rune::Color::BLACK)
@@ -175,10 +176,8 @@ impl MigrationStatus {
     }
 }
 
-/// The updater phases `updateStore.ts` exposes. Rune has no updater yet, so
-/// the UI can reach `Checking`/`Error` from the honest stub but never claims
-/// an update was installed.
-#[allow(dead_code)] // the real updater will construct these later
+/// The updater phases `updateStore.ts` exposes: the shared toast and Settings
+/// both read this one state so they never disagree about an update.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UpdatePhase {
     #[default]
@@ -197,6 +196,8 @@ pub struct UpdateState {
     pub version: String,
     pub message: String,
     pub restart_required: bool,
+    /// When the last event landed, so transient toasts hide after React's 6s.
+    pub shown_at: Option<u64>,
 }
 
 enum OpKind {
@@ -237,6 +238,11 @@ pub struct SettingsState {
     generation: u64,
     load_inbox: Option<mpsc::Receiver<LoadResult>>,
     op_inbox: Option<mpsc::Receiver<OpResult>>,
+    /// Update worker events; `None` when no check/download is in flight.
+    update_inbox: Option<mpsc::Receiver<UpdateEvent>>,
+    /// Last automatic check, on the shell clock. The 6-hour cadence survives
+    /// errors and does not retry every frame.
+    update_last_check: Option<f64>,
 }
 
 impl Default for SettingsState {
@@ -258,6 +264,8 @@ impl Default for SettingsState {
             generation: 0,
             load_inbox: None,
             op_inbox: None,
+            update_inbox: None,
+            update_last_check: None,
         }
     }
 }
@@ -281,6 +289,8 @@ impl Clone for SettingsState {
             generation: self.generation,
             load_inbox: None,
             op_inbox: None,
+            update_inbox: None,
+            update_last_check: self.update_last_check,
         }
     }
 }
@@ -298,6 +308,7 @@ impl std::fmt::Debug for SettingsState {
             .field("backup_file", &self.backup_file)
             .field("update", &self.update.phase)
             .field("loading", &self.loading)
+            .field("update_inbox", &self.update_inbox.is_some())
             .finish()
     }
 }
@@ -463,27 +474,74 @@ impl SettingsState {
         });
     }
 
-    /// `checkForAppUpdate({manual:true})`. Rune has no updater yet; say so.
+    /// `checkForAppUpdate({manual:true})`. Starts the signed, staged update
+    /// worker; the shell poll maps its events into the shared toast/settings
+    /// state. The browser build is updated with the server deploy.
     pub fn check_updates(&mut self) {
-        if matches!(
-            self.update.phase,
-            UpdatePhase::Checking | UpdatePhase::Downloading
-        ) {
-            return;
-        }
-        self.update = if cfg!(target_arch = "wasm32") {
-            UpdateState {
+        if cfg!(target_arch = "wasm32") {
+            self.update = UpdateState {
                 phase: UpdatePhase::Unsupported,
                 message: "Web build — updates are applied when the server deploys.".to_string(),
                 ..UpdateState::default()
-            }
-        } else {
-            UpdateState {
+            };
+            return;
+        }
+        if crate::updater::install_root().is_none() && std::env::var("STARK_UPDATE_URL").is_err() {
+            self.update = UpdateState {
                 phase: UpdatePhase::Error,
-                message: "Rune update checks are not wired yet.".to_string(),
+                message: "Updates are available in the installed app.".to_string(),
                 ..UpdateState::default()
-            }
+            };
+            return;
+        }
+        self.start_update_check(true);
+    }
+
+    /// One worker at a time. A ready update is not re-checked until it applies.
+    pub fn start_update_check(&mut self, manual: bool) {
+        if self.update_inbox.is_some()
+            || matches!(
+                self.update.phase,
+                UpdatePhase::Checking | UpdatePhase::Downloading | UpdatePhase::Ready
+            )
+        {
+            return;
+        }
+        self.update = UpdateState {
+            phase: UpdatePhase::Checking,
+            message: if manual {
+                "Checking for updates…".to_string()
+            } else {
+                String::new()
+            },
+            ..UpdateState::default()
         };
+        let (tx, rx) = mpsc::channel();
+        self.update_inbox = Some(rx);
+        crate::updater::spawn_check(manual, tx);
+    }
+
+    /// Six-hour launch/periodic check. `clock` is the shell's wall clock in
+    /// seconds; installed builds only, so headless scenes and dev runs stay
+    /// offline.
+    pub fn auto_update(&mut self, clock: f64) {
+        if self.update_inbox.is_some()
+            || matches!(
+                self.update.phase,
+                UpdatePhase::Checking | UpdatePhase::Downloading | UpdatePhase::Ready
+            )
+        {
+            return;
+        }
+        if crate::updater::auto_check_due(self.update_last_check, clock) {
+            self.update_last_check = Some(clock);
+            self.start_update_check(false);
+        }
+    }
+
+    /// The staged build waits for the shell's busy/draft gate.
+    pub fn update_restart_ready(&self) -> bool {
+        self.update.phase == UpdatePhase::Ready && self.update.restart_required
     }
 
     pub fn desktop(&self) -> bool {
@@ -578,6 +636,15 @@ fn export_op(result: Result<String, String>) -> OpResult {
 /// Drain background settings work. Returns whether the view must commit.
 pub fn poll_settings(s: &mut SettingsState) -> bool {
     let mut changed = false;
+    while let Some(event) = s.update_inbox.as_ref().and_then(|rx| rx.try_recv().ok()) {
+        changed |= crate::updater::apply_event(&mut s.update, event);
+    }
+    if s.update_inbox
+        .as_ref()
+        .is_some_and(|rx| matches!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)))
+    {
+        s.update_inbox = None;
+    }
     #[cfg(target_arch = "wasm32")]
     if let Some(name) = crate::transport::backup_file_name() {
         let current = s
@@ -989,18 +1056,30 @@ pub fn settings_sheet<S: SettingsHost + 'static>(s: &SettingsState, width: f32, 
                         ),
                 )
                 .children(desktop.then(|| {
-                    action_button::<S>(
-                        "settings-check",
-                        "Check",
-                        Some(icon_refresh(14.0, ink("#d4d4d8"))),
-                        false,
-                        matches!(
-                            s.update.phase,
-                            UpdatePhase::Checking | UpdatePhase::Downloading
-                        ),
-                        s.update.phase == UpdatePhase::Checking,
-                        |s: &mut S, _tx: &mut rune::Tx| s.settings_mut().check_updates(),
-                    )
+                    if s.update_restart_ready() {
+                        action_button::<S>(
+                            "settings-restart",
+                            "Restart",
+                            Some(icon_refresh(14.0, ink("#d4d4d8"))),
+                            true,
+                            false,
+                            false,
+                            |_s: &mut S, tx: &mut rune::Tx| tx.quit(),
+                        )
+                    } else {
+                        action_button::<S>(
+                            "settings-check",
+                            "Check",
+                            Some(icon_refresh(14.0, ink("#d4d4d8"))),
+                            false,
+                            matches!(
+                                s.update.phase,
+                                UpdatePhase::Checking | UpdatePhase::Downloading
+                            ),
+                            s.update.phase == UpdatePhase::Checking,
+                            |s: &mut S, _tx: &mut rune::Tx| s.settings_mut().check_updates(),
+                        )
+                    }
                 })),
         );
     // Backup & move.
@@ -1542,7 +1621,7 @@ mod tests {
             assert!(s.update.message.contains("Web build"));
         } else {
             assert_eq!(s.update.phase, UpdatePhase::Error);
-            assert_eq!(s.update.message, "Rune update checks are not wired yet.");
+            assert!(s.update.message.contains("installed app"));
         }
         assert!(!s.desktop() == cfg!(target_arch = "wasm32"));
     }

@@ -2533,26 +2533,25 @@ fn card_view<S: CanvasHost + crate::rune_transcript::TranscriptHost + 'static>(
         view = view.live_border(hover_border.smooth(crate::motion::HOVER_SPRING));
     }
     if card.running {
-        // Sweep sheen: 110pt bar sliding across on the 2.6s linear loop,
-        // clipped to the card. Mirrors `canvas-border-sweep`.
-        view = view.child(
-            rune::el()
-                .key(format!("{id}-sheen"))
-                .absolute(0.0, 0.0)
-                .size(110.0, h)
-                .linear_gradient(
-                    std::f32::consts::FRAC_PI_2,
-                    [
-                        (0.0, ink("#ffffff00")),
-                        (0.5, ink("#ffffff1f")),
-                        (1.0, ink("#ffffff00")),
-                    ],
-                )
-                .looping(
-                    rune::LoopSpec::slide(2.6, [-130.0, 0.0], [w + 20.0, 0.0])
-                        .easing(rune::Easing::LINEAR),
-                ),
-        );
+        // `canvas.css .canvas-card.is-running::before`: a 110° gradient over a
+        // 220% background, swept from 140% to -80% over 2.6 s and masked to the
+        // 1 pt ring. Rune paints it fragment-by-fragment, so corners and AA are
+        // exact and no child overlay can cover the card's content.
+        view = view.border_sweep(rune::BorderSweep {
+            width: 1.0,
+            angle: 110.0f32.to_radians(),
+            color: rune::Color {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 0.48,
+            },
+            stops: [0.22, 0.47, 0.72],
+            size: [2.2, 1.0],
+            from: 140.0,
+            to: -80.0,
+            period: 2.6,
+        });
     }
     // Card status from the thread (`childStatus`): the run dot while live,
     // failed on an error tail, done once rows exist, idle otherwise. Queued
@@ -6286,29 +6285,26 @@ mod tests {
     }
 
     #[test]
-    fn running_card_has_sheen_status_and_motion() {
+    fn running_card_has_border_sweep_status_and_no_sheen_overlay() {
         let env = Env::new(true, 1.0);
         let mut rt = Runtime::new(CanvasState::map(), canvas_view, (MAP_W, MAP_H), env);
         rt.frame(0.0);
         let run_id = "chat:ws-general:chat-4";
         let idle_id = "chat:ws-general:chat-1";
-        for key in [format!("{run_id}-sheen"), format!("{run_id}-badge")] {
-            assert!(rt.find(&key).is_some(), "{key} mounted on running card");
-        }
+        assert!(
+            rt.find(&format!("{run_id}-badge")).is_some(),
+            "running badge mounted"
+        );
+        // The sweep is a fragment-level border paint (`El::border_sweep`), not
+        // a child: a child would cover content and could not be clipped to the
+        // exact 1 pt ring.
+        assert!(
+            rt.find(&format!("{run_id}-sheen")).is_none(),
+            "the old full-card sheen child is gone"
+        );
         assert!(
             rt.find(&format!("{idle_id}-sheen")).is_none(),
-            "idle card has no sheen"
-        );
-        // The sweep travels on the virtual clock: half a period later the
-        // sheen rect has moved.
-        let x0 = rt.presented(&format!("{run_id}-sheen")).unwrap().0[0];
-        for _ in 0..78 {
-            rt.frame(1.0 / 60.0);
-        }
-        let x1 = rt.presented(&format!("{run_id}-sheen")).unwrap().0[0];
-        assert!(
-            (x1 - x0).abs() > 5.0,
-            "sheen travels: {x0} -> {x1} over half a period"
+            "idle card has no sweep child either"
         );
     }
 

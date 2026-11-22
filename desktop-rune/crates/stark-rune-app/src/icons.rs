@@ -227,6 +227,34 @@ pub(crate) fn play(size: f32, color: rune::Color) -> Shape {
     )
 }
 
+/// Lucide `Volume2`.
+pub(crate) fn volume(size: f32, color: rune::Color) -> Shape {
+    lucide(
+        &[
+            "M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z",
+            "M16 9a5 5 0 0 1 0 6",
+            "M19.364 18.364a9 9 0 0 0 0-12.728",
+        ],
+        size,
+        2.0,
+        color,
+    )
+}
+
+/// Lucide `VolumeX`.
+pub(crate) fn volume_x(size: f32, color: rune::Color) -> Shape {
+    lucide(
+        &[
+            "M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z",
+            "m22 9-6 6",
+            "m16 9 6 6",
+        ],
+        size,
+        2.0,
+        color,
+    )
+}
+
 /// Lucide `MessageSquare` (the group chat kicker).
 pub(crate) fn message_square(size: f32, color: rune::Color) -> Shape {
     lucide(

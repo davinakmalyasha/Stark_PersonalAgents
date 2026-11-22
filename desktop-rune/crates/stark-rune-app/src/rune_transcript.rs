@@ -763,6 +763,9 @@ pub struct RuneTranscriptState {
     /// Settings modal data + visibility (global in the shell; this thread
     /// owns the standalone transcript scene's copy).
     pub settings: crate::settings::SettingsState,
+    /// Inline audio players for this thread's attachments. Clones share the
+    /// mixer, so a virtual row can unmount without stopping playback.
+    pub audio: crate::audio::AudioEngine,
     /// Mic capture bus (levels, notes, stop flag, inbox).
     pub voice: crate::voice::VoiceBus,
     /// Frames streamed from the run thread, drained by the `poll` hook.
@@ -909,6 +912,7 @@ impl Clone for RuneTranscriptState {
             },
             services_auto: self.services_auto,
             settings: self.settings.clone(),
+            audio: self.audio.clone(),
             voice: self.voice.clone(),
             inbox: None,
             copied_code: self.copied_code.clone(),
@@ -1012,6 +1016,7 @@ impl RuneTranscriptState {
             provider: ProviderState::default(),
             services_auto: false,
             settings: crate::settings::SettingsState::default(),
+            audio: crate::audio::AudioEngine::new(),
             voice: crate::voice::VoiceBus::default(),
             inbox: None,
             copied_code: None,
@@ -1094,6 +1099,7 @@ impl RuneTranscriptState {
             provider: ProviderState::default(),
             services_auto: false,
             settings: crate::settings::SettingsState::default(),
+            audio: crate::audio::AudioEngine::new(),
             voice: crate::voice::VoiceBus::default(),
             inbox: None,
             copied_code: None,
@@ -2074,9 +2080,289 @@ fn attachment_image(
     crate::image_cache::attachment(file, size, &s.workspace_id, &s.chat_id)
 }
 
-/// `MessageBubble`'s `.message-attachments`: 86×66 image buttons, audio
-/// bars and file chips. Rune has no native audio element, so an audio row
-/// shows the same icon/name instead of playback controls.
+/// Where an audio row can play from. Local files stay local; API/remote
+/// sources are resolved by the engine (native cache or web Blob URL).
+fn audio_source(
+    t: &RuneTranscriptState,
+    file: &ChatAttachment,
+) -> Option<crate::audio::AudioSource> {
+    if !file.path.is_empty() && std::path::Path::new(&file.path).is_file() {
+        return Some(crate::audio::AudioSource::File(std::path::PathBuf::from(
+            &file.path,
+        )));
+    }
+    if let Some(url) = attachment_open_url(t, file) {
+        if let Some(path) = url.strip_prefix("file://") {
+            let path = path.trim_start_matches('/');
+            return Some(crate::audio::AudioSource::File(std::path::PathBuf::from(
+                path,
+            )));
+        }
+        if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("blob:") {
+            return Some(crate::audio::AudioSource::Url(url));
+        }
+        #[cfg(target_arch = "wasm32")]
+        return Some(crate::audio::AudioSource::Url(crate::transport::api_url(
+            &url,
+        )));
+        #[cfg(not(target_arch = "wasm32"))]
+        if !t.workspace_id.is_empty() && !t.chat_id.is_empty() && !file.id.is_empty() {
+            return Some(crate::audio::AudioSource::Url(format!(
+                "http://{}:{}/api/workspaces/{}/chats/{}/attachments/{}",
+                t.api_host, t.api_port, t.workspace_id, t.chat_id, file.id
+            )));
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if !t.workspace_id.is_empty() && !t.chat_id.is_empty() && !file.id.is_empty() {
+        return Some(crate::audio::AudioSource::Url(format!(
+            "http://{}:{}/api/workspaces/{}/chats/{}/attachments/{}",
+            t.api_host, t.api_port, t.workspace_id, t.chat_id, file.id
+        )));
+    }
+    None
+}
+
+fn audio_clock(seconds: f64) -> String {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return "--:--".to_string();
+    }
+    let total = seconds.floor() as u64;
+    format!("{}:{:02}", total / 60, total % 60)
+}
+
+/// Inline player for one attachment. The row keeps React's `.message-audio`
+/// container; the controls are Stark-native, so play/pause, seek, time and
+/// mute read the same on every desktop.
+fn home_audio_row<S: TranscriptHost + 'static>(
+    s: &S,
+    which: Thread,
+    file: &ChatAttachment,
+    id: &str,
+    key: String,
+) -> El {
+    use crate::audio::AudioStatus;
+
+    let t = s.thread(which);
+    let snapshot = t.audio.snapshot(id).unwrap_or_default();
+    let status = snapshot.status;
+    let playing = status == AudioStatus::Playing;
+    let loading = status == AudioStatus::Loading;
+    let failed = status == AudioStatus::Failed;
+    let duration = snapshot.duration;
+    let progress = snapshot.progress();
+    let muted = snapshot.muted;
+    let source = audio_source(t, file);
+    let open_url = attachment_open_url(t, file);
+    let border = t.hover.border(
+        format!("{key}-hover-border"),
+        home_rgba(255.0, 255.0, 255.0, 0.1),
+    );
+    let set_border = border.clone();
+    let play_id = id.to_string();
+    let play_source = source.clone();
+    let seek_id = id.to_string();
+    let mute_id = id.to_string();
+    let mut player = row()
+        .key(key.clone())
+        .role("group")
+        .label(format!("Audio: {}", file.name))
+        .help(file.name.clone())
+        .items_center()
+        .gap(6.0)
+        .w(280.0)
+        .max_w(280.0)
+        .px(7.0)
+        .py(5.0)
+        .radius(9.0)
+        .border(1.0, home_rgba(255.0, 255.0, 255.0, 0.1))
+        .border_layout()
+        .fill(home_rgba(0.0, 0.0, 0.0, 0.18))
+        .hover(home_rgba(255.0, 255.0, 255.0, 0.045))
+        .live_border(border.smooth(crate::motion::HOVER_SPRING))
+        .hover_group()
+        .on_hover_change(move |_s: &mut S, inside, tx| {
+            set_border.set(if inside {
+                home_rgba(255.0, 255.0, 255.0, 0.22)
+            } else {
+                home_rgba(255.0, 255.0, 255.0, 0.1)
+            });
+            tx.live_only();
+        })
+        .child(
+            rune::el()
+                .size(14.0, 14.0)
+                .inert()
+                .shape(crate::lucide_audio_lines(14.0, home_ink("#cfcfd6"))),
+        )
+        .child(
+            rune::el()
+                .key(format!("{key}-play"))
+                .role("button")
+                .focusable(true)
+                .label(if playing { "Pause audio" } else { "Play audio" })
+                .help(if playing { "Pause" } else { "Play" })
+                .size(22.0, 22.0)
+                .radius(6.0)
+                .center()
+                .hover(home_rgba(255.0, 255.0, 255.0, 0.075))
+                .hover_group()
+                .disabled(loading)
+                .opacity(if loading { 0.45 } else { 1.0 })
+                .on_press_enter(move |s: &mut S| {
+                    if loading {
+                        return;
+                    }
+                    let thread = s.thread_mut(which);
+                    match thread.audio.snapshot(&play_id).map(|snap| snap.status) {
+                        Some(AudioStatus::Playing) => thread.audio.pause(&play_id),
+                        Some(AudioStatus::Paused | AudioStatus::Ready | AudioStatus::Ended) => {
+                            thread.audio.resume(&play_id)
+                        }
+                        _ => {
+                            if let Some(source) = play_source.clone() {
+                                thread.audio.play(&play_id, source);
+                            }
+                        }
+                    }
+                })
+                .child(if playing {
+                    rune::el()
+                        .size(12.0, 12.0)
+                        .inert()
+                        .shape(crate::icons::pause(12.0, home_ink("#e4e4e7")))
+                } else {
+                    rune::el()
+                        .size(12.0, 12.0)
+                        .inert()
+                        .shape(crate::icons::play(12.0, home_ink("#e4e4e7")))
+                }),
+        );
+    if failed {
+        player = player.child(
+            text(
+                snapshot
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "Can't play this audio.".to_string()),
+            )
+            .grow(1.0)
+            .min_w(0.0)
+            .font(rune::tok::TextStyle::new(10.0, 400.0))
+            .wrap()
+            .color(home_ink("#fda4af")),
+        );
+        if let Some(url) = open_url {
+            player = player.child(
+                rune::el()
+                    .key(format!("{key}-open"))
+                    .role("button")
+                    .focusable(true)
+                    .label("Open audio")
+                    .help("Open externally")
+                    .h(20.0)
+                    .px(6.0)
+                    .radius(5.0)
+                    .center()
+                    .hover(home_rgba(255.0, 255.0, 255.0, 0.08))
+                    .hover_group()
+                    .on_press_tx_enter(move |_s: &mut S, tx: &mut rune::Tx| {
+                        let _ = tx.open_url(&url);
+                    })
+                    .child(
+                        text("Open")
+                            .font(rune::tok::TextStyle::new(10.0, 600.0))
+                            .color(home_ink("#e4e4e7")),
+                    ),
+            );
+        }
+    } else {
+        let seek_duration = duration;
+        let track = row()
+            .key(format!("{key}-seek"))
+            .role("slider")
+            .label("Audio position")
+            .grow(1.0)
+            .min_w(56.0)
+            .h(18.0)
+            .items_center()
+            .on_drag(
+                move |s: &mut S, drag: &mut rune::Drag, _tx: &mut rune::Tx| {
+                    let Some(duration) = seek_duration else {
+                        return;
+                    };
+                    if !matches!(drag.phase, rune::Phase::Down | rune::Phase::Move) {
+                        return;
+                    }
+                    let fraction = if drag.w > 0.0 {
+                        (drag.x / drag.w).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    s.thread_mut(which)
+                        .audio
+                        .seek(&seek_id, duration * fraction as f64);
+                },
+            )
+            .child(
+                rune::el()
+                    .w_full()
+                    .h(4.0)
+                    .radius(2.0)
+                    .fill(home_rgba(255.0, 255.0, 255.0, 0.12))
+                    .child(
+                        rune::el()
+                            .w_frac(progress)
+                            .h(4.0)
+                            .radius(2.0)
+                            .fill(home_rgba(255.0, 255.0, 255.0, 0.58)),
+                    ),
+            );
+        player = player.child(track).child(
+            text(format!(
+                "{} / {}",
+                audio_clock(snapshot.position),
+                duration.map_or("--:--".to_string(), audio_clock)
+            ))
+            .key(format!("{key}-time"))
+            .w(58.0)
+            .font(crate::motion::tabular(rune::tok::TextStyle::new(
+                9.5, 400.0,
+            )))
+            .color(home_ink("#8d8d96")),
+        );
+    }
+    player = player.child(
+        rune::el()
+            .key(format!("{key}-mute"))
+            .role("button")
+            .focusable(true)
+            .label(if muted { "Unmute audio" } else { "Mute audio" })
+            .help(if muted { "Unmute" } else { "Mute" })
+            .size(18.0, 18.0)
+            .radius(4.0)
+            .center()
+            .hover(home_rgba(255.0, 255.0, 255.0, 0.075))
+            .hover_group()
+            .on_press_enter(move |s: &mut S| {
+                let thread = s.thread_mut(which);
+                let muted = thread
+                    .audio
+                    .snapshot(&mute_id)
+                    .is_some_and(|snapshot| snapshot.muted);
+                thread.audio.set_muted(&mute_id, !muted);
+            })
+            .child(rune::el().size(12.0, 12.0).inert().shape(if muted {
+                crate::icons::volume_x(12.0, home_ink("#8d8d96"))
+            } else {
+                crate::icons::volume(12.0, home_ink("#8d8d96"))
+            })),
+    );
+    player
+}
+
+/// `MessageBubble`’s `.message-attachments`: 86×66 image buttons, inline
+/// audio players and file chips.
 fn home_message_attachments<S: TranscriptHost + 'static>(
     s: &S,
     which: Thread,
@@ -2147,54 +2433,7 @@ fn home_message_attachments<S: TranscriptHost + 'static>(
             continue;
         }
         if file.is_audio() && has_src {
-            let border = t.hover.border(
-                format!("{key}-hover-border"),
-                home_rgba(255.0, 255.0, 255.0, 0.1),
-            );
-            let set_border = border.clone();
-            let child = row()
-                .key(key)
-                .role("group")
-                .label(file.name.clone())
-                .items_center()
-                .gap(7.0)
-                .max_w(280.0)
-                .px(7.0)
-                .py(5.0)
-                .radius(9.0)
-                .border(1.0, home_rgba(255.0, 255.0, 255.0, 0.1))
-                .border_layout()
-                .fill(home_rgba(0.0, 0.0, 0.0, 0.18))
-                // `.message-attachment:hover`: border .22, white text and a
-                // 5.5% white wash. The border rides a Live track; the rest
-                // fill and text keep their measured colours.
-                .hover(home_rgba(255.0, 255.0, 255.0, 0.055))
-                .live_border(border.smooth(crate::motion::HOVER_SPRING))
-                .hover_group()
-                .on_hover_change(move |_s: &mut S, inside, tx| {
-                    set_border.set(if inside {
-                        home_rgba(255.0, 255.0, 255.0, 0.22)
-                    } else {
-                        home_rgba(255.0, 255.0, 255.0, 0.1)
-                    });
-                    tx.live_only();
-                })
-                .child(
-                    rune::el()
-                        .size(14.0, 14.0)
-                        .inert()
-                        .shape(crate::lucide_audio_lines(14.0, home_ink("#cfcfd6"))),
-                )
-                .child(
-                    text(file.name.clone())
-                        .min_w(0.0)
-                        .max_w(220.0)
-                        .truncate()
-                        .font(rune::tok::TextStyle::new(11.0, 400.0))
-                        .color(home_ink("#cfcfd6"))
-                        .group_color(home_ink("#ffffff")),
-                );
-            deck = deck.child(child);
+            deck = deck.child(home_audio_row::<S>(s, which, file, &id, key));
             continue;
         }
         let src = has_src;
@@ -5643,10 +5882,10 @@ pub fn attachments_demo() -> RuneTranscriptState {
         },
         ChatAttachment {
             id: "demo-voice".to_string(),
-            name: "voice-note.mp3".to_string(),
-            file_type: "audio/mpeg".to_string(),
-            size: 482_000,
-            path: String::new(),
+            name: "voice-note.wav".to_string(),
+            file_type: "audio/wav".to_string(),
+            size: 8_844,
+            path: concat!(env!("CARGO_MANIFEST_DIR"), "/assets/voice-note.wav").to_string(),
             is_image: false,
             url: None,
         },
@@ -5675,6 +5914,15 @@ pub fn attachments_demo() -> RuneTranscriptState {
             file_type: "application/pdf".to_string(),
             size: 1_240_000,
             path: String::new(),
+            is_image: false,
+            url: None,
+        },
+        ChatAttachment {
+            id: "demo-msg-audio".to_string(),
+            name: "voice-note.wav".to_string(),
+            file_type: "audio/wav".to_string(),
+            size: 8_844,
+            path: concat!(env!("CARGO_MANIFEST_DIR"), "/assets/voice-note.wav").to_string(),
             is_image: false,
             url: None,
         },
@@ -6490,6 +6738,78 @@ mod tests {
             ));
         }
         root
+    }
+
+    fn tiny_wav() -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("stark-transcript-audio-{}.wav", std::process::id()));
+        let sample_rate = 8_000u32;
+        let samples: Vec<i16> = (0..800)
+            .map(|i| ((i as f32 * 0.2).sin() * 4_000.0) as i16)
+            .collect();
+        let data_len = (samples.len() * 2) as u32;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&sample_rate.to_le_bytes());
+        bytes.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        for sample in samples {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn audio_attachment_mounts_inline_player_controls() {
+        let wav = tiny_wav();
+        let env = Env::new(true, 2.0);
+        let mut init = RuneTranscriptState::screenshot();
+        init.live = false;
+        init.rows.clear();
+        let mut row = RowData::default();
+        row.key = "u-audio".to_string();
+        row.role = "user";
+        row.body = "Listen.".to_string();
+        row.raw_body = row.body.clone();
+        row.at = "2026-11-12T12:04:00Z".to_string();
+        row.attachments = vec![ChatAttachment {
+            id: "audio-1".to_string(),
+            name: "voice-note.wav".to_string(),
+            file_type: "audio/wav".to_string(),
+            size: std::fs::metadata(&wav).map(|m| m.len()).unwrap_or(0),
+            path: wav.to_string_lossy().into_owned(),
+            is_image: false,
+            url: None,
+        }];
+        init.rows.push(row);
+        let mut rt = Runtime::new(init, home_attachments_view, (468.0, 720.0), env);
+        rt.frame(0.0);
+        for key in [
+            "u-audio-attachments",
+            "u-audio-file-audio-1",
+            "u-audio-file-audio-1-play",
+            "u-audio-file-audio-1-seek",
+            "u-audio-file-audio-1-time",
+            "u-audio-file-audio-1-mute",
+        ] {
+            assert!(rt.find(key).is_some(), "{key} mounted");
+        }
+        let (rect, _) = rt.presented("u-audio-file-audio-1").unwrap();
+        assert!(
+            (rect[2] - 280.0).abs() < 0.6,
+            "React .message-audio max width, got {}",
+            rect[2]
+        );
+        let _ = std::fs::remove_file(wav);
     }
 
     #[test]

@@ -12,6 +12,9 @@ pub mod agents;
 #[path = "ask.rs"]
 pub mod ask;
 #[cfg(feature = "rune-real")]
+#[path = "audio.rs"]
+pub mod audio;
+#[cfg(feature = "rune-real")]
 #[path = "chats.rs"]
 pub mod chats;
 #[cfg(feature = "rune-real")]
@@ -80,6 +83,9 @@ pub mod tool_labels;
 #[cfg(feature = "rune-real")]
 #[path = "transport.rs"]
 pub mod transport;
+#[cfg(feature = "rune-real")]
+#[path = "updater.rs"]
+pub mod updater;
 #[cfg(feature = "rune-real")]
 #[path = "voice.rs"]
 pub mod voice;

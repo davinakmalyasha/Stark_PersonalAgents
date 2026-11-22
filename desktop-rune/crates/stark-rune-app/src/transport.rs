@@ -662,6 +662,47 @@ pub enum WebTarget {
     Card(String),
 }
 
+/// Fetch an attachment with the pairing header and hand it to an
+/// `HtmlAudioElement` through an object URL. The caller revokes the URL when
+/// the clip stops. Relative API paths are resolved against `api_origin()`.
+#[cfg(target_arch = "wasm32")]
+pub async fn fetch_blob_url(url: &str) -> Result<(String, bool), String> {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
+    let absolute = if url.starts_with('/') {
+        api_url(url)
+    } else {
+        url.to_string()
+    };
+    let window = web_sys::window().ok_or("no window")?;
+    let init = web_sys::RequestInit::new();
+    init.set_method("GET");
+    init.set_mode(web_sys::RequestMode::Cors);
+    init.set_headers(&auth_headers(false)?.into());
+    let request = web_sys::Request::new_with_str_and_init(&absolute, &init)
+        .map_err(|e| format!("request: {e:?}"))?;
+    let resp_value = JsFuture::from(window.fetch_with_request(&request))
+        .await
+        .map_err(|e| format!("fetch audio: {e:?}"))?;
+    let resp: web_sys::Response = resp_value
+        .dyn_into()
+        .map_err(|e| format!("response: {e:?}"))?;
+    if resp.status() == 401 {
+        mark_auth_rejected();
+        return Err("HTTP 401 Unauthorized".to_string());
+    }
+    if !resp.ok() {
+        return Err(format!("audio: HTTP {}", resp.status()));
+    }
+    let blob = JsFuture::from(resp.blob().map_err(|e| format!("blob: {e:?}"))?)
+        .await
+        .map_err(|e| format!("blob: {e:?}"))?;
+    let blob: web_sys::Blob = blob.dyn_into().map_err(|e| format!("blob: {e:?}"))?;
+    let object = web_sys::Url::create_object_url_with_blob(&blob)
+        .map_err(|e| format!("object url: {e:?}"))?;
+    Ok((object, true))
+}
+
 /// A browser picker result waiting for the shell poll. Files stay as browser
 /// `File` handles until the async upload runs.
 #[cfg(target_arch = "wasm32")]

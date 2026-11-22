@@ -28,6 +28,8 @@ mod agents;
 #[cfg(feature = "rune-real")]
 mod ask;
 #[cfg(feature = "rune-real")]
+mod audio;
+#[cfg(feature = "rune-real")]
 mod chats;
 #[cfg(feature = "rune-real")]
 mod clock;
@@ -76,6 +78,8 @@ mod token_stats;
 mod tool_labels;
 #[cfg(feature = "rune-real")]
 mod transport;
+#[cfg(feature = "rune-real")]
+mod updater;
 #[cfg(feature = "rune-real")]
 mod voice;
 #[cfg(feature = "rune-real")]
@@ -764,12 +768,19 @@ fn run_cli() {
                 eprintln!("--rune-canvas-snap <png> is required");
                 std::process::exit(2);
             });
-            rune_canvas::run_canvas_headless(vec![
+            let mut run_args = vec![
                 "--snap".to_string(),
                 png,
                 "--scale".to_string(),
                 "1".to_string(),
-            ]);
+            ];
+            if let Some(at) = args.iter().position(|a| a == "--at") {
+                if let Some(value) = args.get(at + 1) {
+                    run_args.push("--at".to_string());
+                    run_args.push(value.clone());
+                }
+            }
+            rune_canvas::run_canvas_headless(run_args);
             return;
         }
     }

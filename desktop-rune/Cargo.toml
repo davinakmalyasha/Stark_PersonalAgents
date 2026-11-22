@@ -19,4 +19,4 @@ exclude = ["vendor"]
 [workspace.package]
 edition = "2021"
 license = "MIT"
-version = "2.6.4"
+version = "2.7.0"

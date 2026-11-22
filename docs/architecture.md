@@ -148,9 +148,15 @@ tasks, not part of the Stark application stack.
   the updater payload.
 - `stark-launcher` owns `current.json`, `pending.json`, `blocked.json`, server
   lifecycle, and rollback.
-- `.github/workflows/rune-release.yml` publishes the signed Rune feed.
+- `.github/workflows/rune-master.yml` runs on every push to master: it builds,
+  signs and publishes the desktop payload to `Stark_Rune_Releases`, updates the
+  rolling `rune-master` installer release, and the installed app checks the
+  feed on launch and every five minutes. Versions use
+  `<next-patch>-master.<run>.<attempt>` so they increase with each build.
 - `.github/workflows/build-linux.yml` and `deploy-vps.yml` ship the API-only
-  Linux server; no web client build is part of the artifact.
+  Linux server from the same commit on every master push; no web client build
+  is part of the artifact. `/api/health` reports the deployed revision in
+  `build`.
 - Windows x86_64 is the primary installed target today.
 
 ## Source map

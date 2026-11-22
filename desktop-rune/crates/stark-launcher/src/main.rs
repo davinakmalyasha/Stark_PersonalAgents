@@ -107,7 +107,7 @@ fn supervise(root: &Path) -> Result<(), String> {
         }
         log(root, &format!("starting {}", current.version));
 
-        let mut server = start_server(root, &version_dir)?;
+        let mut server = start_server(root, &version_dir, &current.version)?;
         let mut ui = start_ui(root, &version_dir)?;
         let started = Instant::now();
         let status = ui.wait().map_err(|error| format!("wait for UI: {error}"))?;
@@ -263,6 +263,7 @@ fn start_ui(root: &Path, version_dir: &Path) -> Result<Child, String> {
         .current_dir(version_dir)
         .env("STARK_INSTALL_ROOT", root)
         .env("STARK_PORT", DEFAULT_PORT.to_string())
+        .env("STARK_API_PORT", DEFAULT_PORT.to_string())
         .env("STARK_HARNESS_ROOT", &data)
         .env("STARK_LAUNCHER_PID", std::process::id().to_string())
         .stdin(Stdio::null())
@@ -284,7 +285,7 @@ struct Server {
     job: Option<windows_sys::Win32::Foundation::HANDLE>,
 }
 
-fn start_server(root: &Path, version_dir: &Path) -> Result<Option<Server>, String> {
+fn start_server(root: &Path, version_dir: &Path, version: &str) -> Result<Option<Server>, String> {
     let exe = version_dir.join("stark-server.exe");
     if !exe.is_file() {
         log(
@@ -293,9 +294,22 @@ fn start_server(root: &Path, version_dir: &Path) -> Result<Option<Server>, Strin
         );
         return Ok(None);
     }
-    if api_healthy(DEFAULT_PORT) {
-        log(root, "port 8124 already has a healthy backend; reusing it");
-        return Ok(None);
+    if let Some(health) = api_health(DEFAULT_PORT) {
+        if health_matches(&health, version) {
+            log(
+                root,
+                &format!("port {DEFAULT_PORT} already runs {version}; reusing it"),
+            );
+            return Ok(None);
+        }
+        let running = health
+            .get("app_version")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .unwrap_or("an unknown build");
+        return Err(format!(
+            "port {DEFAULT_PORT} is held by {running}, not {version}. Close the development backend and start Stark Rune again."
+        ));
     }
     let data = data_root(root);
     std::fs::create_dir_all(&data)
@@ -304,6 +318,7 @@ fn start_server(root: &Path, version_dir: &Path) -> Result<Option<Server>, Strin
     command
         .current_dir(version_dir)
         .env("STARK_PORT", DEFAULT_PORT.to_string())
+        .env("STARK_APP_VERSION", version)
         .env("STARK_HARNESS_ROOT", &data)
         .env("HARNESS_ROOT", &data)
         .stdin(Stdio::null())
@@ -359,32 +374,38 @@ fn data_root(root: &Path) -> PathBuf {
     root.join("data")
 }
 
-fn api_healthy(port: u16) -> bool {
+fn api_health(port: u16) -> Option<serde_json::Value> {
     use std::io::{Read, Write};
     use std::net::TcpStream;
     let address = format!("127.0.0.1:{port}");
-    let Ok(mut stream) = TcpStream::connect_timeout(
-        &address.parse().expect("valid API address"),
-        Duration::from_millis(500),
-    ) else {
-        return false;
-    };
+    let mut stream =
+        TcpStream::connect_timeout(&address.parse().ok()?, Duration::from_millis(500)).ok()?;
     let _ = stream.set_read_timeout(Some(Duration::from_millis(700)));
-    if stream
+    stream
         .write_all(b"GET /api/health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
-        .is_err()
-    {
-        return false;
+        .ok()?;
+    let mut buffer = Vec::new();
+    stream.read_to_end(&mut buffer).ok()?;
+    let text = String::from_utf8_lossy(&buffer);
+    let (head, body) = text.split_once("\r\n\r\n")?;
+    if !head.starts_with("HTTP/1.1 200") && !head.starts_with("HTTP/1.0 200") {
+        return None;
     }
-    let mut buffer = [0u8; 256];
-    let read = stream.read(&mut buffer).unwrap_or(0);
-    String::from_utf8_lossy(&buffer[..read]).contains(" 200 ")
+    serde_json::from_str(body.trim()).ok()
+}
+
+/// A healthy port belongs to this install only when it reports the same app
+/// version. This stops an installed build from silently reusing a development
+/// backend with different data and code.
+fn health_matches(health: &serde_json::Value, version: &str) -> bool {
+    health.get("ok").and_then(|value| value.as_bool()) == Some(true)
+        && health.get("app_version").and_then(|value| value.as_str()) == Some(version)
 }
 
 fn wait_healthy(root: &Path, port: u16, timeout: Duration) {
     let started = Instant::now();
     while started.elapsed() < timeout {
-        if api_healthy(port) {
+        if api_health(port).is_some() {
             return;
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -556,6 +577,21 @@ mod tests {
         assert!(apply_pending(&root, None).is_err());
         assert_eq!(read_current(&root).unwrap().version, "1.0.0");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn health_must_match_the_running_app_version() {
+        let health = serde_json::json!({"ok": true, "app_version": "2.7.1-master.10"});
+        assert!(health_matches(&health, "2.7.1-master.10"));
+        assert!(!health_matches(&health, "2.7.0"));
+        assert!(!health_matches(
+            &serde_json::json!({"ok": false, "app_version": "2.7.1-master.10"}),
+            "2.7.1-master.10"
+        ));
+        assert!(!health_matches(
+            &serde_json::json!({"ok": true}),
+            "2.7.1-master.10"
+        ));
     }
 
     #[test]

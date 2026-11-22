@@ -11,7 +11,17 @@ systemctl show stark -p MainPID --value
 free -h | head -2
 
 echo "==> health"
-curl -fsS "$BASE/api/health"; echo
+HEALTH="$(curl -fsS "$BASE/api/health")"
+echo "$HEALTH"
+EXPECTED="$(cat /opt/stark/current/REVISION 2>/dev/null || true)"
+if [ -n "$EXPECTED" ]; then
+  ACTUAL="$(printf '%s' "$HEALTH" | jq -r '.build // empty')"
+  if [ "$ACTUAL" != "$EXPECTED" ]; then
+    echo "health build '$ACTUAL' does not match deployed revision '$EXPECTED'" >&2
+    exit 1
+  fi
+  echo "build matches $EXPECTED"
+fi
 
 echo "==> provider key (boolean only)"
 curl -fsS "$BASE/api/provider" | jq '{provider, base_url, has_key, legacy_env}'

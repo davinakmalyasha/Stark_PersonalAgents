@@ -129,7 +129,18 @@ jobs:
       - name: Install packaging tools
         shell: pwsh
         run: |
-          choco install nsis minisign -y --no-progress
+          choco install nsis -y --no-progress
+          # Use minisign 0.12 to match the key format. The Chocolatey build is
+          # older and rejects a 0.12 secret key with "Unsupported key
+          # derivation function".
+          $zip = Join-Path $env:RUNNER_TEMP "minisign.zip"
+          $dir = Join-Path $env:RUNNER_TEMP "minisign"
+          Invoke-WebRequest -Uri "https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-win64.zip" -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $dir -Force
+          $exe = Get-ChildItem $dir -Recurse -Filter minisign.exe | Select-Object -First 1
+          if (-not $exe) { throw "minisign.exe not found" }
+          $exe.Directory.FullName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & $exe.FullName -v
 
       - name: Fetch ONNX Runtime 1.26
         shell: pwsh

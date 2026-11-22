@@ -137,10 +137,10 @@ jobs:
           $dir = Join-Path $env:RUNNER_TEMP "minisign"
           Invoke-WebRequest -Uri "https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-win64.zip" -OutFile $zip
           Expand-Archive -Path $zip -DestinationPath $dir -Force
-          $exe = Get-ChildItem $dir -Recurse -Filter minisign.exe | Select-Object -First 1
-          if (-not $exe) { throw "minisign.exe not found" }
-          $exe.Directory.FullName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          & $exe.FullName -v
+          $exe = Join-Path $dir "minisign-win64\x86_64\minisign.exe"
+          if (-not (Test-Path $exe)) { throw "x86_64 minisign.exe not found" }
+          Split-Path $exe | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & $exe -v
 
       - name: Fetch ONNX Runtime 1.26
         shell: pwsh

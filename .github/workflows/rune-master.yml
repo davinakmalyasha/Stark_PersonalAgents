@@ -130,6 +130,11 @@ jobs:
         shell: pwsh
         run: |
           choco install nsis -y --no-progress
+          # Chocolatey installs NSIS outside Git Bash's PATH; publish it for
+          # package.sh's `command -v makensis` check.
+          $nsis = "C:\Program Files (x86)\NSIS"
+          if (-not (Test-Path "$nsis\makensis.exe")) { throw "makensis.exe not found" }
+          $nsis | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           # Use minisign 0.12 to match the key format. The Chocolatey build is
           # older and rejects a 0.12 secret key with "Unsupported key
           # derivation function".

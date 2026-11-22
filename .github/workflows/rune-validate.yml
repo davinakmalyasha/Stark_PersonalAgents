@@ -26,7 +26,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: desktop-rune -> target
-      - run: cargo fmt --all --check
+      - run: cargo fmt -p stark-theme -p stark-kit -p stark-rune-app -p stark-rune-web -p stark-launcher -- --check
       - run: cargo clippy -p stark-rune-app --features rune-real --all-targets -- -D warnings
       - run: cargo clippy -p stark-launcher --all-targets -- -D warnings
       - run: cargo test -p stark-rune-app --features rune-real

@@ -16,11 +16,12 @@ if [[ "$SRC" == *.enc ]]; then
   SRC="$PLAIN"
 fi
 
-unzip -Z1 "$SRC" | grep -qx 'manifest.json' || { echo "missing manifest.json"; exit 1; }
+unzip -Z1 "$SRC" > "$WORK/entries.txt"
+grep -qx 'manifest.json' "$WORK/entries.txt" || { echo "missing manifest.json"; exit 1; }
 manifest="$(unzip -p "$SRC" manifest.json)"
 app="$(jq -r '.app // empty' <<<"$manifest")"
 [ "$app" = "stark" ] || { echo "not a Stark backup: $manifest"; exit 1; }
-unzip -Z1 "$SRC" | grep -qx '.deep_agents/chats.db' || { echo "missing chats.db"; exit 1; }
+grep -qx '.deep_agents/chats.db' "$WORK/entries.txt" || { echo "missing chats.db"; exit 1; }
 
 mkdir -p "$WORK/db"
 unzip -p "$SRC" .deep_agents/chats.db > "$WORK/db/chats.db"

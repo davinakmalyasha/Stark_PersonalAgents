@@ -38,6 +38,10 @@ pre-release identifiers compare numerically, so `master.10` is newer than
    davinakmalyasha/Stark_Rune_Releases
    ```
 
+   The build-only ONNX Runtime 1.26 DLL is published once as the `rune-deps`
+   prerelease in that repo. It is a dependency, not an update target; the
+   `rune-master` workflow downloads it by tag.
+
 2. Generate a passwordless minisign keypair outside the repository:
 
    ```bash

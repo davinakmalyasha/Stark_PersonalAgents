@@ -21,6 +21,8 @@ checks the feed on launch and every five minutes. Updates are staged, applied
 after the UI exits, and rolled back automatically if the new build fails to
 start. The installed shortcut launches a GUI supervisor, so no terminal window
 opens, and the launcher/UI/server carry the Stark icon and taskbar identity.
+The Rune window uses one custom titlebar: navigation, open-session tabs, the
+new-session action and the Windows caption buttons share a single 44pt row.
 
 ## Develop
 

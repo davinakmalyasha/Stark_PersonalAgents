@@ -86,6 +86,12 @@ over approximating a CSS property.
   Symphonia; web uses a hidden `HtmlAudioElement` fed by an authenticated
   Blob URL. The engine lives in the thread, so virtual rows can unmount
   without stopping a clip.
+- **Window chrome** — native uses Rune's custom `Titlebar`: one 44pt band with
+  the navigation toggle, chat search, session tabs, compact `+` and Rune's
+  Windows caption buttons. `Cx::chrome_insets` reserves the caption area;
+  the band drags the window and keeps Aero Snap, snap layouts and the window
+  menu. The browser renders the same band without caption buttons; Linux keeps
+  its native frame.
 - **Updates** — `updater.rs` follows the master feed. It checks on launch and
   every five minutes, downloads and verifies the signed payload, and stages it
   under `app/<version>`; `stark-launcher` switches `current.json` after the UI
@@ -119,11 +125,11 @@ over approximating a CSS property.
 
 ## Architecture
 
-The shell is one page: a session tab strip, an icon rail, a side panel, a
-canvas map and a transcript/chat surface. The canvas and transcript are
-always mounted; panels switch content rather than routes. Overlays mount at
-the shell or modal root so they escape the clipping of the surface that
-opened them.
+The shell is one page: an app-drawn titlebar with the open-session tabs, an
+icon rail, a side panel, a canvas map and a transcript/chat surface. The
+canvas and transcript are always mounted; panels switch content rather than
+routes. Overlays mount at the shell or modal root so they escape the clipping
+of the surface that opened them.
 
 Canvas cards are small chat surfaces, not previews: each card dock owns its
 own attachment draft and send path, pending questions replace the dock with

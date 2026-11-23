@@ -1,10 +1,11 @@
 //! Single-page shell — one window, chat types only, no workspace routes.
 //!
-//! Layout mirrors the desktop app: session tabs on top (one per open chat +
-//! New session), then a row of icon rail + side panel + canvas map. The rail
-//! switches the panel (Chats / Agents / Group / Cloud / Memory / House); the
-//! canvas always stays mounted, so a running stream keeps draining whatever
-//! panel is up. A transcript sheet opens over the map for the active session.
+//! Layout mirrors the desktop app: one custom titlebar holds the open-session
+//! tabs, the new-session action and the navigation controls, then a row of
+//! icon rail + side panel + canvas map. The rail switches the panel (Chats /
+//! Agents / Group / Cloud / Memory / House); the canvas always stays mounted,
+//! so a running stream keeps draining whatever panel is up. A transcript sheet
+//! opens over the map for the active session.
 
 use crate::keys::EnterPress;
 use rune::{col, row, text, text_input, AppSpec, Cx, El, LineCap, Path, Shape};
@@ -29,8 +30,12 @@ static mut WINDOW_SAFE_BOTTOM: f32 = 0.0;
 
 /// Sidebar/side-panel fold threshold (the reference UI `md:` = 768).
 const PANEL_FOLD_W: f32 = 768.0;
-/// Top session-tab bar (`HouseHeader` md:h-[52px]).
-const TAB_H: f32 = 52.0;
+/// The app-drawn titlebar: session tabs and window identity in one row. Rune
+/// takes the native Windows titlebar away and draws the caption buttons over
+/// the trailing edge (`Cx::chrome_insets`).
+const TOPBAR_H: f32 = 44.0;
+/// Gap between session tabs and the compact new-session control.
+const TAB_GAP: f32 = 4.0;
 /// Side panel width (`HouseSidebar` w-[248px]).
 const PANEL_W: f32 = 248.0;
 /// Phone bottom nav (icons + labels), before safe-area padding.
@@ -288,8 +293,11 @@ pub struct ShellState {
     pub settings: crate::settings::SettingsState,
     pub pairing: PairingState,
     /// Phone drawer. Desktop ignores it; below `md` it is closed until the
-    /// bottom nav asks for a panel.
+    /// topbar or bottom nav asks for a panel.
     pub mobile_panel_open: bool,
+    /// Desktop navigation: the icon rail and side panel. The titlebar menu
+    /// hides both so the canvas can use the full width.
+    pub nav_open: bool,
     /// Home chat card folded to its prompt dock (`HouseChat` minimize). The
     /// card is not keyed by chat, so this persists across chat switches like
     /// The reference UI's local `minimized` state.
@@ -325,6 +333,7 @@ impl Default for ShellState {
             settings: crate::settings::SettingsState::default(),
             pairing: PairingState::default(),
             mobile_panel_open: false,
+            nav_open: true,
             home_minimized: false,
             home_controls: HomeControls(rune::Live::new(0.0)),
             audio_owner: "main".to_string(),
@@ -420,7 +429,7 @@ impl CloudHost for ShellState {
 
 /// One session tab: card title + close. Press activates the chat (the reference UI
 /// `SessionTabs`: the active tab drives the home chat card).
-fn session_tab(s: &ShellState, id: &str) -> El {
+fn session_tab(s: &ShellState, id: &str, width: f32) -> El {
     let title = s
         .canvas
         .card(id)
@@ -462,7 +471,7 @@ fn session_tab(s: &ShellState, id: &str) -> El {
         .focusable(true)
         .focus_selected(active)
         .focus_ring(2.0, 2.0, rgba(1.0, 1.0, 1.0, 0.55))
-        .max_w(210.0)
+        .w(width)
         .h(30.0)
         .items_center()
         .gap(8.0)
@@ -471,8 +480,9 @@ fn session_tab(s: &ShellState, id: &str) -> El {
         .radius(8.0)
         .border(1.0, ink(if active { "#ffffff24" } else { "#00000000" }))
         .hover_group()
-        .on_press_enter(move |s: &mut ShellState| {
+        .on_press_tx_enter(move |s: &mut ShellState, tx: &mut rune::Tx| {
             s.canvas.select_card(&select);
+            tx.scroll_into_view(format!("session-{select}"));
         });
     if !active {
         // SessionTabs inactive: hover:bg-white/[0.05] hover:text-zinc-200.
@@ -1051,6 +1061,212 @@ fn active_chat_sheets(s: &ShellState) -> Vec<El> {
     sheets
 }
 
+/// Lucide `Menu` for the titlebar's navigation toggle.
+fn icon_menu(size: f32, color: rune::Color) -> Shape {
+    crate::icons::lucide(&["M4 6h16", "M4 12h16", "M4 18h16"], size, 2.0, color)
+}
+
+/// Lucide `Search` for the titlebar's chat search shortcut.
+fn icon_search(size: f32, color: rune::Color) -> Shape {
+    crate::icons::lucide(
+        &["m21 21-4.34-4.34", "M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16z"],
+        size,
+        2.0,
+        color,
+    )
+}
+
+/// A 30-point ghost control in the titlebar. Its press handler is attached by
+/// the caller so the menu and search buttons keep their own actions.
+fn topbar_control(key: &str, label: &str, glyph: Shape) -> El {
+    rune::el()
+        .key(key)
+        .role("button")
+        .focusable(true)
+        .label(label)
+        .help(label)
+        .size(30.0, 30.0)
+        .radius(8.0)
+        .center()
+        .hover(rgba(1.0, 1.0, 1.0, 0.07))
+        .focus_ring(1.0, 1.0, rgba(1.0, 1.0, 1.0, 0.5))
+        .press_scale(0.94)
+        .child(rune::el().size(15.0, 15.0).inert().shape(glyph))
+}
+
+/// A compact `+` after the last tab. Unlike the old dashed "New session" pill,
+/// this stays a fixed 30×30 target and never stretches with the strip.
+fn new_session_button() -> El {
+    let plus = |color: rune::Color| {
+        Shape::new()
+            .line(
+                [12.0, 5.0],
+                [12.0, 19.0],
+                crate::lucide_stroke(14.0),
+                LineCap::Round,
+                color,
+            )
+            .line(
+                [5.0, 12.0],
+                [19.0, 12.0],
+                crate::lucide_stroke(14.0),
+                LineCap::Round,
+                color,
+            )
+            .view_box(24.0, 24.0)
+    };
+    rune::el()
+        .key("session-new")
+        .role("button")
+        .focusable(true)
+        .label("New session")
+        .help("New session")
+        .size(30.0, 30.0)
+        .radius(8.0)
+        .center()
+        .hover(rgba(1.0, 1.0, 1.0, 0.07))
+        .focus_ring(1.0, 1.0, rgba(1.0, 1.0, 1.0, 0.5))
+        .hover_group()
+        .press_scale(0.94)
+        .on_press_tx_enter(|s: &mut ShellState, tx: &mut rune::Tx| {
+            s.canvas.new_session();
+            if let Some(id) = s.canvas.sessions.order.last() {
+                tx.scroll_into_view(format!("session-{id}"));
+            }
+        })
+        .child(
+            rune::el()
+                .size(14.0, 14.0)
+                .inert()
+                .child(
+                    rune::el()
+                        .size(14.0, 14.0)
+                        .inert()
+                        .shape(plus(ink("#71717a"))),
+                )
+                .child(
+                    rune::el()
+                        .size(14.0, 14.0)
+                        .absolute(0.0, 0.0)
+                        .inert()
+                        .group_opacity(0.0, 1.0)
+                        .shape(plus(ink("#e4e4e7"))),
+                ),
+        )
+}
+
+/// The one app-drawn titlebar: navigation controls, open-session tabs, the
+/// compact new-session action, and Rune's Windows caption buttons over the
+/// trailing edge. The band drags the window; presses on its controls win.
+fn shell_topbar(s: &ShellState, cx: &mut Cx<ShellState>, w: f32) -> El {
+    let chrome = cx.chrome_insets();
+    cx.caption_color(ink("#d4d4d8"));
+    let top_h = if chrome.height > 0.0 {
+        chrome.height
+    } else {
+        TOPBAR_H
+    };
+    let folded = w < PANEL_FOLD_W;
+    let menu_label = if folded {
+        if s.mobile_panel_open {
+            "Close navigation"
+        } else {
+            "Open navigation"
+        }
+    } else if s.nav_open {
+        "Hide sidebar"
+    } else {
+        "Show sidebar"
+    };
+    let menu = topbar_control("topbar-menu", menu_label, icon_menu(15.0, ink("#a1a1aa")))
+        .on_press_enter(move |s: &mut ShellState| {
+            if folded {
+                s.mobile_panel_open = !s.mobile_panel_open;
+            } else {
+                s.nav_open = !s.nav_open;
+            }
+        });
+    let search = topbar_control(
+        "topbar-search",
+        "Search chats",
+        icon_search(15.0, ink("#a1a1aa")),
+    )
+    .on_press_enter(move |s: &mut ShellState| {
+        s.canvas.rail = RailTab::Chats;
+        if folded {
+            s.mobile_panel_open = true;
+        } else {
+            s.nav_open = true;
+        }
+        let caret = s.canvas.sessions.search.text.len();
+        s.canvas.sessions.search.anchor = caret;
+        s.canvas.sessions.search.focus = caret;
+        s.canvas.sessions.search.focused = true;
+    });
+
+    // Give tabs equal shares of the visible strip, like the reference UI:
+    // 210pt with room, shrinking to 96pt before the strip scrolls.
+    let tabs_n = s.canvas.sessions.order.len();
+    // Menu + search + `+`, both outer gutters and the three gaps; the rest is
+    // the tab strip. The caption reservation is part of the trailing gutter.
+    let fixed = 8.0 + 6.0 + chrome.trailing + 30.0 * 3.0 + TAB_GAP * 3.0;
+    let strip_w = (w - chrome.leading - fixed).max(120.0);
+    let tab_w = if tabs_n == 0 {
+        210.0
+    } else {
+        ((strip_w - TAB_GAP * tabs_n.saturating_sub(1) as f32) / tabs_n as f32).clamp(96.0, 210.0)
+    };
+    // The strip hugs the tabs, and `+` sits right after it. Beyond the
+    // visible width the strip scrolls instead of pushing the button aside.
+    let tabs_width = if tabs_n == 0 {
+        0.0
+    } else {
+        (tab_w * tabs_n as f32 + TAB_GAP * (tabs_n.saturating_sub(1)) as f32).min(strip_w)
+    };
+    let mut tabs = row()
+        .key("shell-tabs")
+        .w(tabs_width)
+        .h_full()
+        .items_center()
+        .gap(TAB_GAP)
+        // A new tab or a resize must not spring the strip's width: the `+`
+        // and the caption buttons stay put while the tab itself fades in.
+        .instant_changes()
+        // The reference UI's strip is `overflow-x-auto`; keep every tab
+        // reachable when the window is narrow.
+        .scroll_x()
+        .scroll_edge_fade(18.0)
+        .role("tablist")
+        .label("Sessions")
+        .focus_group();
+    for id in s.canvas.sessions.order.clone() {
+        tabs = tabs.child(session_tab(s, &id, tab_w));
+    }
+
+    row()
+        .key("shell-titlebar")
+        .role("toolbar")
+        .label("Title bar")
+        .w_full()
+        .h(top_h)
+        .items_center()
+        .gap(TAB_GAP)
+        .pl(chrome.leading + 8.0)
+        .pr(chrome.trailing + 6.0)
+        // The rail's surface, so the titlebar reads as chrome rather than as
+        // another row of canvas.
+        .fill(ink("#0c0c0c"))
+        .border_sides([0.0, 0.0, 1.0, 0.0], ink("#ffffff14"))
+        // Tab widths, the `+` and the caption reservation change together;
+        // springing their positions would briefly overlap hit targets.
+        .instant_changes()
+        .window_drag()
+        .child(menu)
+        .child(search)
+        .child(tabs)
+        .child(new_session_button())
+}
+
 pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
     // Window size for this frame: the root's laid-out rect (rebuilds on
     // resize). Spec size stands in until the first layout lands.
@@ -1067,109 +1283,9 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
         WINDOW_H = h;
         WINDOW_SAFE_BOTTOM = safe_bottom;
     }
-    let mut tabs = row()
-        .key("shell-tabs")
-        .w_full()
-        .h(TAB_H)
-        .items_center()
-        .gap(4.0)
-        .px(16.0)
-        .pb(1.0)
-        // The reference UI's strip is `overflow-x-auto`; phones scroll tabs instead of
-        // clipping the tail at the window edge.
-        .scroll_x()
-        .border_sides([0.0, 0.0, 1.0, 0.0], ink("#ffffff14"))
-        .role("tablist")
-        .label("Sessions")
-        .focus_group();
-    for id in s.canvas.sessions.order.clone() {
-        tabs = tabs.child(session_tab(s, &id));
-    }
-    let new_style = {
-        let mut style = rune::tok::TextStyle::new(12.0, 400.0);
-        style.line_height = 12.0;
-        style
-    };
-    let new_advance = rune::text::advance("New session", new_style);
-    let new_right_pad = 11.0 - (new_advance.ceil() - new_advance);
-    tabs = tabs.child(
-        row()
-            .key("session-new")
-            .role("button")
-            .focusable(true)
-            .label("New session")
-            .h(30.0)
-            .items_center()
-            .gap(6.0)
-            .pl(11.0)
-            .pr(new_right_pad)
-            .radius(8.0)
-            .border(1.0, ink("#ffffff1f"))
-            .border_dash(3.0, 3.0)
-            .hover(rgba(1.0, 1.0, 1.0, 0.04))
-            .hover_group()
-            .on_press_enter(move |s: &mut ShellState| {
-                s.canvas.new_session();
-            })
-            .child({
-                let plus = |color: rune::Color| {
-                    Shape::new()
-                        .line(
-                            [12.0, 5.0],
-                            [12.0, 19.0],
-                            crate::lucide_stroke(13.0),
-                            LineCap::Round,
-                            color,
-                        )
-                        .line(
-                            [5.0, 12.0],
-                            [19.0, 12.0],
-                            crate::lucide_stroke(13.0),
-                            LineCap::Round,
-                            color,
-                        )
-                        .view_box(24.0, 24.0)
-                };
-                rune::el()
-                    .size(13.0, 13.0)
-                    .inert()
-                    .child(
-                        rune::el()
-                            .size(13.0, 13.0)
-                            .inert()
-                            .shape(plus(ink("#71717a"))),
-                    )
-                    .child(
-                        rune::el()
-                            .size(13.0, 13.0)
-                            .absolute(0.0, 0.0)
-                            .inert()
-                            .group_opacity(0.0, 1.0)
-                            .shape(plus(ink("#e4e4e7"))),
-                    )
-            })
-            .child(
-                text("New session".to_string())
-                    .key("session-new-label")
-                    .font(new_style)
-                    .color(ink("#71717a"))
-                    .group_color(ink("#e4e4e7")),
-            )
-            .child(
-                // hover:border-white/[0.28] — borders don't take a hover
-                // colour in Rune, so overlay the brighter dashed edge.
-                rune::el()
-                    .absolute(0.0, 0.0)
-                    .w_full()
-                    .h_full()
-                    .radius(8.0)
-                    .border(1.0, rgba(1.0, 1.0, 1.0, 0.28))
-                    .border_dash(3.0, 3.0)
-                    .group_opacity(0.0, 1.0)
-                    .inert(),
-            ),
-    );
+    let topbar = shell_topbar(s, cx, w);
     let folded = w < PANEL_FOLD_W;
+
     let rail = col()
         .key("icon-rail")
         .w(RAIL_W)
@@ -1276,9 +1392,12 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
                         ),
                 ),
         );
-    let stage_w = (w - if folded { 0.0 } else { RAIL_W + PANEL_W }).max(320.0);
+    // The titlebar menu folds both desktop columns; phones keep the rail
+    // hidden and open the drawer instead.
+    let nav_open = !folded && s.nav_open;
+    let stage_w = (w - if nav_open { RAIL_W + PANEL_W } else { 0.0 }).max(320.0);
     let stage_h = (h
-        - TAB_H
+        - TOPBAR_H
         - if folded {
             MOBILE_NAV_H + safe_bottom
         } else {
@@ -1311,7 +1430,7 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
         .grow(1.0)
         .min_h(0.0)
         .fill(ink("#0a0a0a"));
-    if !folded {
+    if nav_open {
         // Desktop: icon rail + docked panel. Below `md` both disappear and
         // The panel becomes an on-demand drawer (the reference UI `House.tsx`).
         main = main.child(rail).child(side_panel(s, PANEL_W));
@@ -1334,18 +1453,21 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
                 false
             },
         )
-        .child(tabs)
+        .child(topbar)
         .child(main);
     if folded {
         root = root.child(mobile_nav(s, safe_bottom));
         if s.mobile_panel_open {
+            // The drawer opens below the titlebar so its menu button stays
+            // visible and can close it again.
             let drawer_w = (w * 0.84).clamp(240.0, 320.0);
+            let body_h = (h - TOPBAR_H).max(0.0);
             root = root
                 .child(
                     rune::el()
                         .key("side-backdrop")
-                        .absolute(0.0, 0.0)
-                        .size(w, h)
+                        .absolute(0.0, TOPBAR_H)
+                        .size(w, body_h)
                         .fill(rgba(0.0, 0.0, 0.0, 0.6))
                         .backdrop_blur(4.0)
                         .on_press_enter(|s: &mut ShellState| s.mobile_panel_open = false),
@@ -1353,9 +1475,9 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
                 .child(
                     rune::el()
                         .key("side-drawer")
-                        .absolute(0.0, 0.0)
+                        .absolute(0.0, TOPBAR_H)
                         .w(drawer_w)
-                        .h(h)
+                        .h(body_h)
                         .transition(crate::motion::drawer_enter())
                         .box_shadow(rune::Shadow {
                             x: 18.0,
@@ -1805,9 +1927,10 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
     // drives `fitView`). While the camera is auto it refits on resize.
     let (win_w, win_h, safe_bottom) = unsafe { (WINDOW_W, WINDOW_H, WINDOW_SAFE_BOTTOM) };
     let folded = win_w < PANEL_FOLD_W;
-    let stage_w = (win_w - if folded { 0.0 } else { RAIL_W + PANEL_W } - 40.0).max(320.0);
+    let nav_open = !folded && s.nav_open;
+    let stage_w = (win_w - if nav_open { RAIL_W + PANEL_W } else { 0.0 } - 40.0).max(320.0);
     let stage_h = (win_h
-        - TAB_H
+        - TOPBAR_H
         - 12.0
         - if folded {
             MOBILE_NAV_H + safe_bottom
@@ -2750,6 +2873,13 @@ pub fn run_shell_headless(extra_args: Vec<String>) {
     // Windows default (the browser's path), `off`/`on` are the portable
     // pipelines. It never changes the shipped default.
     let mut app = rune::App::new(shell_spec());
+    // One app-drawn titlebar replaces Windows' native caption. Rune keeps the
+    // resize edges, Aero Snap, snap layouts, the window menu and animations,
+    // and draws its caption buttons over the trailing edge of our band.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        app = app.titlebar(rune::Titlebar::new(TOPBAR_H));
+    }
     if let Ok(mode) = std::env::var("STARK_FONT_SMOOTHING") {
         app = app.font_smoothing(match mode.as_str() {
             "off" => rune::FontSmoothing::Off,
@@ -2892,6 +3022,19 @@ mod tests {
         assert!(rt.find("side-drawer").is_some(), "drawer mounted");
         assert!(rt.find("side-backdrop").is_some(), "backdrop mounted");
         assert!(rt.find("side-panel").is_some(), "chats panel in drawer");
+        let (drawer, _) = rt.presented("side-drawer").expect("drawer rect");
+        assert!(drawer[1] >= TOPBAR_H, "drawer starts below the titlebar");
+        // The titlebar stays above the drawer, so its menu can close it.
+        let (x, y) = rt.find("topbar-menu").expect("menu above drawer");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        assert!(!rt.state.mobile_panel_open, "titlebar menu closes drawer");
+        let (x, y) = rt.find("mobile-chats").expect("chats button");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.mobile_panel_open);
         let (backdrop, _) = rt.presented("side-backdrop").expect("backdrop");
         let bx = backdrop[0] + backdrop[2] - 8.0;
         let by = backdrop[1] + backdrop[3] * 0.5;
@@ -2986,6 +3129,75 @@ mod tests {
         // id is listed for the Add menu.
         assert!(rt.state.canvas.sessions.threads.contains_key(&id));
         assert!(rt.state.canvas.closed.iter().any(|(cid, _)| cid == &id));
+    }
+
+    #[test]
+    fn titlebar_merges_tabs_and_keeps_new_session_compact() {
+        let env = Env::new(true, 1.0);
+        let mut rt = Runtime::new(ShellState::default(), shell_view, (1280.0, 900.0), env);
+        rt.frame(0.0);
+
+        // The whole shell chrome is one band at the top of the window.
+        let (rect, _) = rt.presented("shell-titlebar").expect("titlebar");
+        assert_eq!(rect[1], 0.0, "titlebar starts at the window top");
+        assert!((rect[3] - TOPBAR_H).abs() < 0.5, "one 44pt row");
+        assert!(rt.presented("shell-tabs").is_some());
+
+        // New session is a fixed square, never a full-width dashed box.
+        let (plus, _) = rt.presented("session-new").expect("new session");
+        assert!((plus[2] - 30.0).abs() < 0.5, "width {}", plus[2]);
+        assert!((plus[3] - 30.0).abs() < 0.5, "height {}", plus[3]);
+        assert!(
+            rt.find("session-new-label").is_none(),
+            "the visible New session text is gone"
+        );
+        // It follows the last tab and never overlays a tab's close target.
+        let last = rt
+            .state
+            .canvas
+            .sessions
+            .order
+            .last()
+            .expect("a tab")
+            .clone();
+        let (tab, _) = rt.presented(&format!("session-{last}")).expect("last tab");
+        assert!(
+            plus[0] >= tab[0] + tab[2] + TAB_GAP - 0.5,
+            "plus {} overlaps tab right {}",
+            plus[0],
+            tab[0] + tab[2]
+        );
+    }
+
+    #[test]
+    fn titlebar_menu_folds_navigation_and_search_opens_it() {
+        let env = Env::new(true, 1.0);
+        let mut rt = Runtime::new(ShellState::default(), shell_view, (1280.0, 900.0), env);
+        rt.frame(0.0);
+        assert!(rt.find("icon-rail").is_some());
+        assert!(rt.find("map-sidebar").is_some());
+
+        let (x, y) = rt.find("topbar-menu").expect("menu");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..8 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(!rt.state.nav_open);
+        assert!(rt.find("icon-rail").is_none(), "rail folded");
+        assert!(rt.find("map-sidebar").is_none(), "panel folded");
+        assert!(rt.find("shell-titlebar").is_some(), "titlebar stays");
+
+        let (x, y) = rt.find("topbar-search").expect("search");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..5 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(rt.state.nav_open, "search restores navigation");
+        assert_eq!(rt.state.canvas.rail, RailTab::Chats);
+        assert!(rt.state.canvas.sessions.search.focused);
+        assert!(rt.find("map-search").is_some());
     }
 
     #[test]

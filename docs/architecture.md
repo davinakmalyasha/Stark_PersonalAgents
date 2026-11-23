@@ -25,10 +25,15 @@ independently by its own static host or dev proxy.
 | `stark-theme` | Design tokens and shared theme values |
 | `stark-launcher` | Stable supervisor: versioned installs, server lifecycle, updates, rollback |
 
-The UI is a single page. A session tab strip, icon rail, side panel, canvas map,
-and transcript surface stay mounted; panels swap content instead of routing.
-Canvas cards are small chat surfaces with their own drafts and sends. Overlays
-mount at the shell or modal root so they escape clipping.
+The UI is a single page. One app-drawn titlebar holds the navigation controls,
+the open-session tabs and the new-session action. Below it, an icon rail, side
+panel, canvas map and transcript surface stay mounted; panels swap content
+instead of routing. On Windows Rune replaces the native caption with this 44pt
+`.window_drag()` band and draws the minimize/maximize/close buttons over its
+trailing edge; `Cx::chrome_insets` reserves that area and `Cx::caption_color`
+keeps the symbols readable on the dark fill. Canvas cards are small chat
+surfaces with their own drafts and sends. Overlays mount at the shell or modal
+root so they escape clipping.
 
 State is plain Rust. Host traits (`TranscriptHost`, `CanvasHost`,
 `ProjectsHost`, `SettingsHost`, and related traits) let shared views resolve the

@@ -11,6 +11,12 @@
 //! The launcher starts the server and UI from the current version, owns the
 //! server with a kill-on-close job object, applies `pending.json` only after
 //! the UI exits, and rolls back when the new UI fails immediately.
+//!
+//! This is a GUI-subsystem binary: launching the shortcut must not open a
+//! terminal. `--version-file` exists for packaging, and `--version` attaches to
+//! the parent console only when someone asks for it from a terminal.
+
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -36,7 +42,25 @@ struct Pending {
 }
 
 fn main() {
-    if std::env::args().any(|arg| arg == "--version") {
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = args.iter().position(|arg| arg == "--version-file") {
+        if let Some(path) = args.get(pos + 1) {
+            let _ = std::fs::write(
+                path,
+                format!("stark-launcher {}\n", env!("CARGO_PKG_VERSION")),
+            );
+        }
+        return;
+    }
+    if args.iter().any(|arg| arg == "--version") {
+        // GUI-subsystem binaries have no console of their own. Attach only
+        // when a terminal asks for the version; a shortcut launch never does.
+        #[cfg(windows)]
+        unsafe {
+            windows_sys::Win32::System::Console::AttachConsole(
+                windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS,
+            );
+        }
         println!("stark-launcher {}", env!("CARGO_PKG_VERSION"));
         return;
     }

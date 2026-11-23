@@ -57,6 +57,8 @@ mkdir -p "$APP"
 cp "$LAUNCHER_BIN" "$STAGE/StarkRune.exe"
 cp "$APP_BIN" "$APP/stark-rune.exe"
 cp "$SERVER_BIN" "$APP/stark-server.exe"
+cp "$DESKTOP/assets/stark.ico" "$STAGE/stark.ico"
+cp "$DESKTOP/packaging/set-appid.ps1" "$STAGE/set-appid.ps1"
 printf '{\n  "version": "%s",\n  "previous": null\n}\n' "$VERSION" > "$STAGE/current.json"
 
 # Shared runtime data stays outside versioned app folders.
@@ -81,7 +83,7 @@ for license in POCKET_TTS_LICENSE THIRD_PARTY_VOICE.md; do
   fi
 done
 "$APP/stark-rune.exe" --version > "$APP/VERSION.txt"
-"$STAGE/StarkRune.exe" --version > "$STAGE/LAUNCHER_VERSION.txt"
+"$STAGE/StarkRune.exe" --version-file "$STAGE/LAUNCHER_VERSION.txt"
 cat > "$STAGE/README.txt" <<EOF
 Stark Rune $VERSION ($ARCH)
 Run StarkRune.exe. The launcher starts the bundled backend and keeps the
@@ -105,6 +107,7 @@ if command -v makensis >/dev/null 2>&1; then
   makensis -V2 \
     -DSTAGE="$(cygpath -w "$STAGE")" \
     -DVERSION="$VERSION" \
+    -DICON="$(cygpath -w "$DESKTOP/assets/stark.ico")" \
     -DOUTFILE="$(cygpath -w "$DIST/StarkRune-Setup-$VERSION.exe")" \
     "$DESKTOP/packaging/StarkRune.nsi"
 else
@@ -117,5 +120,5 @@ echo "--- install tree ---"
 ls -lh "$STAGE/StarkRune.exe" "$STAGE/current.json" "$APP/stark-rune.exe" "$APP/stark-server.exe"
 echo "--- smoke ---"
 "$APP/stark-rune.exe" --version
-"$STAGE/StarkRune.exe" --version
+cat "$STAGE/LAUNCHER_VERSION.txt"
 echo "PACKAGE_OK"

@@ -19,7 +19,8 @@ Download the newest master installer from the rolling
 The desktop follows `master`: every push builds a signed payload, and the app
 checks the feed on launch and every five minutes. Updates are staged, applied
 after the UI exits, and rolled back automatically if the new build fails to
-start.
+start. The installed shortcut launches a GUI supervisor, so no terminal window
+opens, and the launcher/UI/server carry the Stark icon and taskbar identity.
 
 ## Develop
 

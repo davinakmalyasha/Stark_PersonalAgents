@@ -136,6 +136,13 @@ bundled `stark-server`, starts the UI from `app/<version>`, and applies a
 staged update only after the UI exits. `current.json` is the atomic switch;
 `pending.json` is the handoff; `blocked.json` records a version that failed to
 start. A failed new build rolls back to the previous version automatically.
+
+The launcher is a Windows GUI-subsystem binary, so the shortcut does not open a
+terminal. The launcher, UI and bundled server embed `stark.ico`; the shortcuts
+use it and carry the `com.stark.rune` AppUserModelID, and the Rune UI sets the
+same ID plus its live window icon. Launcher or shortcut changes are delivered
+by the Setup; the five-minute auto-update payload replaces only
+`app/<version>`.
 Every push to master publishes a signed build to the dedicated public feed
 repo (`davinakmalyasha/Stark_Rune_Releases`), and the installed app checks that
 feed on launch and every five minutes. The rolling `rune-master` release on the

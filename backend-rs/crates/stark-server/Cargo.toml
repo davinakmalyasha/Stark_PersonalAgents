@@ -40,5 +40,8 @@ tracing-log = "0.2"
 uuid.workspace = true
 zip = { version = "9", default-features = false, features = ["deflate"] }
 
+[build-dependencies]
+embed-resource = "3.0"
+
 [dev-dependencies]
 tempfile = "3"

@@ -680,6 +680,13 @@ fn main() {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn run_cli() {
+    // Stable taskbar identity shared with the installed shortcuts. Without
+    // this Windows groups the Rune window separately from its pinned icon.
+    #[cfg(windows)]
+    unsafe {
+        let app_id: Vec<u16> = "com.stark.rune\0".encode_utf16().collect();
+        windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(app_id.as_ptr());
+    }
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--version") {
         println!("stark-rune {APP_VERSION} (rune {RUNE_REV})");

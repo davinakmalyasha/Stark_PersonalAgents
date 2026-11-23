@@ -2742,6 +2742,10 @@ pub fn shell_spec() -> AppSpec<ShellState> {
 }
 
 pub fn run_shell_headless(extra_args: Vec<String>) {
+    // Rune sizes the window/taskbar/Alt-Tab icons from this PNG. The executable
+    // resource covers Explorer and Task Manager; this covers the live window.
+    #[cfg(target_os = "windows")]
+    let _ = rune::set_app_icon(include_bytes!("../../../assets/stark-icon.png").to_vec());
     // `STARK_FONT_SMOOTHING` is a parity-rig knob: DirectWrite is the
     // Windows default (the browser's path), `off`/`on` are the portable
     // pipelines. It never changes the shipped default.

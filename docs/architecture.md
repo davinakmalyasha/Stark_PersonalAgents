@@ -147,7 +147,9 @@ tasks, not part of the Stark application stack.
 - `desktop-rune/packaging/` builds the portable, versioned Rune install and
   the updater payload.
 - `stark-launcher` owns `current.json`, `pending.json`, `blocked.json`, server
-  lifecycle, and rollback.
+  lifecycle, and rollback. It is a Windows GUI-subsystem binary; the launcher,
+  UI and bundled server embed the Stark icon, and the UI plus shortcuts share
+  the `com.stark.rune` AppUserModelID for taskbar grouping.
 - `.github/workflows/rune-master.yml` runs on every push to master: it builds,
   signs and publishes the desktop payload to `Stark_Rune_Releases`, updates the
   rolling `rune-master` installer release, and the installed app checks the

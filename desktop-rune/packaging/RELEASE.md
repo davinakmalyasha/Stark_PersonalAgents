@@ -12,12 +12,19 @@ same commit as the desktop. `/api/health` reports the deployed commit in
 ## Layout
 
 ```text
-StarkRune.exe                 stable launcher/supervisor
+StarkRune.exe                 stable GUI-subsystem launcher/supervisor
 current.json                  atomic { version, previous }
 app/<version>/                stark-rune.exe + stark-server.exe + runtime
 models/                       shared voice models, not duplicated per version
 updates/                      staged payloads
+stark.ico                     shortcut/installer icon
+set-appid.ps1                 installer helper for the taskbar identity
 ```
+
+The launcher, UI and bundled server all embed `stark.ico`. The launcher is a
+Windows GUI binary, so a shortcut never opens a console window. The shortcuts
+carry `com.stark.rune` as their AppUserModelID and the UI sets the same ID, so
+the pinned shortcut groups with the running Rune window.
 
 The version is computed per master build:
 
@@ -104,6 +111,10 @@ The app restarts when it is safe (no live run or draft); the launcher then
 switches `current.json`, starts the new server and UI, and rolls back to the
 previous version if the new UI exits within 20 seconds. `blocked.json` records
 a version that failed to start so it is not retried.
+
+The updater payload contains only `app/<version>`. Changes to the launcher,
+the installer icon or the shortcut identity need one new Setup run; after that
+the normal five-minute master updates continue.
 
 The update row in Settings shows the current version and status. Updates apply
 automatically; there is no manual check button. The browser build reports that

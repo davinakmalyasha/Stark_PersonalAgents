@@ -94,3 +94,9 @@ optional = true
 # feature compiles to meter-only instead of failing on bindgen/link.
 [target.'cfg(target_env = "msvc")'.dependencies]
 moonshine-rs = { version = "0.2.6", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_UI_Shell"] }
+
+[build-dependencies]
+embed-resource = "3.0"

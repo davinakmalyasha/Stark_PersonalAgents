@@ -87,6 +87,155 @@ impl ProviderUsage {
     }
 }
 
+/// Compact per-model rollup for the provider sheet. Built from local run
+/// history (`UsageCall`s), since the documented OpenCode Go `/usage`
+/// endpoint only returns the three allowance meters.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LocalModelUsage {
+    pub model: String,
+    pub requests: u64,
+    pub tokens: u64,
+    pub cost: f64,
+    pub percent: f64,
+}
+
+/// One daily bucket for the mini bar strip (`YYYY-MM-DD` + tokens).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LocalDailyPoint {
+    pub day: String,
+    pub label: String,
+    pub tokens: u64,
+    pub cost: f64,
+}
+
+/// Device totals shown under the allowance card.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LocalUsageView {
+    pub total_tokens: u64,
+    pub total_requests: u64,
+    pub total_cost: f64,
+    pub by_model: Vec<LocalModelUsage>,
+    pub daily: Vec<LocalDailyPoint>,
+}
+
+fn short_model(model: &str) -> String {
+    let model = model.trim();
+    if model.is_empty() {
+        return "unknown".to_string();
+    }
+    // Keep the compact dashboard style: last segment after `/` or `:`.
+    let tail = model.rsplit('/').next().unwrap_or(model);
+    let tail = tail.split(':').next().unwrap_or(tail);
+    if tail.is_empty() {
+        model.to_string()
+    } else {
+        tail.to_string()
+    }
+}
+
+fn day_label(iso: &str) -> String {
+    // `2026-11-24T…` -> `11/24`; fall back to the raw prefix.
+    if iso.len() >= 10 && iso.as_bytes()[4] == b'-' && iso.as_bytes()[7] == b'-' {
+        format!("{}/{}", &iso[5..7], &iso[8..10])
+    } else {
+        iso.to_string()
+    }
+}
+
+/// Aggregate local `UsageCall`s into totals + per-model + last-14-day buckets.
+pub fn aggregate_local_calls(calls: &[crate::rune_transcript::UsageCall]) -> LocalUsageView {
+    use std::collections::BTreeMap;
+    let mut total_tokens = 0u64;
+    let mut total_cost = 0.0f64;
+    let mut per_model: BTreeMap<String, (u64, u64, f64)> = BTreeMap::new();
+    let mut per_day: BTreeMap<String, (u64, f64)> = BTreeMap::new();
+    for call in calls {
+        let tokens = call.input.saturating_add(call.output);
+        total_tokens = total_tokens.saturating_add(tokens);
+        total_cost += call.cost;
+        let name = short_model(&call.model);
+        let entry = per_model.entry(name).or_insert((0, 0, 0.0));
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = entry.1.saturating_add(tokens);
+        entry.2 += call.cost;
+        let day = call.at.get(..10).unwrap_or("").to_string();
+        if !day.is_empty() {
+            let day_entry = per_day.entry(day).or_insert((0, 0.0));
+            day_entry.0 = day_entry.0.saturating_add(tokens);
+            day_entry.1 += call.cost;
+        }
+    }
+    let total_requests = calls.len() as u64;
+    let mut by_model: Vec<LocalModelUsage> = per_model
+        .into_iter()
+        .map(|(model, (requests, tokens, cost))| LocalModelUsage {
+            percent: if total_tokens > 0 {
+                (tokens as f64 / total_tokens as f64 * 100.0).clamp(0.0, 100.0)
+            } else {
+                0.0
+            },
+            model,
+            requests,
+            tokens,
+            cost,
+        })
+        .collect();
+    by_model.sort_by_key(|entry| std::cmp::Reverse(entry.tokens));
+    by_model.truncate(6);
+    // Last 14 days, oldest first, for the mini bar strip.
+    let mut days: Vec<(String, (u64, f64))> = per_day.into_iter().collect();
+    days.sort_by(|a, b| a.0.cmp(&b.0));
+    let daily: Vec<LocalDailyPoint> = days
+        .into_iter()
+        .rev()
+        .take(14)
+        .rev()
+        .map(|(day, (tokens, cost))| LocalDailyPoint {
+            label: day_label(&day),
+            day,
+            tokens,
+            cost,
+        })
+        .collect();
+    LocalUsageView {
+        total_tokens,
+        total_requests,
+        total_cost,
+        by_model,
+        daily,
+    }
+}
+
+/// `6.930B` / `19,893` style compact formatting for the totals row.
+fn format_tokens(n: u64) -> String {
+    if n >= 1_000_000_000 {
+        format!("{:.3}B", n as f64 / 1_000_000_000.0)
+    } else if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else {
+        // Thousands grouping (`19,893`); matches the dashboard style.
+        let s = n.to_string();
+        let mut out = String::with_capacity(s.len() + 1);
+        for (i, ch) in s.chars().enumerate() {
+            if i > 0 && (s.len() - i).is_multiple_of(3) {
+                out.push(',');
+            }
+            out.push(ch);
+        }
+        out
+    }
+}
+
+fn format_cost(cost: f64) -> String {
+    if cost <= 0.0 {
+        "$0.00".to_string()
+    } else if cost < 0.01 {
+        "<$0.01".to_string()
+    } else {
+        format!("${cost:.2}")
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProviderKeyRow {
     pub id: String,
@@ -690,12 +839,12 @@ fn reset_label(window: &UsageWindow) -> String {
 }
 
 fn usage_color(percent: f64) -> rune::Color {
+    // Palette lock: dark / white / grey / green / red only.
+    // Rate-limited or nearly exhausted reads red, everything else green.
     if percent >= 85.0 {
         ink("#f87171")
-    } else if percent >= 60.0 {
-        ink("#fbbf24")
     } else {
-        ink("#818cf8")
+        ink("#6ee7b7")
     }
 }
 
@@ -755,15 +904,224 @@ fn usage_row(label: &str, window: &Option<UsageWindow>) -> El {
     out
 }
 
+fn totals_card(local: &LocalUsageView) -> El {
+    let cell = |key: &str, label: &str, value: String| {
+        col()
+            .key(format!("providerkeys-total-{key}"))
+            .grow(1.0)
+            .min_w(0.0)
+            .gap(1.0)
+            .px(10.0)
+            .py(8.0)
+            .radius(8.0)
+            .fill(ink("#ffffff05"))
+            .border(1.0, ink("#ffffff0d"))
+            .child(
+                text(label.to_string())
+                    .font(rune::tok::TextStyle::new(9.5, 500.0))
+                    .color(ink("#71717a")),
+            )
+            .child(
+                text(value)
+                    .font(rune::tok::TextStyle::new(14.0, 600.0).mono())
+                    .color(ink("#f4f4f5")),
+            )
+    };
+    row()
+        .key("providerkeys-totals")
+        .w_full()
+        .gap(8.0)
+        .child(cell("cost", "Cost", format_cost(local.total_cost)))
+        .child(cell(
+            "requests",
+            "Requests",
+            format_tokens(local.total_requests),
+        ))
+        .child(cell("tokens", "Tokens", format_tokens(local.total_tokens)))
+}
+
+fn daily_strip(local: &LocalUsageView) -> El {
+    let mut body = col()
+        .key("providerkeys-daily")
+        .w_full()
+        .gap(6.0)
+        .px(12.0)
+        .py(10.0)
+        .radius(10.0)
+        .fill(ink("#ffffff05"))
+        .border(1.0, ink("#ffffff0d"))
+        .child(
+            row()
+                .w_full()
+                .items_center()
+                .gap(8.0)
+                .child(
+                    text("Daily tokens".to_string())
+                        .grow(1.0)
+                        .font(rune::tok::TextStyle::new(10.5, 600.0))
+                        .color(ink("#e4e4e7")),
+                )
+                .child(
+                    text("last 14 days · this device".to_string())
+                        .font(rune::tok::TextStyle::new(9.0, 400.0))
+                        .color(ink("#71717a")),
+                ),
+        );
+    if local.daily.is_empty() {
+        body = body.child(
+            text("No local runs yet.".to_string())
+                .font(rune::tok::TextStyle::new(10.0, 400.0))
+                .color(ink("#71717a")),
+        );
+        return body;
+    }
+    let max = local
+        .daily
+        .iter()
+        .map(|day| day.tokens)
+        .max()
+        .unwrap_or(1)
+        .max(1) as f32;
+    let mut bars = row()
+        .key("providerkeys-daily-bars")
+        .w_full()
+        .items_end()
+        .gap(4.0)
+        .h(44.0);
+    for day in &local.daily {
+        let frac = (day.tokens as f32 / max).clamp(0.04, 1.0);
+        let h = (frac * 34.0).clamp(2.0, 34.0);
+        bars = bars.child(
+            col()
+                .grow(1.0)
+                .min_w(0.0)
+                .items_center()
+                .justify_end()
+                .gap(3.0)
+                .child(
+                    rune::el()
+                        .w_full()
+                        .h(h)
+                        .radius(2.0)
+                        .fill(ink(if day.tokens == 0 {
+                            "#ffffff10"
+                        } else {
+                            "#a1a1aa"
+                        })),
+                )
+                .child(
+                    text(day.label.clone())
+                        .font(rune::tok::TextStyle::new(7.5, 400.0))
+                        .color(ink("#52525b")),
+                ),
+        );
+    }
+    body.child(bars)
+}
+
+fn by_model_card(local: &LocalUsageView) -> El {
+    let mut body = col()
+        .key("providerkeys-models")
+        .w_full()
+        .gap(4.0)
+        .px(12.0)
+        .py(10.0)
+        .radius(10.0)
+        .fill(ink("#ffffff05"))
+        .border(1.0, ink("#ffffff0d"))
+        .child(
+            row()
+                .w_full()
+                .items_center()
+                .gap(8.0)
+                .child(
+                    text("Usage by Model".to_string())
+                        .grow(1.0)
+                        .font(rune::tok::TextStyle::new(10.5, 600.0))
+                        .color(ink("#e4e4e7")),
+                )
+                .child(
+                    text(format!(
+                        "{} {} · this device",
+                        local.by_model.len(),
+                        if local.by_model.len() == 1 {
+                            "model"
+                        } else {
+                            "models"
+                        }
+                    ))
+                    .font(rune::tok::TextStyle::new(9.0, 400.0))
+                    .color(ink("#71717a")),
+                ),
+        );
+    if local.by_model.is_empty() {
+        body = body.child(
+            text("No per-model data yet.".to_string())
+                .font(rune::tok::TextStyle::new(10.0, 400.0))
+                .color(ink("#71717a")),
+        );
+        return body;
+    }
+    for entry in &local.by_model {
+        let grow = entry.percent.clamp(0.0, 100.0).max(0.8) as f32;
+        let rest = (100.0 - entry.percent).clamp(0.0, 100.0).max(0.8) as f32;
+        body = body.child(
+            row()
+                .key(format!("providerkeys-model-{}", entry.model))
+                .w_full()
+                .items_center()
+                .gap(8.0)
+                .py(3.0)
+                .child(
+                    text(entry.model.clone())
+                        .w(150.0)
+                        .truncate()
+                        .font(rune::tok::TextStyle::new(10.5, 500.0).mono())
+                        .color(ink("#d4d4d8")),
+                )
+                .child(
+                    row()
+                        .grow(1.0)
+                        .h(4.0)
+                        .radius(2.0)
+                        .fill(ink("#ffffff10"))
+                        .child(
+                            rune::el()
+                                .grow(grow)
+                                .h(4.0)
+                                .fill(ink("#6ee7b7"))
+                                .radius(2.0),
+                        )
+                        .child(rune::el().grow(rest).h(4.0)),
+                )
+                .child(
+                    text(format!("{}%", entry.percent.round() as i64))
+                        .w(36.0)
+                        .font(rune::tok::TextStyle::new(10.0, 600.0).mono())
+                        .color(ink("#e4e4e7")),
+                )
+                .child(
+                    text(format_tokens(entry.tokens))
+                        .w(52.0)
+                        .font(rune::tok::TextStyle::new(10.0, 400.0).mono())
+                        .color(ink("#a1a1aa")),
+                ),
+        );
+    }
+    body
+}
+
 /// Provider sheet. `which` resolves close/actions to the owning thread.
+/// `local` is the aggregated device usage (totals + per-model + daily).
 pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
     state: &ProviderKeysState,
     which: crate::rune_transcript::Thread,
     width: f32,
     height: f32,
+    local: &LocalUsageView,
 ) -> El {
-    let card_w = 560.0_f32.min((width - 24.0).max(0.0));
-    let max_card_h = 640.0_f32.min((height - 36.0).max(0.0));
+    let card_w = 780.0_f32.min((width - 24.0).max(0.0));
+    let max_card_h = 720.0_f32.min((height - 36.0).max(0.0));
     // The sheet hugs its content (one key is a small panel) but grows for
     // the add form and extra keys, then scrolls at the window cap.
     let key_rows = state.keys.len().max(1) as f32;
@@ -776,11 +1134,20 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
         0.0
     };
     let issues_h = state.issues.len() as f32 * 14.0;
+    // One wide overlay: hero + allowance + totals + daily + models + keys.
+    let model_rows = local.by_model.len().max(1) as f32;
     let content_h = 62.0
         + 32.0
         + 34.0
         + 16.0
-        + 150.0
+        + 132.0
+        + 10.0
+        + 54.0
+        + 10.0
+        + 66.0
+        + 10.0
+        + 34.0
+        + model_rows * 26.0
         + 16.0
         + 40.0
         + key_rows * 62.0
@@ -789,7 +1156,7 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
         + form_h
         + notice_h
         + issues_h;
-    let card_h = content_h.min(max_card_h).max(360.0);
+    let card_h = content_h.min(max_card_h).max(420.0);
     let close = move |s: &mut S| {
         close_provider_keys(&mut s.thread_mut(which).provider_keys);
     };
@@ -832,7 +1199,7 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                     .child(
                         text("◎".to_string())
                             .font(rune::tok::TextStyle::new(17.0, 500.0))
-                            .color(ink("#c7d2fe")),
+                            .color(ink("#e4e4e7")),
                     ),
             )
             .child(
@@ -864,9 +1231,9 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                     .px(8.0)
                     .py(3.0)
                     .radius(999.0)
-                    .fill(ink(if has_key { "#6ee7b712" } else { "#fbbf2412" }))
-                    .border(1.0, ink(if has_key { "#6ee7b740" } else { "#fbbf244d" }))
-                    .color(ink(if has_key { "#6ee7b7" } else { "#fbbf24" })),
+                    .fill(ink(if has_key { "#6ee7b712" } else { "#ffffff0d" }))
+                    .border(1.0, ink(if has_key { "#6ee7b740" } else { "#ffffff1f" }))
+                    .color(ink(if has_key { "#6ee7b7" } else { "#a1a1aa" })),
             ),
     );
 
@@ -951,6 +1318,9 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
         );
     }
     body = body.child(usage_card);
+    body = body.child(totals_card(local));
+    body = body.child(daily_strip(local));
+    body = body.child(by_model_card(local));
 
     // Keys.
     let mut keys = col().key("providerkeys-keys").w_full().gap(8.0).child(
@@ -991,12 +1361,12 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                     "Add an API key"
                 })
                 .font(rune::tok::TextStyle::new(10.5, 600.0))
-                .color(ink("#c7d2fe"))
+                .color(ink("#e4e4e7"))
                 .px(9.0)
                 .py(5.0)
                 .radius(7.0)
-                .fill(ink("#6366f11f"))
-                .border(1.0, ink("#6366f14d"))
+                .fill(ink("#ffffff10"))
+                .border(1.0, ink("#ffffff1f"))
                 .on_press_tx_enter(move |s: &mut S, tx: &mut rune::Tx| {
                     let st = &mut s.thread_mut(which).provider_keys;
                     st.add_open = !st.add_open;
@@ -1086,8 +1456,9 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                     .px(6.0)
                     .py(2.0)
                     .radius(999.0)
-                    .fill(ink("#6366f11f"))
-                    .color(ink("#c7d2fe")),
+                    .fill(ink("#6ee7b71f"))
+                    .border(1.0, ink("#6ee7b740"))
+                    .color(ink("#6ee7b7")),
             );
         }
         if row_source == "managed" {
@@ -1273,11 +1644,11 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                             .focusable(true)
                             .label("Save this API key and make it active")
                             .font(rune::tok::TextStyle::new(10.5, 600.0))
-                            .color(ink("#ffffff"))
+                            .color(ink("#09090b"))
                             .px(10.0)
                             .py(5.0)
                             .radius(7.0)
-                            .fill(ink("#6366f1"))
+                            .fill(ink("#f4f4f5"))
                             .on_press_enter(move |s: &mut S| {
                                 save_provider_key(&mut s.thread_mut(which).provider_keys);
                             }),
@@ -1300,7 +1671,7 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                 .w_full()
                 .wrap()
                 .font(rune::tok::TextStyle::new(9.5, 400.0).mono())
-                .color(ink("#fbbf24")),
+                .color(ink("#a1a1aa")),
         );
     }
     if let Some(error) = &state.error {
@@ -1603,5 +1974,95 @@ mod tests {
             rt.frame(1.0 / 60.0);
         }
         assert!(rt.find("providerkeys-add-form").is_some());
+    }
+
+    #[test]
+    fn local_usage_aggregates_totals_and_models() {
+        use crate::rune_transcript::UsageCall;
+        let calls = vec![
+            UsageCall {
+                agent: "chat".to_string(),
+                model: "opencode/deepseek-v4.1-flash".to_string(),
+                input: 1_000,
+                output: 500,
+                hits: 0,
+                misses: 0,
+                cost: 0.02,
+                at: "2026-11-20T10:00:00Z".to_string(),
+            },
+            UsageCall {
+                agent: "chat".to_string(),
+                model: "muse-spark-1.3-contributor".to_string(),
+                input: 2_000,
+                output: 1_000,
+                hits: 0,
+                misses: 0,
+                cost: 0.01,
+                at: "2026-11-21T10:00:00Z".to_string(),
+            },
+            UsageCall {
+                agent: "chat".to_string(),
+                model: "opencode/deepseek-v4.1-flash".to_string(),
+                input: 500,
+                output: 500,
+                hits: 0,
+                misses: 0,
+                cost: 0.0,
+                at: "2026-11-21T12:00:00Z".to_string(),
+            },
+        ];
+        let local = aggregate_local_calls(&calls);
+        assert_eq!(local.total_requests, 3);
+        assert_eq!(local.total_tokens, 5_500);
+        assert_eq!(local.by_model.len(), 2);
+        assert_eq!(local.by_model[0].model, "muse-spark-1.3-contributor");
+        assert!(local.by_model[0].percent > 50.0);
+        assert_eq!(local.daily.len(), 2);
+        assert_eq!(format_tokens(19_893), "19,893");
+        assert_eq!(format_cost(0.0), "$0.00");
+    }
+
+    #[test]
+    fn sheet_mounts_totals_daily_and_models() {
+        use rune::{Env, Runtime};
+        let mut init = crate::rune_transcript::RuneTranscriptState::screenshot();
+        init.live = false;
+        init.provider_keys.open = true;
+        init.provider_keys.provider = "opencode".to_string();
+        init.provider_keys.label = "OpenCode Go".to_string();
+        init.provider_keys.active = "env".to_string();
+        init.provider_keys.has_key = true;
+        init.provider_keys.keys = vec![ProviderKeyRow {
+            id: "env".to_string(),
+            label: "Environment (.env)".to_string(),
+            masked: "oc_…a1b2".to_string(),
+            source: "env".to_string(),
+            active: true,
+        }];
+        init.usage.calls = vec![crate::rune_transcript::UsageCall {
+            agent: "chat".to_string(),
+            model: "deepseek-v4.1-flash".to_string(),
+            input: 100,
+            output: 50,
+            hits: 0,
+            misses: 0,
+            cost: 0.01,
+            at: "2026-11-24T10:00:00Z".to_string(),
+        }];
+        let mut rt = Runtime::new(
+            init,
+            crate::rune_transcript::transcript_view,
+            (1000.0, 800.0),
+            Env::new(true, 1.0),
+        );
+        rt.frame(0.0);
+        for key in [
+            "providerkeys-totals",
+            "providerkeys-daily",
+            "providerkeys-models",
+            "providerkeys-model-deepseek-v4.1-flash",
+        ] {
+            assert!(rt.find(key).is_some(), "{key} mounted");
+        }
     }
 }

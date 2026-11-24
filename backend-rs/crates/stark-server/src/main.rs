@@ -4294,14 +4294,38 @@ fn parse_opencode_usage(value: &Value) -> Value {
     let weekly = usage_window(usage.get("weekly"));
     let monthly = usage_window(usage.get("monthly"));
     if rolling.is_null() && weekly.is_null() && monthly.is_null() {
-        Value::Null
-    } else {
-        json!({
-            "rolling": rolling,
-            "weekly": weekly,
-            "monthly": monthly,
-        })
+        return Value::Null;
     }
+    let mut out = json!({
+        "rolling": rolling,
+        "weekly": weekly,
+        "monthly": monthly,
+    });
+    // The documented `/usage` endpoint only returns the three meters, but
+    // pass through any dashboard-style fields if the gateway ever returns
+    // them so the desktop can render totals without a backend change.
+    if let Some(object) = out.as_object_mut() {
+        for key in [
+            "cost",
+            "requests",
+            "tokens",
+            "total_cost",
+            "total_requests",
+            "total_tokens",
+            "daily",
+            "daily_cost",
+            "by_model",
+            "models",
+            "breakdown",
+            "details",
+            "allowance",
+        ] {
+            if let Some(extra) = usage.get(key) {
+                object.insert(key.to_string(), extra.clone());
+            }
+        }
+    }
+    out
 }
 
 async fn fetch_opencode_usage(base_url: &str, api_key: &str) -> Result<Value, String> {
@@ -7099,6 +7123,25 @@ mod tests {
         assert_eq!(usage["monthly"]["status"], "rate-limited");
         assert!(parse_opencode_usage(&json!({})).is_null());
         assert!(parse_opencode_usage(&json!({"usage": {}})).is_null());
+    }
+
+    #[test]
+    fn usage_passthrough_keeps_dashboard_fields_when_present() {
+        let value = json!({
+            "usage": {
+                "rolling": {"status": "ok", "percent": 1, "resetsAt": "2099-01-01T00:00:00Z"},
+                "weekly": {"status": "ok", "percent": 2, "resetsAt": "2099-01-02T00:00:00Z"},
+                "monthly": {"status": "ok", "percent": 3, "resetsAt": "2099-01-03T00:00:00Z"},
+                "tokens": 6930000000u64,
+                "requests": 19893u64,
+                "by_model": [{"model": "deepseek-v4.1-flash", "tokens": 100}]
+            }
+        });
+        let usage = parse_opencode_usage(&value);
+        assert_eq!(usage["rolling"]["percent"], 1.0);
+        assert_eq!(usage["tokens"], 6930000000u64);
+        assert_eq!(usage["requests"], 19893u64);
+        assert_eq!(usage["by_model"][0]["model"], "deepseek-v4.1-flash");
     }
 
     async fn group_provider_response(

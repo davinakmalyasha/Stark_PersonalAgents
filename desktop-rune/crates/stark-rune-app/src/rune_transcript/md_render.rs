@@ -38,17 +38,17 @@ fn rgba(r: f32, g: f32, b: f32, a: f32) -> rune::Color {
 fn syntax_theme() -> rune_kit::syntax::SyntaxTheme {
     use rune_kit::syntax::{Syntax, SyntaxTheme};
     SyntaxTheme::neutral(true)
-        .with(Syntax::Keyword, ink("#c678dd"))
+        .with(Syntax::Keyword, ink("#a1a1aa"))
         .with(Syntax::String, ink("#98c379"))
-        .with(Syntax::Number, ink("#d19a66"))
+        .with(Syntax::Number, ink("#a1a1aa"))
         .with(Syntax::Comment, ink("#5c6370"))
-        .with(Syntax::Type, ink("#d19a66"))
-        .with(Syntax::Function, ink("#61afef"))
+        .with(Syntax::Type, ink("#a1a1aa"))
+        .with(Syntax::Function, ink("#a1a1aa"))
         .with(Syntax::Property, ink("#e06c75"))
-        .with(Syntax::Punctuation, ink("#abb2bf"))
+        .with(Syntax::Punctuation, ink("#a1a1aa"))
         .with(Syntax::Inserted, ink("#98c379"))
         .with(Syntax::Deleted, ink("#e06c75"))
-        .with(Syntax::Parameter, ink("#abb2bf"))
+        .with(Syntax::Parameter, ink("#a1a1aa"))
 }
 
 /// Inline runs flattened to `rich` text + spans + link/strike maps.
@@ -95,7 +95,7 @@ fn inline_code_span(start: usize, end: usize) -> (rune::Span, rune::TextHighligh
         rune::Span::new(start, end)
             .mono()
             .size(INLINE_CODE_SIZE)
-            .color(ink("#a5b4fc")),
+            .color(ink("#a1a1aa")),
         rune::TextHighlight::new(start..end, rgba(39.0, 39.0, 42.0, 0.8))
             .ring(rgba(63.0, 63.0, 70.0, 0.5), 1.0)
             .pad(6.0),
@@ -153,7 +153,7 @@ fn inlines(runs: &mut Runs, list: &[stark_kit::markdown::Inline], italic: bool) 
                 let at = runs.spans.len();
                 runs.spans.push(
                     rune::Span::new(start, start)
-                        .color(ink("#60a5fa"))
+                        .color(ink("#a1a1aa"))
                         .underline(rgba(59.0, 130.0, 246.0, 0.4)),
                 );
                 inlines(runs, text, italic);
@@ -163,8 +163,8 @@ fn inlines(runs: &mut Runs, list: &[stark_kit::markdown::Inline], italic: bool) 
                     runs.links.push(
                         rune::Link::new(start..runs.text.len(), href.clone()).hover(
                             rune::LinkPaint::new()
-                                .color(ink("#93c5fd"))
-                                .underline(ink("#60a5fa")),
+                                .color(ink("#a1a1aa"))
+                                .underline(ink("#a1a1aa")),
                         ),
                     );
                 } else {
@@ -985,7 +985,7 @@ fn code_block<S: TranscriptHost + 'static>(
     // sixteenth line for it.
     let code = code.strip_suffix('\n').unwrap_or(code);
     let base = if highlighted {
-        ink("#abb2bf")
+        ink("#a1a1aa")
     } else {
         ink("#d4d4d8")
     };
@@ -1411,9 +1411,9 @@ fn diff<S: TranscriptHost + 'static>(s: &S, which: Thread, key: &str, raw: &str)
                 .child(rune::el().size(13.0, 13.0).inert().shape(icon_chevron(
                     !expanded,
                     13.0,
-                    ink("#818cf8"),
+                    ink("#6ee7b7"),
                 )))
-                .child(text(label).font(label_style).color(ink("#818cf8")))
+                .child(text(label).font(label_style).color(ink("#6ee7b7")))
                 .on_press_enter(move |s: &mut S| {
                     let t = s.thread_mut(which);
                     let expanded = &mut t.expanded_diffs;

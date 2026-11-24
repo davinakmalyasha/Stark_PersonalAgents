@@ -337,7 +337,7 @@ fn header<S: ProjectsHost + 'static>(
                 .font(crate::motion::tabular(rune::tok::TextStyle::new(
                     10.5, 650.0,
                 )))
-                .color(ink("#fbbf24")),
+                .color(ink("#a1a1aa")),
         );
     }
 

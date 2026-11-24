@@ -1956,7 +1956,7 @@ fn project_card_view<S: CanvasHost + 'static>(card: &MapCard, active: bool) -> E
         ink("#ffffff4d")
     } else if waiting {
         // `.canvas-card.is-waiting`: amber border.
-        ink("#fcd34d42")
+        ink("#a1a1aa42")
     } else {
         ink("#ffffff16")
     };
@@ -2117,7 +2117,7 @@ fn project_card_view<S: CanvasHost + 'static>(card: &MapCard, active: bool) -> E
             .key(format!("{id}-waiting"))
             .px(14.0)
             .font(rune::tok::TextStyle::new(10.0, 600.0))
-            .color(ink("#fcd34d")),
+            .color(ink("#a1a1aa")),
         )
         .child(
             rune::el()
@@ -4231,7 +4231,7 @@ fn sidebar_actions<S: CanvasHost + 'static>(
     let mut cloud_icon = action_icon(
         12.0,
         if running {
-            crate::icons::cloud(12.0, ink("#7dd3fc"))
+            crate::icons::cloud(12.0, ink("#e4e4e7"))
         } else {
             crate::icons::cloud_off(12.0, ink("#71717a"))
         },
@@ -4608,7 +4608,7 @@ fn sidebar_thread<S: CanvasHost + 'static>(
                     .size(12.0, 12.0)
                     .inert()
                     .shape(if spawned {
-                        bot_icon(12.0, ink("#c4b5fd"))
+                        bot_icon(12.0, ink("#a1a1aa"))
                     } else if chat.workspace_kind == "general" {
                         chat_row_icon(12.0, ink("#52525b"))
                     } else {

@@ -3796,7 +3796,7 @@ fn home_agent_row<S: TranscriptHost + 'static>(
                 text("▍".to_string())
                     .key(format!("{}-caret", r.key))
                     .font(home_body_style())
-                    .color(home_ink("#a78bfa"))
+                    .color(home_ink("#a1a1aa"))
                     .ml(1.0)
                     .looping(rune::LoopSpec::cycle(crate::motion::CARET)),
             );
@@ -4014,7 +4014,7 @@ fn artifact_status_icon(status: crate::chats::ArtifactStatus, size: f32) -> El {
         crate::chats::ArtifactStatus::Modified => rune::el()
             .size(size, size)
             .inert()
-            .shape(crate::icons::pencil(size, home_ink("#c4ad78"))),
+            .shape(crate::icons::pencil(size, home_ink("#a1a1aa"))),
     }
 }
 
@@ -4877,7 +4877,7 @@ fn home_session_event<S: TranscriptHost + 'static>(
         )
     };
     let icon = if aborted {
-        home_icon_square(10.0, home_ink("#fcd34d"))
+        home_icon_square(10.0, home_ink("#a1a1aa"))
     } else {
         home_icon_archive(11.0, home_ink("#8b8b94"))
     };
@@ -6024,11 +6024,13 @@ fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'sta
         }
         if s.provider_keys.open {
             let (w, h) = transcript_window();
+            let local = super::provider_keys::aggregate_local_calls(&s.usage.calls);
             root = root.child(super::provider_keys::provider_keys_sheet::<S>(
                 &s.provider_keys,
                 which,
                 w,
                 h,
+                &local,
             ));
         }
         if let Some(file) = s.attachment_preview.clone() {
@@ -6131,7 +6133,7 @@ pub fn voice_overlay<S: TranscriptHost + 'static>(s: &RuneTranscriptState, which
                 .h(if on { 26.0 } else { 10.0 })
                 .radius(3.0)
                 .fill(if on {
-                    ink("#aa8dff")
+                    ink("#e4e4e7")
                 } else {
                     home_rgba(255.0, 255.0, 255.0, 0.10)
                 }),
@@ -6211,7 +6213,7 @@ pub fn voice_overlay<S: TranscriptHost + 'static>(s: &RuneTranscriptState, which
                         .key("voice-text")
                         .w_full()
                         .font(rune::tok::TextStyle::new(12.5, 400.0))
-                        .color(if live { ink("#e4e4e7") } else { ink("#d39ba4") }),
+                        .color(if live { ink("#e4e4e7") } else { ink("#a1a1aa") }),
                 )
                 .child(
                     text(if live {

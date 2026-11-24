@@ -771,20 +771,20 @@ pub fn agent_config_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                         .fill(ink(if entry.eff_has_key {
                             "#6ee7b712"
                         } else {
-                            "#fbbf2412"
+                            "#a1a1aa12"
                         }))
                         .border(
                             1.0,
                             ink(if entry.eff_has_key {
                                 "#6ee7b740"
                             } else {
-                                "#fbbf244d"
+                                "#a1a1aa4d"
                             }),
                         )
                         .color(ink(if entry.eff_has_key {
                             "#6ee7b7"
                         } else {
-                            "#fbbf24"
+                            "#a1a1aa"
                         })),
                     ),
             )
@@ -992,8 +992,8 @@ pub fn agent_config_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                 .w_full()
                 .gap(4.0)
                 .radius(8.0)
-                .fill(ink("#fbbf240a"))
-                .border(1.0, ink("#fbbf2433"))
+                .fill(ink("#a1a1aa0a"))
+                .border(1.0, ink("#a1a1aa33"))
                 .px(12.0)
                 .py(8.0);
             for (i, issue) in s.issues.iter().enumerate() {
@@ -1001,7 +1001,7 @@ pub fn agent_config_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                     text(issue.clone())
                         .key(format!("agentcfg-issue-{i}"))
                         .font(rune::tok::TextStyle::new(10.5, 400.0))
-                        .color(ink("#fcd34d")),
+                        .color(ink("#a1a1aa")),
                 );
             }
             main = main.child(notes);
@@ -1101,7 +1101,7 @@ pub fn agent_config_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                         .px(14.0)
                         .py(6.0)
                         .radius(8.0)
-                        .fill(ink("#6366f1"))
+                        .fill(ink("#a1a1aa"))
                         .color(ink("#ffffff"))
                         .on_press_enter(move |s: &mut S| {
                             save_agent_config(&mut s.thread_mut(which).agent_config);

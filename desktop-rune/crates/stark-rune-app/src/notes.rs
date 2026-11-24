@@ -428,7 +428,7 @@ pub fn notes_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
             .gap(6.0)
             .radius(12.0)
             .fill(ink("#151311"))
-            .border(1.0, ink("#fbbf2433"))
+            .border(1.0, ink("#a1a1aa33"))
             .px(12.0)
             .py(10.0)
             .child(
@@ -590,7 +590,7 @@ pub fn notes_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                 .gap(8.0)
                 .radius(12.0)
                 .fill(ink("#151311"))
-                .border(1.0, ink("#fbbf2440"))
+                .border(1.0, ink("#a1a1aa40"))
                 .px(12.0)
                 .py(10.0)
                 .child(
@@ -645,7 +645,7 @@ pub fn notes_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                                 .px(10.0)
                                 .py(6.0)
                                 .radius(8.0)
-                                .fill(ink("#fbbf24"))
+                                .fill(ink("#a1a1aa"))
                                 .color(ink("#0a0a0d"))
                                 .on_press_enter(move |s: &mut S| {
                                     let notes = &mut s.thread_mut(which).notes;

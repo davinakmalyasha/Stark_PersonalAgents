@@ -1050,7 +1050,7 @@ pub fn settings_sheet<S: SettingsHost + 'static>(s: &SettingsState, width: f32, 
                                         .mt(6.0)
                                         .font(text_style(11.0, 400.0))
                                         .color(ink(if s.update.phase == UpdatePhase::Error {
-                                            "#fcd34d"
+                                            "#f87171"
                                         } else {
                                             "#a1a1aa"
                                         }))

@@ -262,7 +262,7 @@ fn voice_button<S: 'static>(
         .center()
         .on_press_enter(on_voice);
     if live {
-        // `.voice-live-dot`: a 5 pt white dot with a 2 pt `#8a6fe9` ring,
+        // `.voice-live-dot`: a 5 pt white dot with a 2 pt `#a1a1aa` ring,
         // top-right. `voice-breathe` scales and fades both over 1.2 s; the
         // shell publishes the two Live tracks from the keyframe clock.
         let scale = voice.breathe_scale;
@@ -270,7 +270,7 @@ fn voice_button<S: 'static>(
         button = button
             .linear_gradient(
                 135.0 * std::f32::consts::PI / 180.0,
-                [(0.0, ink("#7860d9")), (1.0, ink("#aa8dff"))],
+                [(0.0, ink("#a1a1aa")), (1.0, ink("#e4e4e7"))],
             )
             .child(
                 rune::el()
@@ -278,7 +278,7 @@ fn voice_button<S: 'static>(
                     .pin(None, Some(2.0), Some(2.0), None)
                     .size(9.0, 9.0)
                     .radius(4.5)
-                    .fill(ink("#8a6fe9"))
+                    .fill(ink("#a1a1aa"))
                     .live_scale(scale)
                     .live_opacity(opacity)
                     .center()
@@ -370,7 +370,7 @@ fn target_toggle<S: 'static>(
         .inert()
         .shape(cloud_icon(
             !cloud_active,
-            ink(if cloud_active { "#7dd3fc" } else { "#71717a" }),
+            ink(if cloud_active { "#e4e4e7" } else { "#71717a" }),
         ));
     if cloud_active {
         // The reference UI pulses the cloud icon (`animate-pulse`); same rhythm here.
@@ -414,7 +414,7 @@ fn target_toggle<S: 'static>(
                 .py(6.0)
                 .radius(6.0)
                 .fill(ink(if cloud_active {
-                    "#0c4a6e66"
+                    "#a1a1aa66"
                 } else {
                     "#00000000"
                 }))
@@ -428,7 +428,7 @@ fn target_toggle<S: 'static>(
                             style.line_height = 16.5;
                             style
                         })
-                        .color(ink(if cloud_active { "#7dd3fc" } else { "#71717a" }));
+                        .color(ink(if cloud_active { "#e4e4e7" } else { "#71717a" }));
                     if !cloud_active {
                         label = label.group_color(ink("#d4d4d8"));
                     }
@@ -489,14 +489,14 @@ fn usage_orb<S: 'static>(
     let ring_ink = if pct >= 95.0 {
         "#f87171"
     } else if pct >= 85.0 {
-        "#fbbf24"
+        "#a1a1aa"
     } else {
         "#e5e5e8"
     };
     let number_ink = if pct >= 95.0 {
         "#f87171"
     } else if pct >= 85.0 {
-        "#fbbf24"
+        "#a1a1aa"
     } else {
         "#dadade"
     };
@@ -712,7 +712,7 @@ fn provider_pill<S: 'static>(
                 style.line_height = 11.0;
                 style
             })
-            .color(ink(if warn { "#fbbf24" } else { "#c9c9d1" }))
+            .color(ink(if warn { "#a1a1aa" } else { "#c9c9d1" }))
             .group_color(ink("#ededf1")),
         )
 }
@@ -859,7 +859,7 @@ fn model_row<S: 'static>(id: &str, name: &str, selected: bool, pick: Pick<S>) ->
         .py(6.0)
         .radius(6.0)
         .fill(if selected {
-            ink("#9577ff24")
+            ink("#a1a1aa24")
         } else {
             ink("#00000000")
         })
@@ -869,22 +869,22 @@ fn model_row<S: 'static>(id: &str, name: &str, selected: bool, pick: Pick<S>) ->
         .focus_selected(selected)
         // `.model-menu button:hover` is the same violet wash as `.selected`;
         // one highlight serves pointer and arrow keys, as NSMenu does.
-        .focus_highlight(ink("#9577ff24"));
+        .focus_highlight(ink("#a1a1aa24"));
     if !selected {
-        el = el.hover(ink("#9577ff24")).hover_group();
+        el = el.hover(ink("#a1a1aa24")).hover_group();
     }
     el.on_press(move |s: &mut S| pick(s, target.clone()))
         .child(
             text(name.to_string())
                 .grow(1.0)
                 .font(rune::tok::TextStyle::new(11.0, 400.0))
-                .color(ink(if selected { "#e5ddff" } else { "#d4d4d8" }))
-                .group_color(ink("#e5ddff")),
+                .color(ink(if selected { "#f4f4f5" } else { "#d4d4d8" }))
+                .group_color(ink("#f4f4f5")),
         )
         .child(
             text(if selected { "✓" } else { "" }.to_string())
                 .font(rune::tok::TextStyle::new(11.0, 600.0))
-                .color(ink("#e5ddff")),
+                .color(ink("#f4f4f5")),
         )
 }
 
@@ -1050,7 +1050,7 @@ pub fn composer_card<S: 'static>(
         }
     } else if voice_live {
         // `.premium-surface.is-listening`: violet .58 wins over hover.
-        ink("#977fff94")
+        ink("#a1a1aa94")
     } else {
         // `.premium-surface` rests at white .08; hover lifts to .14.
         rune::Color {
@@ -1110,7 +1110,7 @@ pub fn composer_card<S: 'static>(
                 y: 0.0,
                 blur: 0.0,
                 spread: 1.0,
-                color: ink("#977fff1f"),
+                color: ink("#a1a1aa1f"),
                 inset: false,
             })
             .box_shadow(rune::Shadow {
@@ -1118,7 +1118,7 @@ pub fn composer_card<S: 'static>(
                 y: 0.0,
                 blur: 34.0,
                 spread: 0.0,
-                color: ink("#7a5cff24"),
+                color: ink("#a1a1aa24"),
                 inset: false,
             })
             .shadow(
@@ -1218,7 +1218,7 @@ pub fn composer_card<S: 'static>(
                 .px(16.0)
                 .pb(8.0)
                 .font(rune::tok::TextStyle::new(11.0, 400.0))
-                .color(ink("#fcd34de6")),
+                .color(ink("#a1a1aae6")),
         );
     }
     card = card.child(

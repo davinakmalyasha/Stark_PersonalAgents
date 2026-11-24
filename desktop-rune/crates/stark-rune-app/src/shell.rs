@@ -117,29 +117,43 @@ fn icon_home(size: f32, color: rune::Color) -> Shape {
     icon_shape(p, size, color)
 }
 
-fn icon_folder(size: f32, color: rune::Color) -> Shape {
-    // Lucide v1.17 `folder-kanban`: tabbed folder + three kanban ticks.
-    let p = Path::new()
-        .move_to([4.0, 20.0])
-        .line_to([20.0, 20.0])
-        .cubic_to([21.1, 20.0], [22.0, 19.1], [22.0, 18.0])
-        .line_to([22.0, 8.0])
-        .cubic_to([22.0, 6.9], [21.1, 6.0], [20.0, 6.0])
-        .line_to([12.07, 6.0])
-        .cubic_to([11.4, 6.0], [10.78, 5.66], [10.41, 5.1])
-        .line_to([9.59, 3.9])
-        .cubic_to([9.22, 3.34], [8.6, 3.0], [7.93, 3.0])
-        .line_to([4.0, 3.0])
-        .cubic_to([2.9, 3.0], [2.0, 3.9], [2.0, 5.0])
-        .line_to([2.0, 18.0])
-        .cubic_to([2.0, 19.1], [2.9, 20.0], [4.0, 20.0])
-        .close()
-        .move_to([8.0, 10.0])
-        .line_to([8.0, 14.0])
-        .move_to([12.0, 10.0])
-        .line_to([12.0, 12.0])
-        .move_to([16.0, 10.0])
-        .line_to([16.0, 16.0]);
+fn icon_group(size: f32, color: rune::Color) -> Shape {
+    // Three side-by-side agents: middle bust higher/taller than left/right.
+    // Each bust = head circle + shoulder arc, stroked like Lucide.
+    let mut p = Path::new();
+    // Left head.
+    p = p.move_to([6.2, 10.4]);
+    p = p.cubic_to([6.2, 9.2], [5.2, 8.2], [4.0, 8.2]);
+    p = p.cubic_to([2.8, 8.2], [1.8, 9.2], [1.8, 10.4]);
+    p = p.cubic_to([1.8, 11.6], [2.8, 12.6], [4.0, 12.6]);
+    p = p.cubic_to([5.2, 12.6], [6.2, 11.6], [6.2, 10.4]);
+    p = p.close();
+    // Left shoulders.
+    p = p.move_to([0.8, 19.0]);
+    p = p.cubic_to([0.8, 16.2], [2.1, 14.4], [4.0, 14.4]);
+    p = p.cubic_to([5.9, 14.4], [7.2, 16.2], [7.2, 19.0]);
+    // Right head.
+    p = p.move_to([22.2, 10.4]);
+    p = p.cubic_to([22.2, 9.2], [21.2, 8.2], [20.0, 8.2]);
+    p = p.cubic_to([18.8, 8.2], [17.8, 9.2], [17.8, 10.4]);
+    p = p.cubic_to([17.8, 11.6], [18.8, 12.6], [20.0, 12.6]);
+    p = p.cubic_to([21.2, 12.6], [22.2, 11.6], [22.2, 10.4]);
+    p = p.close();
+    // Right shoulders.
+    p = p.move_to([16.8, 19.0]);
+    p = p.cubic_to([16.8, 16.2], [18.1, 14.4], [20.0, 14.4]);
+    p = p.cubic_to([21.9, 14.4], [23.2, 16.2], [23.2, 19.0]);
+    // Middle head (higher, larger).
+    p = p.move_to([14.8, 7.6]);
+    p = p.cubic_to([14.8, 6.0], [13.6, 4.8], [12.0, 4.8]);
+    p = p.cubic_to([10.4, 4.8], [9.2, 6.0], [9.2, 7.6]);
+    p = p.cubic_to([9.2, 9.2], [10.4, 10.4], [12.0, 10.4]);
+    p = p.cubic_to([13.6, 10.4], [14.8, 9.2], [14.8, 7.6]);
+    p = p.close();
+    // Middle shoulders (taller).
+    p = p.move_to([8.0, 19.0]);
+    p = p.cubic_to([8.0, 15.2], [9.7, 12.6], [12.0, 12.6]);
+    p = p.cubic_to([14.3, 12.6], [16.0, 15.2], [16.0, 19.0]);
     icon_shape(p, size, color)
 }
 
@@ -212,7 +226,7 @@ fn icon_settings(size: f32, color: rune::Color) -> Shape {
 fn rail_icon(tab: RailTab, size: f32, color: rune::Color) -> Shape {
     match tab {
         RailTab::Chats => icon_home(size, color),
-        RailTab::Group => icon_folder(size, color),
+        RailTab::Group => icon_group(size, color),
         RailTab::Cloud => icon_cloud(size, color),
         // Not in the reference UI's rail (single-page: chats, projects, cloud only);
         // mapped for completeness if a panel reuses the helper.
@@ -1055,11 +1069,20 @@ fn active_chat_sheets(s: &ShellState) -> Vec<El> {
     }
     if t.provider_keys.open {
         let (w, h) = unsafe { (WINDOW_W, WINDOW_H) };
+        // Device totals: main + personal + every open session thread.
+        let mut calls: Vec<crate::rune_transcript::UsageCall> = Vec::new();
+        calls.extend(s.transcript.usage.calls.iter().cloned());
+        calls.extend(s.personal.usage.calls.iter().cloned());
+        for thread in s.canvas.sessions.threads.values() {
+            calls.extend(thread.usage.calls.iter().cloned());
+        }
+        let local = crate::provider_keys::aggregate_local_calls(&calls);
         sheets.push(crate::provider_keys::provider_keys_sheet::<ShellState>(
             &t.provider_keys,
             Thread::Open,
             w,
             h,
+            &local,
         ));
     }
     if let Some(file) = t.attachment_preview.clone() {
@@ -1083,16 +1106,6 @@ fn active_chat_sheets(s: &ShellState) -> Vec<El> {
 /// Lucide `Menu` for the titlebar's navigation toggle.
 fn icon_menu(size: f32, color: rune::Color) -> Shape {
     crate::icons::lucide(&["M4 6h16", "M4 12h16", "M4 18h16"], size, 2.0, color)
-}
-
-/// Lucide `Search` for the titlebar's chat search shortcut.
-fn icon_search(size: f32, color: rune::Color) -> Shape {
-    crate::icons::lucide(
-        &["m21 21-4.34-4.34", "M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16z"],
-        size,
-        2.0,
-        color,
-    )
 }
 
 /// A 30-point ghost control in the titlebar. Its press handler is attached by
@@ -1205,30 +1218,13 @@ fn shell_topbar(s: &ShellState, cx: &mut Cx<ShellState>, w: f32) -> El {
                 s.nav_open = !s.nav_open;
             }
         });
-    let search = topbar_control(
-        "topbar-search",
-        "Search chats",
-        icon_search(15.0, ink("#a1a1aa")),
-    )
-    .on_press_enter(move |s: &mut ShellState| {
-        s.canvas.rail = RailTab::Chats;
-        if folded {
-            s.mobile_panel_open = true;
-        } else {
-            s.nav_open = true;
-        }
-        let caret = s.canvas.sessions.search.text.len();
-        s.canvas.sessions.search.anchor = caret;
-        s.canvas.sessions.search.focus = caret;
-        s.canvas.sessions.search.focused = true;
-    });
 
     // Give tabs equal shares of the visible strip, like the reference UI:
     // 210pt with room, shrinking to 96pt before the strip scrolls.
     let tabs_n = s.canvas.sessions.order.len();
-    // Menu + search + `+`, both outer gutters and the three gaps; the rest is
+    // Menu + `+`, both outer gutters and the two gaps; the rest is
     // the tab strip. The caption reservation is part of the trailing gutter.
-    let fixed = 8.0 + 6.0 + chrome.trailing + 30.0 * 3.0 + TAB_GAP * 3.0;
+    let fixed = 8.0 + 6.0 + chrome.trailing + 30.0 * 2.0 + TAB_GAP * 2.0;
     let strip_w = (w - chrome.leading - fixed).max(120.0);
     let tab_w = if tabs_n == 0 {
         210.0
@@ -1281,7 +1277,6 @@ fn shell_topbar(s: &ShellState, cx: &mut Cx<ShellState>, w: f32) -> El {
         .instant_changes()
         .window_drag()
         .child(menu)
-        .child(search)
         .child(tabs)
         .child(new_session_button())
 }
@@ -1317,30 +1312,30 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
         .border_layout()
         .child(
             rune::el()
-                .key("rail-new")
+                .key("rail-menu")
                 .role("button")
                 .focusable(true)
-                .label("New chat")
-                .help("New chat")
+                .label("Toggle sidebar")
+                .help("Toggle sidebar")
                 .size(36.0, 36.0)
                 .radius(12.0)
                 .center()
                 .hover(rgba(1.0, 1.0, 1.0, 0.07))
                 .hover_group()
                 .on_press_enter(move |s: &mut ShellState| {
-                    s.canvas.new_session();
+                    s.nav_open = !s.nav_open;
                 })
                 .press_scale(0.94)
                 .child(
                     rune::el()
-                        .key("rail-new-icon")
+                        .key("rail-menu-icon")
                         .size(17.0, 17.0)
                         .inert()
                         .child(
                             rune::el()
                                 .size(17.0, 17.0)
                                 .inert()
-                                .shape(icon_new_chat(17.0, ink("#71717a"))),
+                                .shape(icon_menu(17.0, ink("#71717a"))),
                         )
                         .child(
                             rune::el()
@@ -1348,7 +1343,7 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
                                 .absolute(0.0, 0.0)
                                 .inert()
                                 .group_opacity(0.0, 1.0)
-                                .shape(icon_new_chat(17.0, ink("#e4e4e7"))),
+                                .shape(icon_menu(17.0, ink("#e4e4e7"))),
                         ),
                 ),
         )
@@ -1666,7 +1661,7 @@ fn update_toast(s: &ShellState, w: f32, h: f32, bottom_inset: f32) -> Option<El>
         return None;
     }
     let tone = match update.phase {
-        UpdatePhase::Error => "#fcd34d",
+        UpdatePhase::Error => "#f87171",
         UpdatePhase::UpToDate => "#a1a1aa",
         _ => "#e4e4e7",
     };
@@ -1825,22 +1820,17 @@ fn pairing_gate(s: &ShellState, w: f32, h: f32) -> El {
         .size(46.0, 46.0)
         .radius(10.0)
         .center()
-        .fill(if can_submit {
-            ink("#0284c7")
-        } else {
-            ink("#0c4a6e")
-        })
+        // Palette lock: white primary when submittable, dark grey when not.
+        .fill(ink(if can_submit { "#f4f4f5" } else { "#3f3f46" }))
         .opacity(if can_submit { 1.0 } else { 0.45 })
         .disabled(!can_submit)
         .on_press_tx_enter(move |s: &mut ShellState, tx: &mut rune::Tx| {
             submit_pairing(s, tx);
         })
-        .child(
-            rune::el()
-                .size(18.0, 18.0)
-                .inert()
-                .shape(icon_arrow_right(18.0, ink("#ffffff"))),
-        );
+        .child(rune::el().size(18.0, 18.0).inert().shape(icon_arrow_right(
+            18.0,
+            ink(if can_submit { "#09090b" } else { "#a1a1aa" }),
+        )));
     card = card.child(
         row()
             .w_full()
@@ -3219,7 +3209,7 @@ mod tests {
     }
 
     #[test]
-    fn titlebar_menu_folds_navigation_and_search_opens_it() {
+    fn titlebar_menu_folds_navigation_and_rail_menu_restores_it() {
         let env = Env::new(true, 1.0);
         let mut rt = Runtime::new(ShellState::default(), shell_view, (1280.0, 900.0), env);
         rt.frame(0.0);
@@ -3237,16 +3227,26 @@ mod tests {
         assert!(rt.find("map-sidebar").is_none(), "panel folded");
         assert!(rt.find("shell-titlebar").is_some(), "titlebar stays");
 
-        let (x, y) = rt.find("topbar-search").expect("search");
+        // The hamburger now lives at the top of the rail (rail-menu),
+        // replacing the old new-chat pen. The titlebar has no search
+        // button; the panel search input stays mounted.
+        let (x, y) = rt.find("topbar-menu").expect("menu restores");
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
         for _ in 0..5 {
             rt.frame(1.0 / 60.0);
         }
-        assert!(rt.state.nav_open, "search restores navigation");
-        assert_eq!(rt.state.canvas.rail, RailTab::Chats);
-        assert!(rt.state.canvas.sessions.search.focused);
+        assert!(rt.state.nav_open, "menu restores navigation");
+        assert!(rt.find("rail-menu").is_some(), "rail menu mounted");
         assert!(rt.find("map-search").is_some());
+
+        let (x, y) = rt.find("rail-menu").expect("rail menu toggles");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..5 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(!rt.state.nav_open, "rail menu folds navigation");
     }
 
     #[test]

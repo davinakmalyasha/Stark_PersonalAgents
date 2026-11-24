@@ -488,7 +488,7 @@ fn tool_event_detail<S: TranscriptHost + 'static>(
     let status_icon = if event.status.is_running() {
         icon_box(13.0, loader(13.0, home_ink("#b8bdc4"))).looping(rune::LoopSpec::rotation(1.0))
     } else if event.ok == Some(false) {
-        icon_box(13.0, crate::lucide_x(13.0, 2.0, home_ink("#d39ba4")))
+        icon_box(13.0, crate::lucide_x(13.0, 2.0, home_ink("#a1a1aa")))
     } else {
         icon_box(13.0, check_circle(13.0, home_ink("#b8bdc4")))
     };
@@ -691,7 +691,7 @@ fn tool_panel<S: TranscriptHost + 'static>(
                     st
                 })
                 .color(if event.ok == Some(false) {
-                    home_ink("#d39ba4")
+                    home_ink("#a1a1aa")
                 } else {
                     home_ink("#898d96")
                 }),
@@ -976,13 +976,13 @@ fn delegation_card<S: TranscriptHost + 'static>(
     status_row = status_row.child(if running {
         spinner(12.0, home_ink("#989da5"), 1.6)
     } else if failed {
-        icon_box(12.0, crate::lucide_x(12.0, 2.0, home_ink("#d39ba4")))
+        icon_box(12.0, crate::lucide_x(12.0, 2.0, home_ink("#a1a1aa")))
     } else {
         icon_box(12.0, check_circle(12.0, home_ink("#989da5")))
     });
     status_row = status_row.child(text(status.to_string()).font(style(10.0, 400.0)).color(
         if failed {
-            home_ink("#d39ba4")
+            home_ink("#a1a1aa")
         } else {
             home_ink("#989da5")
         },

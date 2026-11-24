@@ -145,7 +145,7 @@ impl CloudHandoff {
     pub fn chip(&self) -> (&'static str, &'static str) {
         match self.status.as_str() {
             "received" | "sent" => ("#064e3b55", "#6ee7b7"),
-            "staged" => ("#0c4a6e55", "#7dd3fc"),
+            "staged" => ("#a1a1aa55", "#e4e4e7"),
             "failed" => ("#7f1d1d55", "#fca5a5"),
             _ => ("#27272a", "#d4d4d8"),
         }
@@ -971,15 +971,15 @@ pub fn cloud_view<S: CloudHost + 'static>(s: &CloudState) -> El {
                     .py(8.0)
                     .radius(8.0)
                     .fill(ink(if s.workspace_id.trim().is_empty() {
-                        "#0c4a6e33"
+                        "#a1a1aa33"
                     } else {
-                        "#0c4a6e55"
+                        "#a1a1aa55"
                     }))
-                    .border(1.0, ink("#38bdf855"))
+                    .border(1.0, ink("#a1a1aa55"))
                     .color(ink(if s.workspace_id.trim().is_empty() {
-                        "#38bdf888"
+                        "#a1a1aa88"
                     } else {
-                        "#7dd3fc"
+                        "#e4e4e7"
                     }))
                     .on_press_enter(move |s: &mut S| {
                         send_cloud(s.cloud_mut());
@@ -1186,7 +1186,7 @@ mod tests {
             status: "staged".to_string(),
             ..CloudHandoff::default()
         };
-        assert_eq!(staged.chip().1, "#7dd3fc");
+        assert_eq!(staged.chip().1, "#e4e4e7");
         let failed = CloudHandoff {
             status: "failed".to_string(),
             ..CloudHandoff::default()

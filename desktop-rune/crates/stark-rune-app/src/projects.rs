@@ -707,7 +707,7 @@ pub fn projects_section<S: ProjectsHost + 'static>(s: &ProjectsState) -> El {
             text("waiting on you".to_string())
                 .key("side-projects-waiting")
                 .font(rune::tok::TextStyle::new(10.0, 600.0))
-                .color(ink("#fcd34d")),
+                .color(ink("#a1a1aa")),
         );
     }
     if let Some(err) = &s.error {
@@ -1456,7 +1456,7 @@ fn project_card<S: ProjectsHost + 'static>(prefix: &str, p: &GroupProject, compa
             text(format!("{} waiting", p.waiting))
                 .key(format!("{prefix}-{id}-waiting", id = p.id))
                 .font(rune::tok::TextStyle::new(10.0, 600.0))
-                .color(ink("#fcd34d")),
+                .color(ink("#a1a1aa")),
         );
     }
     card

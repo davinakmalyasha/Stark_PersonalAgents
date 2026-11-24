@@ -53,6 +53,8 @@ mod notes;
 #[cfg(feature = "rune-real")]
 mod projects;
 #[cfg(feature = "rune-real")]
+mod provider_keys;
+#[cfg(feature = "rune-real")]
 mod rooms;
 #[cfg(feature = "rune-real")]
 mod rune_canvas;

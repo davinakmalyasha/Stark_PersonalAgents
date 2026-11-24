@@ -734,13 +734,15 @@ async fn main() -> anyhow::Result<()> {
     // instead of guessing. Best-effort.
     let provider_health = Arc::new(Mutex::new(HashMap::new()));
     {
-        let providers = providers.clone();
+        let config = config.clone();
         let health = provider_health.clone();
         let shutdown = shutdown.clone();
         background.push(tokio::spawn(async move {
             loop {
                 let mut learned = 0;
-                for (id, provider) in providers.iter() {
+                // Rebuild from the live config so a key selected in the
+                // provider panel (or a key file edit) is the one probed.
+                for (id, provider) in build_provider_map(&config) {
                     // Unconfigured providers have no key; probing them only
                     // produces a 401 at every boot and tells us nothing.
                     if !provider.config().has_key() {
@@ -750,7 +752,7 @@ async fn main() -> anyhow::Result<()> {
                         Ok(count) => {
                             learned += count;
                             if let Ok(mut health) = health.lock() {
-                                health.remove(id);
+                                health.remove(&id);
                             }
                         }
                         Err(error) => {
@@ -943,6 +945,19 @@ async fn main() -> anyhow::Result<()> {
             "/api/provider",
             get(provider_handler).post(set_provider_handler),
         )
+        .route(
+            "/api/provider/keys",
+            get(provider_keys_handler).post(add_provider_key_handler),
+        )
+        .route(
+            "/api/provider/keys/active",
+            post(activate_provider_key_handler),
+        )
+        .route(
+            "/api/provider/keys/{key_id}",
+            delete(remove_provider_key_handler),
+        )
+        .route("/api/provider/usage", get(provider_usage_handler))
         .route("/api/config/agents", get(agents_config_handler))
         .route(
             "/api/config/agents/{key}",
@@ -4105,6 +4120,420 @@ async fn set_provider_handler(
     })))
 }
 
+#[derive(Debug, Deserialize)]
+struct ProviderSelector {
+    #[serde(default)]
+    provider: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProviderKeyAddRequest {
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    label: String,
+    secret: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProviderKeyActiveRequest {
+    #[serde(default)]
+    provider: Option<String>,
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProviderUsageQuery {
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    key_id: Option<String>,
+}
+
+fn require_local(address: &SocketAddr) -> Result<(), (StatusCode, Json<Value>)> {
+    if address.ip().is_loopback() {
+        Ok(())
+    } else {
+        Err((StatusCode::FORBIDDEN, Json(json!({"error": "Local only"}))))
+    }
+}
+
+fn canonical_provider(
+    state: &ServerState,
+    requested: Option<&str>,
+) -> Result<String, (StatusCode, Json<Value>)> {
+    let active = state.config.active_provider();
+    let wanted = requested.map(str::trim).filter(|id| !id.is_empty());
+    let target = wanted.unwrap_or(active.as_str());
+    state
+        .config
+        .provider_summaries()
+        .into_iter()
+        .find(|provider| provider.id.eq_ignore_ascii_case(target))
+        .map(|provider| provider.id)
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("unknown provider '{target}'")})),
+            )
+        })
+}
+
+fn provider_keys_payload(
+    state: &ServerState,
+    provider: &str,
+) -> Result<Value, (StatusCode, Json<Value>)> {
+    let report = state.config.provider_keys(provider).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": error.to_string()})),
+        )
+    })?;
+    let summaries = state.config.provider_summaries();
+    let summary = summaries
+        .iter()
+        .find(|summary| summary.id == report.provider);
+    let requested = summary
+        .map(|summary| {
+            if summary.default_model.trim().is_empty() {
+                summary
+                    .models
+                    .first()
+                    .map(|model| model.key.clone())
+                    .unwrap_or_default()
+            } else {
+                summary.default_model.clone()
+            }
+        })
+        .unwrap_or_default();
+    let model = state
+        .config
+        .resolve_model(&report.provider, &requested)
+        .map(|(_, model)| model)
+        .unwrap_or(requested);
+    Ok(json!({
+        "provider": report.provider,
+        "label": summary.map(|summary| summary.label.clone()).unwrap_or_default(),
+        "base_url": summary.map(|summary| summary.base_url.clone()).unwrap_or_default(),
+        "model": model,
+        "has_key": !state.config.resolve_key(&report.provider).is_empty(),
+        "active": report.active,
+        "has_env": report.has_env,
+        "keys": report.keys,
+        "issues": state.config.issues(),
+    }))
+}
+
+fn clear_provider_health(state: &ServerState, provider: &str) {
+    if let Ok(mut health) = state.provider_health.lock() {
+        health.remove(provider);
+    }
+}
+
+async fn verify_provider_key(base_url: &str, api_key: &str) -> Result<(), (StatusCode, String)> {
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .user_agent("stark-rs/0.1")
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|error| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("Could not create the key check client: {error}"),
+            )
+        })?;
+    let response = client
+        .get(url)
+        .bearer_auth(api_key)
+        .send()
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("Could not reach the provider to verify the key: {error}"),
+            )
+        })?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let code = status.as_u16();
+    let message = match code {
+        401 => "The provider rejected this key (401).".to_string(),
+        403 => "This key is not authorized for the provider (403).".to_string(),
+        429 => "The provider is rate-limiting key checks; try again shortly (429).".to_string(),
+        _ => format!("The provider rejected the key check (HTTP {code})."),
+    };
+    let code = if code == 429 {
+        StatusCode::TOO_MANY_REQUESTS
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    Err((code, message))
+}
+
+fn usage_window(value: Option<&Value>) -> Value {
+    let Some(value) = value.filter(|value| value.is_object()) else {
+        return Value::Null;
+    };
+    let Some(percent) = value.get("percent").and_then(Value::as_f64) else {
+        return Value::Null;
+    };
+    json!({
+        "status": value.get("status").and_then(Value::as_str).unwrap_or(""),
+        "percent": percent.clamp(0.0, 100.0),
+        "resets_at": value.get("resetsAt").and_then(Value::as_str).unwrap_or(""),
+    })
+}
+
+fn parse_opencode_usage(value: &Value) -> Value {
+    let Some(usage) = value.get("usage").filter(|usage| usage.is_object()) else {
+        return Value::Null;
+    };
+    let rolling = usage_window(usage.get("rolling"));
+    let weekly = usage_window(usage.get("weekly"));
+    let monthly = usage_window(usage.get("monthly"));
+    if rolling.is_null() && weekly.is_null() && monthly.is_null() {
+        Value::Null
+    } else {
+        json!({
+            "rolling": rolling,
+            "weekly": weekly,
+            "monthly": monthly,
+        })
+    }
+}
+
+async fn fetch_opencode_usage(base_url: &str, api_key: &str) -> Result<Value, String> {
+    let url = format!("{}/usage", base_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .user_agent("stark-rs/0.1")
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|error| format!("Could not create the usage client: {error}"))?;
+    let response = client
+        .get(url)
+        .bearer_auth(api_key)
+        .send()
+        .await
+        .map_err(|error| format!("Could not reach OpenCode usage: {error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(match status.as_u16() {
+            401 => "OpenCode rejected this key (401).".to_string(),
+            403 => "This key has no OpenCode Go subscription (403).".to_string(),
+            429 => "OpenCode is rate-limiting usage requests; try again shortly (429).".to_string(),
+            code => format!("OpenCode usage returned HTTP {code}."),
+        });
+    }
+    let value: Value = response
+        .json()
+        .await
+        .map_err(|error| format!("Could not parse OpenCode usage: {error}"))?;
+    let usage = parse_opencode_usage(&value);
+    if usage.is_null() {
+        Err("OpenCode returned no usage meters for this key.".to_string())
+    } else {
+        Ok(usage)
+    }
+}
+
+async fn provider_keys_handler(
+    State(state): State<ServerState>,
+    ConnectInfo(address): ConnectInfo<SocketAddr>,
+    Query(query): Query<ProviderSelector>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    require_local(&address)?;
+    let provider = canonical_provider(&state, query.provider.as_deref())?;
+    Ok(Json(provider_keys_payload(&state, &provider)?))
+}
+
+async fn add_provider_key_handler(
+    State(state): State<ServerState>,
+    ConnectInfo(address): ConnectInfo<SocketAddr>,
+    Json(request): Json<ProviderKeyAddRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    require_local(&address)?;
+    let provider = canonical_provider(&state, request.provider.as_deref())?;
+    let secret = request
+        .secret
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim();
+    if secret.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Enter an API key first."})),
+        ));
+    }
+    if secret.len() > 4_096 || secret.chars().any(char::is_whitespace) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "That API key is not valid."})),
+        ));
+    }
+    let summary = state
+        .config
+        .provider_summaries()
+        .into_iter()
+        .find(|summary| summary.id == provider)
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("unknown provider '{provider}'")})),
+            )
+        })?;
+    verify_provider_key(&summary.base_url, secret)
+        .await
+        .map_err(|(status, error)| (status, Json(json!({"error": error}))))?;
+    state
+        .config
+        .add_provider_key(&provider, &request.label, secret)
+        .map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": error.to_string()})),
+            )
+        })?;
+    clear_provider_health(&state, &provider);
+    let mut payload = provider_keys_payload(&state, &provider)?;
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "message".to_string(),
+            json!("Key saved and active. The next run uses it."),
+        );
+    }
+    Ok(Json(payload))
+}
+
+async fn activate_provider_key_handler(
+    State(state): State<ServerState>,
+    ConnectInfo(address): ConnectInfo<SocketAddr>,
+    Json(request): Json<ProviderKeyActiveRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    require_local(&address)?;
+    let provider = canonical_provider(&state, request.provider.as_deref())?;
+    state
+        .config
+        .activate_provider_key(&provider, &request.id)
+        .map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": error.to_string()})),
+            )
+        })?;
+    clear_provider_health(&state, &provider);
+    let mut payload = provider_keys_payload(&state, &provider)?;
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "message".to_string(),
+            json!("Active key changed. The next run uses it."),
+        );
+    }
+    Ok(Json(payload))
+}
+
+async fn remove_provider_key_handler(
+    State(state): State<ServerState>,
+    ConnectInfo(address): ConnectInfo<SocketAddr>,
+    axum::extract::Path(key_id): axum::extract::Path<String>,
+    Query(query): Query<ProviderSelector>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    require_local(&address)?;
+    let provider = canonical_provider(&state, query.provider.as_deref())?;
+    state
+        .config
+        .remove_provider_key(&provider, &key_id)
+        .map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": error.to_string()})),
+            )
+        })?;
+    clear_provider_health(&state, &provider);
+    let mut payload = provider_keys_payload(&state, &provider)?;
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("message".to_string(), json!("API key removed."));
+    }
+    Ok(Json(payload))
+}
+
+async fn provider_usage_handler(
+    State(state): State<ServerState>,
+    ConnectInfo(address): ConnectInfo<SocketAddr>,
+    Query(query): Query<ProviderUsageQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    require_local(&address)?;
+    let provider = canonical_provider(&state, query.provider.as_deref())?;
+    let report = state.config.provider_keys(&provider).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": error.to_string()})),
+        )
+    })?;
+    let key_id = query
+        .key_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .unwrap_or(report.active.as_str())
+        .to_string();
+    let base = json!({
+        "provider": provider,
+        "key_id": key_id,
+        "checked_ms": now_millis(),
+    });
+    let respond = |usage: Value, error: Option<String>| {
+        let mut value = base.clone();
+        if let Some(object) = value.as_object_mut() {
+            object.insert("usage".to_string(), usage);
+            object.insert(
+                "error".to_string(),
+                error.map(Value::String).unwrap_or(Value::Null),
+            );
+        }
+        Json(value)
+    };
+    if key_id.is_empty() {
+        return Ok(respond(
+            Value::Null,
+            Some("No API key is configured.".to_string()),
+        ));
+    }
+    let api_key = state.config.resolve_key_entry(&provider, &key_id);
+    if api_key.is_empty() {
+        return Ok(respond(
+            Value::Null,
+            Some("That API key is no longer saved.".to_string()),
+        ));
+    }
+    if !provider.eq_ignore_ascii_case("opencode") {
+        return Ok(respond(
+            Value::Null,
+            Some("Usage reporting is only available for OpenCode Go.".to_string()),
+        ));
+    }
+    let base_url = state
+        .config
+        .provider_summaries()
+        .into_iter()
+        .find(|summary| summary.id == provider)
+        .map(|summary| summary.base_url)
+        .unwrap_or_default();
+    match fetch_opencode_usage(&base_url, &api_key).await {
+        Ok(usage) => Ok(respond(usage, None)),
+        Err(error) => Ok(respond(Value::Null, Some(error))),
+    }
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 async fn agents_config_handler(State(state): State<ServerState>) -> Json<Value> {
     let mut agents = Vec::new();
     for key in [
@@ -6654,6 +7083,23 @@ async fn pairing_rotate_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_opencode_usage_meters() {
+        let value = json!({
+            "usage": {
+                "rolling": {"status": "ok", "percent": 42, "resetsAt": "2099-01-01T00:00:00Z"},
+                "weekly": {"status": "ok", "percent": 12.5, "resetsAt": "2099-01-02T00:00:00Z"},
+                "monthly": {"status": "rate-limited", "percent": 100, "resetsAt": "2099-01-03T00:00:00Z"}
+            }
+        });
+        let usage = parse_opencode_usage(&value);
+        assert_eq!(usage["rolling"]["percent"], 42.0);
+        assert_eq!(usage["weekly"]["percent"], 12.5);
+        assert_eq!(usage["monthly"]["status"], "rate-limited");
+        assert!(parse_opencode_usage(&json!({})).is_null());
+        assert!(parse_opencode_usage(&json!({"usage": {}})).is_null());
+    }
 
     async fn group_provider_response(
         axum::extract::State(fails): axum::extract::State<bool>,

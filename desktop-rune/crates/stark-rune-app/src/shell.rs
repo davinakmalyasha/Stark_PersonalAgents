@@ -1018,7 +1018,17 @@ fn home_chat_overlay(s: &ShellState, stage_w: f32, stage_h: f32, window_h: f32) 
 /// The home chat card's clipping never crops them (the reference UI portals its dialogs
 /// over the whole workspace).
 fn active_chat_sheets(s: &ShellState) -> Vec<El> {
-    let Some(t) = s.canvas.sheet_thread() else {
+    // A fresh account has no canvas sheet yet, but the always-mounted home
+    // card still owns the main thread's dock. Its modals must mount at the
+    // shell root too, otherwise the provider/settings pills would be inert
+    // until a chat is opened.
+    let Some(t) = s.canvas.sheet_thread().or({
+        if s.canvas.cards.is_empty() {
+            Some(&s.transcript)
+        } else {
+            None
+        }
+    }) else {
         return Vec::new();
     };
     let mut sheets = Vec::new();
@@ -1041,6 +1051,15 @@ fn active_chat_sheets(s: &ShellState) -> Vec<El> {
         sheets.push(crate::agent_config::agent_config_sheet::<ShellState>(
             &t.agent_config,
             Thread::Open,
+        ));
+    }
+    if t.provider_keys.open {
+        let (w, h) = unsafe { (WINDOW_W, WINDOW_H) };
+        sheets.push(crate::provider_keys::provider_keys_sheet::<ShellState>(
+            &t.provider_keys,
+            Thread::Open,
+            w,
+            h,
         ));
     }
     if let Some(file) = t.attachment_preview.clone() {
@@ -1952,6 +1971,8 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
     let services_auto = s.chats.auto;
     changed |= crate::agent_config::poll_agent_config(&mut s.transcript.agent_config);
     changed |= crate::agent_config::poll_agent_config(&mut s.personal.agent_config);
+    changed |= crate::provider_keys::poll_provider_keys(&mut s.transcript.provider_keys);
+    changed |= crate::provider_keys::poll_provider_keys(&mut s.personal.provider_keys);
     // Only the visible card's dock shows provider/models (the reference UI mounts one
     // PromptDock), so poll just that thread — not every open tab.
     if let Some(thread) = s.canvas.sheet_thread_mut() {
@@ -1960,6 +1981,7 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
         }
         changed |= crate::rune_transcript::poll_provider_state(thread, clock);
         changed |= crate::rune_transcript::poll_models_state(thread, clock);
+        changed |= crate::provider_keys::poll_provider_keys(&mut thread.provider_keys);
     }
     // Pending questions poll every 1.5s (`usePendingAsk`) for every open
     // surface. Canvas cards are visible in the map even while another chat is
@@ -1976,6 +1998,7 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
             changed |= drain_run_inbox(thread, clock, tx);
             changed |= crate::notes::poll_notes_state(&mut thread.notes);
             changed |= crate::agent_config::poll_agent_config(&mut thread.agent_config);
+            changed |= crate::provider_keys::poll_provider_keys(&mut thread.provider_keys);
             changed |= poll_thread_ask(thread, clock, tx);
             let live = thread.live;
             if let Some(card) = s.canvas.cards.iter_mut().find(|c| c.id == *id) {
@@ -2894,6 +2917,32 @@ pub fn run_shell_headless(extra_args: Vec<String>) {
 mod tests {
     use super::*;
     use rune::{Env, Runtime};
+
+    #[test]
+    fn provider_pill_opens_without_an_open_chat() {
+        let mut state = ShellState::default();
+        state.chats.auto = false;
+        state.canvas.cards.clear();
+        state.canvas.sessions.order.clear();
+        state.canvas.sessions.sheet = None;
+        state.transcript.live = false;
+        let mut rt = Runtime::new(state, shell_view, (1280.0, 900.0), Env::new(true, 1.0));
+        rt.frame(0.0);
+        let (x, y) = rt.find("composer-provider").expect("home provider pill");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..6 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(
+            rt.state.transcript.provider_keys.open,
+            "the home dock provider pill opens the panel"
+        );
+        assert!(
+            rt.find("providerkeys-overlay").is_some(),
+            "the home card mounts the provider sheet at the shell root"
+        );
+    }
 
     #[test]
     fn update_toast_mounts_ready_and_downloading_states() {

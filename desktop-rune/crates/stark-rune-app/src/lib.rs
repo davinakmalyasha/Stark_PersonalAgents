@@ -48,6 +48,9 @@ pub mod notes;
 #[path = "projects.rs"]
 pub mod projects;
 #[cfg(feature = "rune-real")]
+#[path = "provider_keys.rs"]
+pub mod provider_keys;
+#[cfg(feature = "rune-real")]
 #[path = "rooms.rs"]
 pub mod rooms;
 #[cfg(feature = "rune-real")]

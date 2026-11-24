@@ -152,7 +152,7 @@ impl UsageTotals {
 /// Live provider label (`fetchProvider` → `ProviderInfo`): `OpenCode Go`
 /// when the gateway is opencode, else `provider_label || provider`. `warn`
 /// mirrors the trigger's `is-warning` (no key or a provider health error).
-/// The agent-config modal it opens is unported, so the pill is a display.
+/// The pill opens the provider/key panel.
 #[derive(Debug)]
 pub struct ProviderState {
     pub label: String,
@@ -312,6 +312,17 @@ pub fn poll_models_state(s: &mut RuneTranscriptState, clock: f64) -> bool {
 /// Failures keep the last label (the effect swallows errors).
 pub fn poll_provider_state(s: &mut RuneTranscriptState, clock: f64) -> bool {
     let mut changed = false;
+    if s.provider_keys.dirty {
+        s.provider_keys.dirty = false;
+        s.provider.warn = !s.provider_keys.has_key;
+        if !s.provider_keys.label.is_empty() {
+            s.provider.label = s.provider_keys.label.clone();
+        }
+        // Re-read `/api/provider` on the next frame instead of waiting for
+        // the 30s cache to expire.
+        s.provider.last_try = f64::NEG_INFINITY;
+        changed = true;
+    }
     let (msgs, _) = crate::rooms::drain_results(&mut s.provider.inbox);
     for msg in msgs {
         if let Ok(next) = msg {
@@ -746,6 +757,8 @@ pub struct RuneTranscriptState {
     /// Agents & providers modal state (per thread — the pill lives in every
     /// dock, so every thread owns its modal).
     pub agent_config: crate::agent_config::AgentConfigState,
+    /// Provider panel: masked OpenCode Go keys + the active key's allowance.
+    pub provider_keys: crate::provider_keys::ProviderKeysState,
     /// Model options (`GET /api/models` → `{models:[{id,name}]}`), fetched
     /// once per thread lifetime (the reference UI fetches on mount; 60s retry keeps a
     /// cold start honest).
@@ -897,6 +910,7 @@ impl Clone for RuneTranscriptState {
             usage_open: self.usage_open,
             stats_open: self.stats_open,
             agent_config: self.agent_config.clone(),
+            provider_keys: self.provider_keys.clone(),
             models: self.models.clone(),
             models_loading: self.models_loading,
             models_ok: self.models_ok,
@@ -1008,6 +1022,7 @@ impl RuneTranscriptState {
             usage_open: false,
             stats_open: false,
             agent_config: crate::agent_config::AgentConfigState::default(),
+            provider_keys: crate::provider_keys::ProviderKeysState::default(),
             models: Vec::new(),
             models_loading: false,
             models_ok: false,
@@ -1091,6 +1106,7 @@ impl RuneTranscriptState {
             usage_open: false,
             stats_open: false,
             agent_config: crate::agent_config::AgentConfigState::default(),
+            provider_keys: crate::provider_keys::ProviderKeysState::default(),
             models: Vec::new(),
             models_loading: false,
             models_ok: false,
@@ -5928,7 +5944,13 @@ fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'sta
                     s.thread_mut(which).usage_open = false;
                 }),
                 config: std::rc::Rc::new(move |s: &mut S| {
-                    crate::agent_config::open_agent_config(&mut s.thread_mut(which).agent_config);
+                    let (host, port) = {
+                        let thread = s.thread(which);
+                        (thread.api_host.clone(), thread.api_port)
+                    };
+                    let thread = s.thread_mut(which);
+                    thread.agent_config.open = false;
+                    crate::provider_keys::open_provider_keys(&mut thread.provider_keys, host, port);
                 }),
                 attach: std::rc::Rc::new(move |s: &mut S, tx: &mut rune::Tx| {
                     open_attachment_picker(s, which, tx);
@@ -5998,6 +6020,15 @@ fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'sta
             root = root.child(super::agent_config::agent_config_sheet::<S>(
                 &s.agent_config,
                 which,
+            ));
+        }
+        if s.provider_keys.open {
+            let (w, h) = transcript_window();
+            root = root.child(super::provider_keys::provider_keys_sheet::<S>(
+                &s.provider_keys,
+                which,
+                w,
+                h,
             ));
         }
         if let Some(file) = s.attachment_preview.clone() {

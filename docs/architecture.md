@@ -73,7 +73,15 @@ endpoint, rebuilds completed items from `/log` when still active, then resumes
 
 The server owns one harness root. It fails closed when `STARK_HARNESS_ROOT` is
 unset. Provider routing and per-agent configuration live under
-`<harness>/.deep_agents/config/`; environment variables supply keys only.
+`<harness>/.deep_agents/config/`. Keys come from the active entry in
+`<harness>/.deep_agents/secrets/provider_keys.json`, falling back to the
+provider's `key_env` variables in `<harness>/.env`.
+
+The desktop provider panel manages those saved keys through local-only
+`/api/provider/keys*` routes and reads OpenCode Go allowance from the official
+`{base_url}/usage` endpoint. The secrets directory is deliberately outside the
+portable backup set. The active key applies on the next run; no server restart
+is needed.
 
 ## Agent components
 
@@ -121,6 +129,7 @@ The harness root holds:
 - `.deep_agents/snapshots/` — rewind checkpoints.
 - `.deep_agents/uploads/`, `imports/`, `live_screen/` — retained inputs.
 - `.deep_agents/config/` — providers, agents, MCP, and app configuration.
+- `.deep_agents/secrets/` — saved provider API keys; never exported.
 - `.deep_agents/worktrees/` — isolated agent worktrees.
 
 Rollout ordinals are the durable cursor for the run log. Database snapshots,

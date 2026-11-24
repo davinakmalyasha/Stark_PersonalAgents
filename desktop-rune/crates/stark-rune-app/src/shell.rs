@@ -120,11 +120,9 @@ fn icon_home(size: f32, color: rune::Color) -> Shape {
 }
 
 fn icon_group(size: f32, color: rune::Color) -> Shape {
-    // Three side-by-side bots: square-ish heads with eyes and antennas, a
-    // taller middle unit, and simple shoulders. Stroked Lucide-style.
+    // Two bots side by side, same rounded-head shape as the empty Projects
+    // mark: antenna, ears, eyes. The rail reads as "agents", not "people".
     let mut p = Path::new();
-
-    // Rounded head outline: x0,y0 → x1,y1 with corner radius r.
     let head = |mut p: Path, x0: f32, y0: f32, x1: f32, y1: f32, r: f32| {
         p = p.move_to([x0 + r, y0]);
         p = p.line_to([x1 - r, y0]);
@@ -138,38 +136,27 @@ fn icon_group(size: f32, color: rune::Color) -> Shape {
         p.close()
     };
 
-    // Left bot: antenna, head, eyes, shoulders.
-    p = p.move_to([4.0, 6.3]).line_to([4.0, 7.4]);
-    p = head(p, 1.8, 7.4, 6.2, 12.0, 1.0);
-    p = p.move_to([3.2, 9.0]).line_to([3.2, 9.8]);
-    p = p.move_to([4.8, 9.0]).line_to([4.8, 9.8]);
-    p = p.move_to([2.4, 17.6]);
-    p = p.cubic_to([2.4, 15.2], [3.1, 14.0], [4.0, 14.0]);
-    p = p.cubic_to([4.9, 14.0], [5.6, 15.2], [5.6, 17.6]);
+    // Left bot.
+    p = p
+        .move_to([6.0, 8.6])
+        .line_to([6.0, 6.0])
+        .line_to([9.0, 6.0]);
+    p = head(p, 1.2, 8.6, 10.8, 18.6, 2.0);
+    p = p.move_to([2.4, 12.6]).line_to([1.0, 12.6]);
+    p = p.move_to([9.6, 12.6]).line_to([11.0, 12.6]);
+    p = p.move_to([4.2, 12.4]).line_to([4.2, 13.8]);
+    p = p.move_to([7.8, 12.4]).line_to([7.8, 13.8]);
 
-    // Right bot: mirror of the left.
-    p = p.move_to([20.0, 6.3]).line_to([20.0, 7.4]);
-    p = head(p, 17.8, 7.4, 22.2, 12.0, 1.0);
-    p = p.move_to([19.2, 9.0]).line_to([19.2, 9.8]);
-    p = p.move_to([20.8, 9.0]).line_to([20.8, 9.8]);
-    p = p.move_to([18.4, 17.6]);
-    p = p.cubic_to([18.4, 15.2], [19.1, 14.0], [20.0, 14.0]);
-    p = p.cubic_to([20.9, 14.0], [21.6, 15.2], [21.6, 17.6]);
-
-    // Middle bot: taller, antenna with a tip, wider head/eyes.
-    p = p.move_to([12.0, 4.4]).line_to([12.0, 2.8]);
-    p = p.move_to([12.9, 2.3]);
-    p = p.cubic_to([12.9, 2.8], [12.5, 3.2], [12.0, 3.2]);
-    p = p.cubic_to([11.5, 3.2], [11.1, 2.8], [11.1, 2.3]);
-    p = p.cubic_to([11.1, 1.8], [11.5, 1.4], [12.0, 1.4]);
-    p = p.cubic_to([12.5, 1.4], [12.9, 1.8], [12.9, 2.3]);
-    p = p.close();
-    p = head(p, 8.6, 4.4, 15.4, 10.8, 1.2);
-    p = p.move_to([10.9, 6.9]).line_to([10.9, 8.0]);
-    p = p.move_to([13.1, 6.9]).line_to([13.1, 8.0]);
-    p = p.move_to([7.4, 18.2]);
-    p = p.cubic_to([7.4, 15.0], [8.6, 13.2], [12.0, 13.2]);
-    p = p.cubic_to([15.4, 13.2], [16.6, 15.0], [16.6, 18.2]);
+    // Right bot, mirrored.
+    p = p
+        .move_to([18.0, 8.6])
+        .line_to([18.0, 6.0])
+        .line_to([15.0, 6.0]);
+    p = head(p, 13.2, 8.6, 22.8, 18.6, 2.0);
+    p = p.move_to([14.4, 12.6]).line_to([13.0, 12.6]);
+    p = p.move_to([21.6, 12.6]).line_to([23.0, 12.6]);
+    p = p.move_to([16.2, 12.4]).line_to([16.2, 13.8]);
+    p = p.move_to([19.8, 12.4]).line_to([19.8, 13.8]);
 
     icon_shape(p, size, color)
 }
@@ -1341,6 +1328,22 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
     // split view, instead of replacing the conversation.
     let drill_thread = drill_thread(s).filter(|thread| thread.active_subagent.is_some() && !folded);
     let drill_w = if drill_thread.is_some() { DRILL_W } else { 0.0 };
+    // The child chat already lives as a canvas card; bind the panel's rows and
+    // composer to that thread so sends stream into the dock.
+    let drill_chat = drill_thread.and_then(|thread| {
+        thread.active_subagent.as_ref().and_then(|drill| {
+            let card_id = format!("chat:{}:{}", drill.workspace_id, drill.child_id);
+            if !s.canvas.sessions.threads.contains_key(&card_id) {
+                return None;
+            }
+            s.canvas
+                .sessions
+                .order
+                .iter()
+                .position(|id| id == &card_id)
+                .map(Thread::Card)
+        })
+    });
     let stage_w = (w
         - if rail_visible { RAIL_W } else { 0.0 }
         - if panel_visible { PANEL_W } else { 0.0 }
@@ -1367,8 +1370,6 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
                 .w_full()
                 .grow(1.0)
                 .min_h(0.0)
-                .px(20.0)
-                .pt(12.0)
                 .child(canvas_body::<ShellState>(&s.canvas)),
         );
     if let Some(overlay) = home_chat_overlay(s, stage_w, stage_h, h) {
@@ -1390,9 +1391,12 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
     }
     main = main.child(stage);
     if let Some(thread) = drill_thread {
-        if let Some(panel) =
-            crate::rune_transcript::subagent_panel::<ShellState>(thread, Thread::Open, DRILL_W)
-        {
+        if let Some(panel) = crate::rune_transcript::subagent_panel::<ShellState>(
+            thread,
+            Thread::Open,
+            drill_chat,
+            DRILL_W,
+        ) {
             main = main.child(panel);
         }
     }
@@ -3168,9 +3172,12 @@ mod tests {
         // the same thread the home card renders.
         let active = state.canvas.active_id.clone();
         let thread = state.canvas.thread_mut(&active);
-        crate::rune_transcript::open_subagent(thread, "child-1", "Dev", None);
+        // Use a real spawned card so the dock binds its child thread/composer.
+        crate::rune_transcript::open_subagent(thread, "chat-2", "Dev", Some("ws-general"));
         thread.drill_inbox = None;
-        thread.active_subagent.as_mut().expect("drill").loading = false;
+        let drill = thread.active_subagent.as_mut().expect("drill");
+        drill.loading = false;
+        drill.workspace_id = "ws-general".to_string();
         let mut rt = Runtime::new(state, shell_view, (1280.0, 900.0), env);
         rt.frame(0.0);
         // The conversation stays mounted; the child session docks to its right.
@@ -3180,6 +3187,10 @@ mod tests {
         assert!(
             rt.find("subagent-panel-close").is_some(),
             "panel close button"
+        );
+        assert!(
+            rt.find("subagent-composer-input").is_some(),
+            "child prompt dock mounted"
         );
         let (card, _) = rt.presented("home-chat-card").expect("card rect");
         let (panel, _) = rt.presented("subagent-panel").expect("panel rect");

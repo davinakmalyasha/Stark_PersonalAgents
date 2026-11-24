@@ -2438,7 +2438,7 @@ pub fn transcript_view_body<S: TranscriptHost + crate::settings::SettingsHost + 
     let mut root = transcript_body_with::<S>(s, which, true, false, true, 0.0, 0.0, false);
     // The app docks this beside the chat; the standalone transcript overlays
     // it on the right edge so the drill still has a home outside the shell.
-    if let Some(panel) = subagent_panel::<S>(s, which, 420.0) {
+    if let Some(panel) = subagent_panel::<S>(s, which, None, 420.0) {
         root = root.child(
             col()
                 .key("subagent-panel-overlay")
@@ -5140,8 +5140,8 @@ fn conversation_rail<S: TranscriptHost + 'static>(
     if marks.is_empty() {
         return None;
     }
-    let start = marks.len().saturating_sub(12);
-    let folded = start > 0;
+    // Six ticks at most: the rail stays a glance, not a second scrollbar.
+    let start = marks.len().saturating_sub(6);
     let marks = &marks[start..];
 
     let mut rail = col()
@@ -5150,22 +5150,6 @@ fn conversation_rail<S: TranscriptHost + 'static>(
         .pin(Some(4.0), Some(16.0), None, Some(16.0))
         .justify_center()
         .gap(2.0);
-    if folded {
-        rail = rail.child(
-            row()
-                .key("conversation-mark-earlier")
-                .w(24.0)
-                .h(12.0)
-                .items_center()
-                .inert()
-                .child(
-                    rune::el()
-                        .size(7.0, 2.0)
-                        .radius(1.0)
-                        .fill(home_rgba(255.0, 255.0, 255.0, 0.14)),
-                ),
-        );
-    }
 
     for (slot, row_index) in marks.iter().enumerate() {
         let msg = &s.rows[*row_index];
@@ -5186,11 +5170,18 @@ fn conversation_rail<S: TranscriptHost + 'static>(
         } else {
             0.28
         };
+        let jump_key = msg.key.clone();
         let mut tick = row()
             .key(format!("conversation-mark-{slot}"))
             .w(24.0)
             .h(14.0)
             .items_center()
+            .role("button")
+            .focusable(true)
+            .label("Jump to this message")
+            .on_press_tx_enter(move |_s: &mut S, tx: &mut rune::Tx| {
+                tx.scroll_into_view(jump_key.clone());
+            })
             .on_hover_change(move |s: &mut S, inside, _tx| {
                 let thread = s.thread_mut(which);
                 if inside {
@@ -5288,14 +5279,113 @@ fn drill_back_icon(size: f32, color: rune::Color) -> rune::Shape {
         .view_box(24.0, 24.0)
 }
 
+/// Compact prompt dock for the docked child session. It reuses the child
+/// thread's draft/live state (so sends stream into the panel) with its own
+/// keys, since the main composer is mounted at the same time.
+fn subagent_composer<S: TranscriptHost + 'static>(s: &RuneTranscriptState, chat: Thread) -> El {
+    let t = s.thread(chat);
+    let running = t.live;
+    let has_text = !t.edit.text.trim().is_empty();
+    let send_label = if running && !has_text {
+        "Stop"
+    } else {
+        "Send to subagent"
+    };
+    let glyph = if running && !has_text {
+        crate::icons::lucide(&["M6 6h12v12H6z"], 12.0, 2.0, home_ink("#0a0a0a"))
+    } else {
+        crate::icons::lucide(
+            &["M12 19V5", "m5 12 7-7 7 7"],
+            13.0,
+            2.0,
+            home_ink("#0a0a0a"),
+        )
+    };
+    col().key("subagent-composer").w_full().child(
+        row()
+            .key("subagent-composer-wrap")
+            .w_full()
+            .items_end()
+            .gap(6.0)
+            .px(9.0)
+            .py(7.0)
+            .radius(12.0)
+            .fill(home_ink("#111114"))
+            .border(1.0, home_rgba(255.0, 255.0, 255.0, 0.12))
+            .border_layout()
+            .child(
+                rune::text_input(&t.edit, rune::tok::TextStyle::new(12.5, 400.0))
+                    .key("subagent-composer-input")
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .single_line()
+                    .px(4.0)
+                    .py(4.0)
+                    .placeholder("Message this subagent…", home_ink("#5e626b"))
+                    .caret(home_ink("#f2f2f4"), crate::motion::TEXT_SELECTION)
+                    .on_edit(move |s: &mut S| &mut s.thread_mut(chat).edit)
+                    .on_submit(move |s: &mut S, _tx: &mut rune::Tx| {
+                        stage_send(s.thread_mut(chat));
+                    }),
+            )
+            .child(
+                rune::el()
+                    .key("subagent-composer-send")
+                    .role("button")
+                    .focusable(true)
+                    .label(send_label)
+                    .size(28.0, 28.0)
+                    .radius(14.0)
+                    .center()
+                    .fill(home_ink(if running && !has_text {
+                        "#e4e4e7"
+                    } else if has_text || running {
+                        "#f4f4f5"
+                    } else {
+                        "#2b2b32"
+                    }))
+                    .hover(home_ink("#ffffff"))
+                    .on_press_enter(move |s: &mut S| {
+                        let thread = s.thread_mut(chat);
+                        if thread.live && thread.edit.text.trim().is_empty() {
+                            stage_abort(thread);
+                        } else {
+                            stage_send(thread);
+                        }
+                    })
+                    .child(rune::el().size(13.0, 13.0).inert().shape(glyph)),
+            ),
+    )
+}
+
+/// Rows shown in a drill: the live child card thread wins (it streams and
+/// accepts sends), falling back to the fetched child history.
+fn drill_rows<S: TranscriptHost + 'static>(
+    s: &S,
+    which: Thread,
+    chat: Option<Thread>,
+) -> Option<&[RowData]> {
+    if let Some(chat) = chat {
+        let rows = &s.thread(chat).rows;
+        if !rows.is_empty() {
+            return Some(rows);
+        }
+    }
+    s.thread(which)
+        .active_subagent
+        .as_ref()
+        .map(|drill| drill.rows.as_slice())
+}
+
 /// Session-keyed drill view (`SubagentSessionView`): header with back +
 /// breadcrumb + running status, body with the child history, read-only dock
 /// notice. Stark visuals (same bubbles as the parent); Rune builds it like
 /// `collapsible`/`dialog` conditional content — open state mounts the layer,
 /// no height animation.
-fn subagent_drill_view<S: TranscriptHost + 'static>(
+fn subagent_drill_view<S: TranscriptHost + crate::settings::SettingsHost + 'static>(
     s: &RuneTranscriptState,
     which: Thread,
+    chat: Option<Thread>,
     max_w: f32,
     panel: bool,
 ) -> El {
@@ -5312,7 +5402,7 @@ fn subagent_drill_view<S: TranscriptHost + 'static>(
     let retry_label = drill.label.clone();
     let retry_ws = drill.workspace_id.clone();
     let loading = drill.loading;
-    let row_count = drill.rows.len();
+    let row_count = drill_rows::<RuneTranscriptState>(s, which, chat).map_or(0, <[RowData]>::len);
     let has_error = drill.error.is_some();
     // Header (`.subagent-session-view-header`): 52pt, 14px sides, hairline.
     let mut header = row()
@@ -5514,21 +5604,15 @@ fn subagent_drill_view<S: TranscriptHost + 'static>(
                 row_count,
                 ESTIMATED_ROW_H,
                 move |s: &S, i| {
-                    let key = s
-                        .thread(which)
-                        .active_subagent
-                        .as_ref()
-                        .and_then(|d| d.rows.get(i))
+                    let key = drill_rows::<S>(s, which, chat)
+                        .and_then(|rows| rows.get(i))
                         .map(|r| r.key.clone())
                         .unwrap_or_default();
                     Cow::Owned(key)
                 },
                 move |s: &S, i| {
-                    let t = s.thread(which);
-                    let Some(drill) = t.active_subagent.as_ref() else {
-                        return col().key(format!("subagent-row-missing-{i}"));
-                    };
-                    let Some(r) = drill.rows.get(i) else {
+                    let Some(r) = drill_rows::<S>(s, which, chat).and_then(|rows| rows.get(i))
+                    else {
                         return col().key(format!("subagent-row-missing-{i}"));
                     };
                     // Same builders as the parent body (Stark bubbles); drill
@@ -5550,20 +5634,34 @@ fn subagent_drill_view<S: TranscriptHost + 'static>(
                 },
             )
     };
-    let dock = col()
-        .key("subagent-view-dock")
-        .w_full()
-        .border_sides([1.0, 0.0, 0.0, 0.0], home_rgba(255.0, 255.0, 255.0, 0.07))
-        .border_layout()
-        .fill(home_ink("#0b0b0b"))
-        .child(
-            text("This child session is read-only in the native view.".to_string())
-                .key("subagent-view-readonly")
-                .px(16.0)
-                .py(12.0)
-                .font(rune::tok::TextStyle::new(11.0, 400.0))
-                .color(home_ink("#777982")),
-        );
+    // Child prompt dock: the same composer as the main chat, bound to the
+    // child's card thread so sends stream into this panel.
+    let dock = match chat {
+        Some(chat) => col()
+            .key("subagent-view-dock")
+            .w_full()
+            .border_sides([0.0, 1.0, 0.0, 0.0], home_rgba(255.0, 255.0, 255.0, 0.07))
+            .border_layout()
+            .fill(home_ink("#0b0b0b"))
+            .px(12.0)
+            .pt(8.0)
+            .pb(10.0)
+            .child(subagent_composer::<S>(s, chat)),
+        None => col()
+            .key("subagent-view-dock")
+            .w_full()
+            .border_sides([0.0, 1.0, 0.0, 0.0], home_rgba(255.0, 255.0, 255.0, 0.07))
+            .border_layout()
+            .fill(home_ink("#0b0b0b"))
+            .child(
+                text("This child session cannot be messaged from here.".to_string())
+                    .key("subagent-view-nodock")
+                    .px(16.0)
+                    .py(12.0)
+                    .font(rune::tok::TextStyle::new(11.0, 400.0))
+                    .color(home_ink("#777982")),
+            ),
+    };
     col()
         .key(if panel {
             "subagent-panel-surface"
@@ -5590,9 +5688,10 @@ fn subagent_drill_view<S: TranscriptHost + 'static>(
 /// Right-hand subagent session panel (`SubagentSessionView` docked like the
 /// reference split view): the main chat stays visible and the child session
 /// slides in beside it. Desktop only; phones keep the full-width drill.
-pub fn subagent_panel<S: TranscriptHost + 'static>(
+pub fn subagent_panel<S: TranscriptHost + crate::settings::SettingsHost + 'static>(
     s: &RuneTranscriptState,
     which: Thread,
+    chat: Option<Thread>,
     width: f32,
 ) -> Option<El> {
     s.active_subagent.as_ref()?;
@@ -5606,7 +5705,99 @@ pub fn subagent_panel<S: TranscriptHost + 'static>(
             .fill(home_ink("#0b0b0b"))
             .border_sides([1.0, 0.0, 0.0, 0.0], home_rgba(255.0, 255.0, 255.0, 0.10))
             .border_layout()
-            .child(subagent_drill_view::<S>(s, which, inner_w * 0.85, true)),
+            .child(subagent_drill_view::<S>(
+                s,
+                which,
+                chat,
+                inner_w * 0.85,
+                true,
+            )),
+    )
+}
+
+/// Prompt dock for one thread. Shared by the home card and the docked
+/// subagent session so the child gets the same composer (send/stop, provider,
+/// usage, attachments) as the main chat.
+fn thread_composer<S: TranscriptHost + crate::settings::SettingsHost + 'static>(
+    s: &RuneTranscriptState,
+    which: Thread,
+    dock_compact: bool,
+) -> El {
+    let t = s.thread(which);
+    super::composer::composer_card(
+        &t.edit,
+        std::rc::Rc::new(move |s: &mut S| &mut s.thread_mut(which).edit),
+        t.voice.meter(),
+        t.live,
+        super::composer::ComposerMeta {
+            target: &t.run_target,
+            usage: &t.usage,
+            usage_open: t.usage_open,
+            provider_label: &t.provider.label,
+            provider_warn: t.provider.warn,
+            model: &t.model,
+            // HouseChat's PromptDock never passes `onModelChange`, so the
+            // home card has no model dropup (the reference UI renders provider only).
+            models: if dock_compact { &[] } else { &t.models },
+            model_open: t.model_open,
+            attachments: &t.draft_attachments,
+            attachments_error: t.attachments_error.as_deref(),
+            attachments_dragging: t.attachments_dragging,
+            workspace_id: &t.workspace_id,
+            chat_id: &t.chat_id,
+            hover: &t.hover,
+        },
+        super::composer::ComposerButtons {
+            voice: std::rc::Rc::new(move |s: &mut S| {
+                let on = !s.thread_mut(which).voice.live;
+                s.thread_mut(which).voice.set_live(on);
+            }),
+            cancel: std::rc::Rc::new(move |s: &mut S| stage_abort(s.thread_mut(which))),
+            local: std::rc::Rc::new(move |s: &mut S| {
+                s.thread_mut(which).run_target = "local".to_string();
+            }),
+            cloud: std::rc::Rc::new(move |s: &mut S| {
+                s.thread_mut(which).run_target = "cloud".to_string();
+            }),
+            usage: std::rc::Rc::new(move |s: &mut S| {
+                let open = s.thread_mut(which).usage_open;
+                s.thread_mut(which).usage_open = !open;
+            }),
+            send: std::rc::Rc::new(move |s: &mut S| stage_send(s.thread_mut(which))),
+            model_menu: std::rc::Rc::new(move |s: &mut S| {
+                let open = s.thread_mut(which).model_open;
+                s.thread_mut(which).model_open = !open;
+            }),
+            model_pick: std::rc::Rc::new(move |s: &mut S, id: String| {
+                s.thread_mut(which).model = id;
+                s.thread_mut(which).model_open = false;
+            }),
+            stats: std::rc::Rc::new(move |s: &mut S| {
+                s.thread_mut(which).stats_open = true;
+                s.thread_mut(which).usage_open = false;
+            }),
+            config: std::rc::Rc::new(move |s: &mut S| {
+                let (host, port) = {
+                    let thread = s.thread(which);
+                    (thread.api_host.clone(), thread.api_port)
+                };
+                let thread = s.thread_mut(which);
+                thread.agent_config.open = false;
+                crate::provider_keys::open_provider_keys(&mut thread.provider_keys, host, port);
+            }),
+            attach: std::rc::Rc::new(move |s: &mut S, tx: &mut rune::Tx| {
+                open_attachment_picker(s, which, tx);
+            }),
+            remove_attachment: std::rc::Rc::new(move |s: &mut S, target: String| {
+                remove_draft_attachment(s.thread_mut(which), &target);
+            }),
+            drop_files: std::rc::Rc::new(move |s: &mut S, files: &[std::path::PathBuf]| {
+                drop_attachment_files(s.thread_mut(which), files);
+            }),
+            drop_hover: std::rc::Rc::new(move |s: &mut S, over: bool| {
+                s.thread_mut(which).attachments_dragging = over;
+            }),
+        },
     )
 }
 
@@ -6025,81 +6216,7 @@ fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'sta
     let composer_card = if ask_batch.is_some() {
         None
     } else {
-        Some(super::composer::composer_card(
-            &s.edit,
-            std::rc::Rc::new(move |s: &mut S| &mut s.thread_mut(which).edit),
-            s.voice.meter(),
-            s.live,
-            super::composer::ComposerMeta {
-                target: &s.run_target,
-                usage: &s.usage,
-                usage_open: s.usage_open,
-                provider_label: &s.provider.label,
-                provider_warn: s.provider.warn,
-                model: &s.model,
-                // HouseChat's PromptDock never passes `onModelChange`, so the
-                // home card has no model dropup (the reference UI renders provider only).
-                models: if dock_compact { &[] } else { &s.models },
-                model_open: s.model_open,
-                attachments: &s.draft_attachments,
-                attachments_error: s.attachments_error.as_deref(),
-                attachments_dragging: s.attachments_dragging,
-                workspace_id: &s.workspace_id,
-                chat_id: &s.chat_id,
-                hover: &s.hover,
-            },
-            super::composer::ComposerButtons {
-                voice: std::rc::Rc::new(move |s: &mut S| {
-                    let on = !s.thread_mut(which).voice.live;
-                    s.thread_mut(which).voice.set_live(on);
-                }),
-                cancel: std::rc::Rc::new(move |s: &mut S| stage_abort(s.thread_mut(which))),
-                local: std::rc::Rc::new(move |s: &mut S| {
-                    s.thread_mut(which).run_target = "local".to_string();
-                }),
-                cloud: std::rc::Rc::new(move |s: &mut S| {
-                    s.thread_mut(which).run_target = "cloud".to_string();
-                }),
-                usage: std::rc::Rc::new(move |s: &mut S| {
-                    let open = s.thread_mut(which).usage_open;
-                    s.thread_mut(which).usage_open = !open;
-                }),
-                send: std::rc::Rc::new(move |s: &mut S| stage_send(s.thread_mut(which))),
-                model_menu: std::rc::Rc::new(move |s: &mut S| {
-                    let open = s.thread_mut(which).model_open;
-                    s.thread_mut(which).model_open = !open;
-                }),
-                model_pick: std::rc::Rc::new(move |s: &mut S, id: String| {
-                    s.thread_mut(which).model = id;
-                    s.thread_mut(which).model_open = false;
-                }),
-                stats: std::rc::Rc::new(move |s: &mut S| {
-                    s.thread_mut(which).stats_open = true;
-                    s.thread_mut(which).usage_open = false;
-                }),
-                config: std::rc::Rc::new(move |s: &mut S| {
-                    let (host, port) = {
-                        let thread = s.thread(which);
-                        (thread.api_host.clone(), thread.api_port)
-                    };
-                    let thread = s.thread_mut(which);
-                    thread.agent_config.open = false;
-                    crate::provider_keys::open_provider_keys(&mut thread.provider_keys, host, port);
-                }),
-                attach: std::rc::Rc::new(move |s: &mut S, tx: &mut rune::Tx| {
-                    open_attachment_picker(s, which, tx);
-                }),
-                remove_attachment: std::rc::Rc::new(move |s: &mut S, target: String| {
-                    remove_draft_attachment(s.thread_mut(which), &target);
-                }),
-                drop_files: std::rc::Rc::new(move |s: &mut S, files: &[std::path::PathBuf]| {
-                    drop_attachment_files(s.thread_mut(which), files);
-                }),
-                drop_hover: std::rc::Rc::new(move |s: &mut S, over: bool| {
-                    s.thread_mut(which).attachments_dragging = over;
-                }),
-            },
-        ))
+        Some(thread_composer::<S>(s, which, dock_compact))
     };
     let dock = if dock_compact {
         // Inside the home chat card the outer card owns the 8pt gutter and
@@ -6791,6 +6908,43 @@ mod tests {
         // Users keep copy and rewind.
         assert!(rt.find("short-user-copy").is_some(), "user copy");
         assert!(rt.find("short-user-rewind").is_some(), "user rewind");
+    }
+
+    #[test]
+    fn rail_keeps_six_newest_user_messages() {
+        use super::*;
+        use rune::{Env, Runtime};
+        let mut init = RuneTranscriptState::screenshot();
+        init.live = false;
+        init.rows = (0..8)
+            .map(|i| RowData {
+                key: format!("u{i}"),
+                role: "user",
+                body: format!("message {i}"),
+                at: "2026-11-24T10:00:00Z".to_string(),
+                ..RowData::default()
+            })
+            .collect();
+        fn home_view(s: &RuneTranscriptState, _cx: &mut Cx<RuneTranscriptState>) -> El {
+            home_transcript_body::<RuneTranscriptState>(s, Thread::Main, 468.0, 720.0, false)
+        }
+        let mut rt = Runtime::new(init, home_view, (900.0, 700.0), Env::new(true, 1.0));
+        rt.frame(0.0);
+        let marks = [
+            "conversation-mark-0",
+            "conversation-mark-1",
+            "conversation-mark-2",
+            "conversation-mark-3",
+            "conversation-mark-4",
+            "conversation-mark-5",
+        ];
+        for key in marks {
+            assert!(rt.find(key).is_some(), "{key} mounted");
+        }
+        assert!(
+            rt.find("conversation-mark-6").is_none(),
+            "only the newest six ticks mount"
+        );
     }
 
     #[test]
@@ -7786,7 +7940,8 @@ mod tests {
                 720.0,
                 false,
             ));
-            if let Some(panel) = subagent_panel::<RuneTranscriptState>(s, Thread::Main, 420.0) {
+            if let Some(panel) = subagent_panel::<RuneTranscriptState>(s, Thread::Main, None, 420.0)
+            {
                 root = root.child(panel);
             }
             root
@@ -7874,8 +8029,8 @@ mod tests {
         );
         assert!(rt.find("subagent-view-child").is_some(), "breadcrumb child");
         assert!(
-            rt.find("subagent-view-readonly").is_some(),
-            "read-only dock"
+            rt.find("subagent-view-nodock").is_some(),
+            "no child thread to message"
         );
         // Close dismisses the docked panel.
         let (bx, by) = rt.find("subagent-panel-close").expect("close placed");

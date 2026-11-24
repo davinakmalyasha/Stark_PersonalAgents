@@ -702,8 +702,8 @@ fn usage_color(percent: f64) -> rune::Color {
 fn usage_row(label: &str, window: &Option<UsageWindow>) -> El {
     let mut out = row().w_full().items_center().gap(10.0).child(
         text(label.to_string())
-            .w(74.0)
-            .font(rune::tok::TextStyle::new(11.5, 500.0))
+            .w(82.0)
+            .font(rune::tok::TextStyle::new(12.5, 500.0))
             .color(ink("#a1a1aa")),
     );
     match window {
@@ -716,22 +716,22 @@ fn usage_row(label: &str, window: &Option<UsageWindow>) -> El {
                 .child(
                     row()
                         .grow(1.0)
-                        .h(5.0)
-                        .radius(3.0)
+                        .h(6.0)
+                        .radius(2.0)
                         .fill(ink("#ffffff10"))
-                        .child(rune::el().grow(grow).h(5.0).fill(color).radius(3.0))
-                        .child(rune::el().grow(rest).h(5.0)),
+                        .child(rune::el().grow(grow).h(6.0).fill(color).radius(2.0))
+                        .child(rune::el().grow(rest).h(6.0)),
                 )
                 .child(
                     text(format!("{}%", percent.round() as i64))
-                        .w(38.0)
-                        .font(rune::tok::TextStyle::new(11.0, 600.0).mono())
+                        .w(42.0)
+                        .font(rune::tok::TextStyle::new(12.0, 600.0).mono())
                         .color(color),
                 )
                 .child(
                     text(reset_label(window))
-                        .w(130.0)
-                        .font(rune::tok::TextStyle::new(9.5, 400.0))
+                        .w(150.0)
+                        .font(rune::tok::TextStyle::new(10.5, 400.0))
                         .color(ink("#71717a")),
                 );
         }
@@ -740,14 +740,14 @@ fn usage_row(label: &str, window: &Option<UsageWindow>) -> El {
                 .child(rune::el().grow(1.0))
                 .child(
                     text("—".to_string())
-                        .w(38.0)
-                        .font(rune::tok::TextStyle::new(11.0, 500.0))
+                        .w(42.0)
+                        .font(rune::tok::TextStyle::new(12.0, 500.0))
                         .color(ink("#52525b")),
                 )
                 .child(
                     text("no data".to_string())
-                        .w(130.0)
-                        .font(rune::tok::TextStyle::new(9.5, 400.0))
+                        .w(150.0)
+                        .font(rune::tok::TextStyle::new(10.5, 400.0))
                         .color(ink("#52525b")),
                 );
         }
@@ -766,8 +766,8 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
     width: f32,
     height: f32,
 ) -> El {
-    let card_w = 760.0_f32.min((width - 24.0).max(0.0));
-    let max_card_h = 640.0_f32.min((height - 36.0).max(0.0));
+    let card_w = 820.0_f32.min((width - 24.0).max(0.0));
+    let max_card_h = 720.0_f32.min((height - 36.0).max(0.0));
     // One 54pt row per key; the add form only takes room while open.
     let key_rows = state.keys.len().max(1) as f32;
     let form_h = if state.add_open { 178.0 } else { 0.0 };
@@ -783,21 +783,23 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
     } else {
         16.0
     };
-    let content_h = 58.0
-        + 12.0
-        + 34.0
+    let content_h = 78.0
         + 14.0
-        + 150.0
+        + 40.0
+        + 16.0
+        + 212.0
         + usage_extra
-        + 14.0
-        + 34.0
-        + 8.0
-        + key_rows * 54.0
+        + 16.0
+        + 38.0
+        + 10.0
+        + key_rows * 60.0
         + form_h
         + notice_h
-        + 14.0
-        + 46.0;
-    let card_h = content_h.min(max_card_h).max(320.0);
+        + 16.0
+        + 56.0;
+    // Hug the content; only cap and scroll when the window is too short.
+    let overflows = content_h > max_card_h;
+    let card_h = content_h.min(max_card_h).max(340.0);
     let close = move |s: &mut S| {
         close_provider_keys(&mut s.thread_mut(which).provider_keys);
     };
@@ -814,14 +816,16 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
     let mut body = col()
         .key("providerkeys-body")
         .w_full()
-        .min_h(0.0)
-        .gap(14.0)
-        .px(18.0)
-        .pt(12.0)
-        .pb(14.0)
-        .scroll(rune::ScrollSpec {
+        .gap(16.0)
+        .px(20.0)
+        .pt(14.0)
+        .pb(16.0);
+    if overflows {
+        // Only a too-short window scrolls; otherwise the card hugs the keys.
+        body = body.grow(1.0).min_h(0.0).scroll(rune::ScrollSpec {
             stick_bottom: false,
         });
+    }
 
     // Hero: provider identity + readiness.
     body = body.child(
@@ -832,14 +836,14 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
             .gap(12.0)
             .child(
                 rune::el()
-                    .size(34.0, 34.0)
-                    .radius(10.0)
+                    .size(40.0, 40.0)
+                    .radius(11.0)
                     .fill(ink("#ffffff0a"))
                     .border(1.0, ink("#ffffff12"))
                     .center()
                     .child(
                         text("◎".to_string())
-                            .font(rune::tok::TextStyle::new(17.0, 500.0))
+                            .font(rune::tok::TextStyle::new(20.0, 500.0))
                             .color(ink("#e4e4e7")),
                     ),
             )
@@ -851,7 +855,7 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                     .child(
                         text(label.clone())
                             .key("providerkeys-title")
-                            .font(rune::tok::TextStyle::new(15.0, 600.0))
+                            .font(rune::tok::TextStyle::new(16.5, 600.0))
                             .color(ink("#f4f4f5")),
                     )
                     .child(
@@ -861,7 +865,7 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                             format!("{provider} · {model}")
                         })
                         .key("providerkeys-model")
-                        .font(rune::tok::TextStyle::new(10.5, 400.0).mono())
+                        .font(rune::tok::TextStyle::new(11.0, 400.0).mono())
                         .color(ink("#71717a")),
                     ),
             )
@@ -882,9 +886,9 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
     let mut usage_card = col()
         .key("providerkeys-usage")
         .w_full()
-        .gap(9.0)
-        .px(14.0)
-        .py(12.0)
+        .gap(11.0)
+        .px(16.0)
+        .py(14.0)
         .radius(12.0)
         .fill(ink("#ffffff05"))
         .border(1.0, ink("#ffffff10"))
@@ -899,14 +903,14 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                         .min_w(0.0)
                         .child(
                             text("OpenCode Go allowance".to_string())
-                                .font(rune::tok::TextStyle::new(11.5, 600.0))
+                                .font(rune::tok::TextStyle::new(13.0, 600.0))
                                 .color(ink("#e4e4e7")),
                         )
                         .child(
                             text(format!(
                                 "{active_label} · 5-hour, weekly and monthly limits"
                             ))
-                            .font(rune::tok::TextStyle::new(9.5, 400.0))
+                            .font(rune::tok::TextStyle::new(10.5, 400.0))
                             .color(ink("#71717a")),
                         ),
                 )
@@ -923,11 +927,11 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                     .role("button")
                     .focusable(true)
                     .label("Refresh OpenCode Go usage")
-                    .font(rune::tok::TextStyle::new(10.0, 500.0))
+                    .font(rune::tok::TextStyle::new(10.5, 500.0))
                     .color(ink("#a1a1aa"))
-                    .px(8.0)
-                    .py(4.0)
-                    .radius(6.0)
+                    .px(10.0)
+                    .py(5.0)
+                    .radius(7.0)
                     .fill(ink("#ffffff08"))
                     .hover(ink("#ffffff14"))
                     .on_press_enter(move |s: &mut S| {
@@ -973,12 +977,12 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                     .min_w(0.0)
                     .child(
                         text("API keys".to_string())
-                            .font(rune::tok::TextStyle::new(11.5, 600.0))
+                            .font(rune::tok::TextStyle::new(13.0, 600.0))
                             .color(ink("#e4e4e7")),
                     )
                     .child(
                         text("Use switches the active key. Allowance reloads above.".to_string())
-                            .font(rune::tok::TextStyle::new(9.5, 400.0))
+                            .font(rune::tok::TextStyle::new(10.5, 400.0))
                             .color(ink("#71717a")),
                     ),
             )
@@ -999,10 +1003,10 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                 } else {
                     "Add an API key"
                 })
-                .font(rune::tok::TextStyle::new(10.5, 600.0))
+                .font(rune::tok::TextStyle::new(11.0, 600.0))
                 .color(ink("#09090b"))
-                .px(10.0)
-                .py(5.0)
+                .px(12.0)
+                .py(6.0)
                 .radius(7.0)
                 .fill(ink("#f4f4f5"))
                 .hover(ink("#ffffff"))
@@ -1049,9 +1053,9 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
             .key(format!("providerkeys-key-{}", key.id))
             .w_full()
             .items_center()
-            .gap(10.0)
-            .px(12.0)
-            .py(9.0)
+            .gap(12.0)
+            .px(14.0)
+            .py(11.0)
             .radius(10.0)
             .fill(ink(if row_active { "#ffffff0a" } else { "#ffffff03" }))
             .border(1.0, ink(if row_active { "#ffffff1f" } else { "#ffffff0d" }))
@@ -1072,7 +1076,7 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                             .gap(6.0)
                             .child(
                                 text(row_label)
-                                    .font(rune::tok::TextStyle::new(11.5, 500.0))
+                                    .font(rune::tok::TextStyle::new(12.5, 500.0))
                                     .color(ink(if row_active { "#f4f4f5" } else { "#d4d4d8" })),
                             )
                             .child(
@@ -1083,7 +1087,7 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                     )
                     .child(
                         text(row_masked)
-                            .font(rune::tok::TextStyle::new(10.0, 400.0).mono())
+                            .font(rune::tok::TextStyle::new(10.5, 400.0).mono())
                             .color(ink("#71717a")),
                     ),
             );
@@ -1146,10 +1150,10 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                     .role("button")
                     .focusable(true)
                     .label(format!("Use {}", key.label))
-                    .font(rune::tok::TextStyle::new(10.0, 600.0))
+                    .font(rune::tok::TextStyle::new(11.0, 600.0))
                     .color(ink("#09090b"))
-                    .px(10.0)
-                    .py(5.0)
+                    .px(12.0)
+                    .py(6.0)
                     .radius(7.0)
                     .fill(ink("#f4f4f5"))
                     .hover(ink("#ffffff"))
@@ -1344,9 +1348,11 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
         .w_full()
         .items_center()
         .gap(8.0)
-        .px(18.0)
-        .pt(6.0)
-        .pb(12.0)
+        .px(20.0)
+        .pt(10.0)
+        .pb(14.0)
+        .border_sides([0.0, 0.0, 1.0, 0.0], ink("#ffffff0f"))
+        .border_layout()
         .child(
             text("Agent settings".to_string())
                 .role("button")
@@ -1375,10 +1381,10 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                 .role("button")
                 .focusable(true)
                 .label("Close provider settings")
-                .font(rune::tok::TextStyle::new(10.5, 600.0))
+                .font(rune::tok::TextStyle::new(11.0, 600.0))
                 .color(ink("#e4e4e7"))
-                .px(10.0)
-                .py(5.0)
+                .px(14.0)
+                .py(6.0)
                 .radius(7.0)
                 .fill(ink("#ffffff0d"))
                 .border(1.0, ink("#ffffff14"))
@@ -1390,7 +1396,7 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
         .key("providerkeys-card")
         .transition(crate::motion::modal_enter())
         .w(card_w)
-        .max_h(card_h)
+        .max_h(max_card_h)
         .radius(16.0)
         .fill(ink("#09090b"))
         .border(1.0, ink("#ffffff14"))
@@ -1416,9 +1422,9 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                 .w_full()
                 .items_center()
                 .gap(10.0)
-                .px(18.0)
-                .pt(14.0)
-                .pb(10.0)
+                .px(20.0)
+                .pt(16.0)
+                .pb(11.0)
                 .child(
                     col()
                         .grow(1.0)
@@ -1426,7 +1432,7 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                         .child(
                             text("Provider".to_string())
                                 .key("providerkeys-head-title")
-                                .font(rune::tok::TextStyle::new(14.0, 600.0))
+                                .font(rune::tok::TextStyle::new(15.0, 600.0))
                                 .color(ink("#f4f4f5")),
                         )
                         .child(
@@ -1448,7 +1454,7 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
         )
         .child(body)
         .child(footer);
-    if card_h > 0.0 {
+    if overflows {
         card = card.h(card_h);
     }
     rune::el()
@@ -1656,7 +1662,7 @@ mod tests {
             assert!(rt.find(gone).is_none(), "{gone} removed");
         }
         let (rect, _) = rt.presented("providerkeys-card").expect("card rect");
-        assert!(rect[3] <= 480.0, "compact card height, got {}", rect[3]);
+        assert!(rect[3] <= 560.0, "compact card height, got {}", rect[3]);
     }
 
     #[test]

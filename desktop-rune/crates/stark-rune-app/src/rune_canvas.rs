@@ -466,6 +466,9 @@ pub struct CanvasState {
     /// Tabs whose history the shell still has to fetch (boot fallback +
     /// auto-opened project chats).
     pub pending_chat_fetches: Vec<(String, String)>,
+    /// Chats whose history already landed on the map, so spawned child cards
+    /// fetch once instead of on every snapshot.
+    pub hydrated_chats: std::collections::HashSet<String>,
     /// The chat with a live backend run (`workspace:chat`, the reference UI
     /// `runningTabId`); drives the dot on sidebar rows and tabs.
     pub running_tab: Option<String>,
@@ -526,6 +529,7 @@ impl Clone for CanvasState {
             active_tab: self.active_tab.clone(),
             known_chats: self.known_chats.clone(),
             pending_chat_fetches: self.pending_chat_fetches.clone(),
+            hydrated_chats: self.hydrated_chats.clone(),
             running_tab: self.running_tab.clone(),
             real: self.real,
             manual_cards: self.manual_cards.clone(),
@@ -633,6 +637,7 @@ impl CanvasState {
             active_tab: String::new(),
             known_chats: std::collections::HashSet::new(),
             pending_chat_fetches: Vec::new(),
+            hydrated_chats: std::collections::HashSet::new(),
             running_tab: None,
             real: false,
             manual_cards: std::collections::HashSet::new(),
@@ -758,6 +763,24 @@ impl CanvasState {
         self.layout_meta = layout_meta;
         self.edges = edges;
         self.sessions.order = self.cards.iter().map(|c| c.id.clone()).collect();
+        // Spawned child cards are on the map without being tabs, so the boot
+        // hydrate never touches them. Fetch each real chat's history once.
+        let mut fetches = std::mem::take(&mut self.pending_chat_fetches);
+        for card in &self.cards {
+            let Some(key) = card.id.strip_prefix("chat:") else {
+                continue;
+            };
+            if key.starts_with("local:") || self.hydrated_chats.contains(key) {
+                continue;
+            }
+            let Some(pair) = split_chat_key(key) else {
+                continue;
+            };
+            if !fetches.contains(&pair) {
+                fetches.push(pair);
+            }
+        }
+        self.pending_chat_fetches = fetches;
     }
 
     /// Adopt the boot snapshot: server layout wins once (open tabs, active
@@ -785,6 +808,7 @@ impl CanvasState {
             self.card_attachment_errors.clear();
             self.card_drop = None;
             self.known_chats.clear();
+            self.hydrated_chats.clear();
             self.running_tab = None;
             return;
         }
@@ -1037,6 +1061,15 @@ impl CanvasState {
     /// Fill one card's transcript from a per-chat history fetch.
     pub fn apply_chat_messages(&mut self, key: &str, rows: &[crate::chats::ChatMsgRow]) -> bool {
         let card_id = format!("chat:{key}");
+        if !self.sessions.threads.contains_key(&card_id) {
+            // Spawned child cards have no tab and no thread until they render;
+            // create it here so their fetched history has somewhere to land.
+            if self.card(&card_id).is_none() {
+                return false;
+            }
+            self.thread_mut(&card_id);
+        }
+        self.hydrated_chats.insert(key.to_string());
         let Some(thread) = self.sessions.threads.get_mut(&card_id) else {
             return false;
         };
@@ -5566,6 +5599,32 @@ pub fn run_canvas_headless(extra_args: Vec<String>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn spawned_card_history_lands_before_it_renders() {
+        use super::*;
+        let mut canvas = CanvasState::map();
+        // A non-tab card: spawned children are on the map without a thread.
+        let card_id = "chat:ws-general:chat-2".to_string();
+        assert!(canvas.card(&card_id).is_some());
+        canvas.sessions.threads.remove(&card_id);
+        let rows = vec![crate::chats::ChatMsgRow {
+            key: "m1".to_string(),
+            role: "agent".to_string(),
+            body: "child reply".to_string(),
+            raw_body: "child reply".to_string(),
+            ..crate::chats::ChatMsgRow::default()
+        }];
+        assert!(canvas.apply_chat_messages("ws-general:chat-2", &rows));
+        let thread = canvas
+            .sessions
+            .threads
+            .get(&card_id)
+            .expect("thread created for the card");
+        assert_eq!(thread.rows.len(), 1);
+        assert_eq!(thread.rows[0].body, "child reply");
+        assert!(canvas.hydrated_chats.contains("ws-general:chat-2"));
+    }
+
     use super::*;
     use rune::{Env, Runtime};
 

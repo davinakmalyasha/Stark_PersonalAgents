@@ -2346,6 +2346,7 @@ fn poll_chats(s: &mut ShellState, clock: f64) -> bool {
                         if format!("{}:{}", thread.workspace_id, thread.chat_id) == key {
                             thread.rows =
                                 rows.iter().map(crate::rune_canvas::row_from_chat).collect();
+                            thread.sync_usage_from_rows();
                             thread.live = false;
                             thread.aborting = false;
                         }

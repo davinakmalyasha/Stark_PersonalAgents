@@ -102,9 +102,40 @@ fn inline_code_span(start: usize, end: usize) -> (rune::Span, rune::TextHighligh
     )
 }
 
+/// Inline code needs real advance around it: the well's paint-only 6px pad
+/// otherwise covers the neighbouring space and reads as `is`+`General`
+/// glued together. EN spaces are inserted into the display text (copy still
+/// uses the raw markdown), one when the neighbour is whitespace, two when
+/// the code butts against a word.
+const CODE_SPACE: char = '\u{2002}';
+
+fn inline_edge(inline: &stark_kit::markdown::Inline, first: bool) -> Option<char> {
+    use stark_kit::markdown::Inline;
+    let pick = |text: &str| {
+        if first {
+            text.chars().next()
+        } else {
+            text.chars().last()
+        }
+    };
+    match inline {
+        Inline::Text(t) | Inline::Code(t) => pick(t),
+        Inline::Bold(items) | Inline::Italic(items) | Inline::Strike(items) => {
+            let item = if first { items.first() } else { items.last() }?;
+            inline_edge(item, first)
+        }
+        Inline::Link { text, .. } => {
+            let item = if first { text.first() } else { text.last() }?;
+            inline_edge(item, first)
+        }
+        Inline::Image { alt, .. } => pick(alt),
+        Inline::Break => Some('\n'),
+    }
+}
+
 fn inlines(runs: &mut Runs, list: &[stark_kit::markdown::Inline], italic: bool) {
     use stark_kit::markdown::Inline;
-    for inline in list {
+    for (index, inline) in list.iter().enumerate() {
         match inline {
             Inline::Text(t) => {
                 let start = runs.text.len();
@@ -116,12 +147,31 @@ fn inlines(runs: &mut Runs, list: &[stark_kit::markdown::Inline], italic: bool) 
             }
             Inline::Break => runs.text.push('\n'),
             Inline::Code(t) => {
+                // Breathing room around the well (see `CODE_SPACE`).
+                let prev = runs.text.chars().last();
+                let next = list.get(index + 1).and_then(|item| inline_edge(item, true));
+                match prev {
+                    None => {}
+                    Some(c) if c.is_whitespace() => runs.text.push(CODE_SPACE),
+                    Some(_) => {
+                        runs.text.push(CODE_SPACE);
+                        runs.text.push(CODE_SPACE);
+                    }
+                }
                 let start = runs.text.len();
                 runs.text.push_str(t);
                 let (span, highlight) = inline_code_span(start, runs.text.len());
                 runs.spans.push(span);
                 runs.highlights.push(highlight);
                 runs.codes.push((start, runs.text.len()));
+                match next {
+                    None => {}
+                    Some(c) if c.is_whitespace() => runs.text.push(CODE_SPACE),
+                    Some(_) => {
+                        runs.text.push(CODE_SPACE);
+                        runs.text.push(CODE_SPACE);
+                    }
+                }
             }
             Inline::Bold(inner) => {
                 let start = runs.text.len();
@@ -1576,6 +1626,34 @@ mod streaming_tests {
         );
         // Empty items and non-para first blocks pass through untouched.
         assert!(prepend_space(&[]).is_empty());
+    }
+
+    #[test]
+    fn inline_code_gets_breathing_room() {
+        use stark_kit::markdown::Inline;
+        let mut runs = Runs::default();
+        inlines(
+            &mut runs,
+            &[
+                Inline::Text("is ".into()),
+                Inline::Code("General".into()),
+                Inline::Text(" (the".into()),
+            ],
+            false,
+        );
+        assert!(
+            runs.text.starts_with("is \u{2002}General\u{2002} "),
+            "spaces stay around the code well: {:?}",
+            runs.text
+        );
+        // Word-adjacent code gets two EN spaces so the 6px pad cannot overlap.
+        let mut tight = Runs::default();
+        inlines(
+            &mut tight,
+            &[Inline::Text("foo".into()), Inline::Code("bar".into())],
+            false,
+        );
+        assert!(tight.text.starts_with("foo\u{2002}\u{2002}bar"));
     }
 
     #[test]

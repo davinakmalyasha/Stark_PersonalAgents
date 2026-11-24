@@ -747,8 +747,12 @@ pub struct RuneTranscriptState {
     /// changes where the NEXT prompt is marked to go — the transfer itself
     /// lands next, same as the reference UI, so sends behave identically either way.
     pub run_target: String,
-    /// Usage totals for the orb + popover (`combinedTokenUsage`).
+    /// Usage totals for the orb + popover (`combinedTokenUsage`). Live runs
+    /// accumulate from `delta kind:"usage"`; loaded history rebuilds from the
+    /// rows' persisted `metadata.usage` (see `sync_usage_from_rows`).
     pub usage: UsageTotals,
+    /// Hovered user-turn tick in the conversation rail.
+    pub rail_hover: Option<usize>,
     /// Usage popover open (tap the orb; the reference UI hovers — tap is the honest
     /// native equivalent, no hover targeting headlessly).
     pub usage_open: bool,
@@ -907,6 +911,7 @@ impl Clone for RuneTranscriptState {
             ask: self.ask.clone(),
             run_target: self.run_target.clone(),
             usage: self.usage.clone(),
+            rail_hover: self.rail_hover,
             usage_open: self.usage_open,
             stats_open: self.stats_open,
             agent_config: self.agent_config.clone(),
@@ -1019,6 +1024,7 @@ impl RuneTranscriptState {
             ask: crate::ask::AskState::default(),
             run_target: "local".to_string(),
             usage: UsageTotals::default(),
+            rail_hover: None,
             usage_open: false,
             stats_open: false,
             agent_config: crate::agent_config::AgentConfigState::default(),
@@ -1103,6 +1109,7 @@ impl RuneTranscriptState {
             ask: crate::ask::AskState::default(),
             run_target: "local".to_string(),
             usage: UsageTotals::default(),
+            rail_hover: None,
             usage_open: false,
             stats_open: false,
             agent_config: crate::agent_config::AgentConfigState::default(),
@@ -1514,6 +1521,42 @@ fn chat_title(prompt: &str) -> String {
 }
 
 impl RuneTranscriptState {
+    /// Rebuild the thread's usage totals from the loaded rows.
+    ///
+    /// Live runs already accumulate from `delta kind:"usage"` frames; a chat
+    /// restored from history has no frames to replay, so the orb/popover read
+    /// zero until this runs. Each agent row carries its persisted
+    /// `metadata.usage`, which is also where retries and restored runs live.
+    pub fn sync_usage_from_rows(&mut self) {
+        let mut totals = UsageTotals::default();
+        for row in &self.rows {
+            if !row.has_usage {
+                continue;
+            }
+            let (input, output, hits, cost) = match &row.run_usage {
+                Some(u) => (u.input, u.output, u.cache_hit, u.cost),
+                None => (row.tokens_in, row.tokens_out, 0, 0.0),
+            };
+            totals.input = totals.input.saturating_add(input);
+            totals.output = totals.output.saturating_add(output);
+            totals.cache_hit = totals.cache_hit.saturating_add(hits);
+            totals.cost += cost;
+            // The last usage-bearing call is the current context size.
+            totals.active = input;
+            totals.calls.push(UsageCall {
+                agent: "chat".to_string(),
+                model: self.model.clone(),
+                input,
+                output,
+                hits,
+                misses: input.saturating_sub(hits),
+                cost,
+                at: row.at.clone(),
+            });
+        }
+        self.usage = totals;
+    }
+
     /// `workspaceKind` sent with the chat run command (deterministic routing).
     pub fn workspace_kind(&self) -> String {
         match self.workspace_id.as_str() {
@@ -3144,6 +3187,7 @@ fn apply_rewind(s: &mut RuneTranscriptState, result: RewindOk) {
         .iter()
         .map(crate::rune_canvas::row_from_chat)
         .collect();
+    s.sync_usage_from_rows();
     // A rewound row is gone for good; if it ever comes back it is a fresh
     // mount and should animate again.
     let live: std::collections::HashSet<String> =
@@ -3567,6 +3611,8 @@ fn home_user_row<S: TranscriptHost + 'static>(s: &S, which: Thread, r: &RowData,
     if let Some(attachments) = home_message_attachments::<S>(s, which, r) {
         bubble = bubble.child(attachments);
     }
+    // Copy and rewind belong to user turns only; the whole message band is
+    // the hover trigger, so the strip appears without aiming at the bubble.
     let mut actions = row()
         .key(format!("{}-actions", r.key))
         .w_full()
@@ -3574,7 +3620,8 @@ fn home_user_row<S: TranscriptHost + 'static>(s: &S, which: Thread, r: &RowData,
         .items_center()
         .gap(4.0)
         .mt(4.0)
-        .pr(2.0);
+        .pr(2.0)
+        .group_opacity(0.0, 1.0);
     if !stamp.is_empty() {
         actions = actions.child(
             text(stamp)
@@ -3684,6 +3731,7 @@ fn home_user_row<S: TranscriptHost + 'static>(s: &S, which: Thread, r: &RowData,
         .key(format!("{}-group", r.key))
         .w_full()
         .mb(24.0)
+        .hover_group()
         .child(row().w_full().justify_end().child(bubble))
         .child(actions)
 }
@@ -3693,7 +3741,7 @@ fn home_agent_row<S: TranscriptHost + 'static>(
     which: Thread,
     r: &RowData,
     live: bool,
-    retry_prompt: &str,
+    _retry_prompt: &str,
 ) -> El {
     let streaming = r.is_streaming || (live && r.accum.is_some());
     let presentation = if let Some(acc) = &r.accum {
@@ -3838,49 +3886,51 @@ fn home_agent_row<S: TranscriptHost + 'static>(
         group = group.child(dots);
     }
 
-    if r.has_usage && !streaming {
+    if !streaming {
         let mono = {
             let mut style = rune::tok::TextStyle::new(10.5, 400.0).mono();
             // `.agent-message-footer`: text-[10.5px] at leading 1.5.
             style.line_height = 15.75;
             style
         };
+        // Tokens, time and copy share one left-aligned strip. It stays
+        // invisible at rest (but occupies its line) and fades in with the
+        // row's hover; agents offer copy only.
         let mut footer = row()
             .key(format!("{}-footer", r.key))
+            .w_full()
             .items_center()
-            .gap(12.0)
+            .gap(10.0)
             .mt(8.0)
-            .child(
-                text(format!("↑{}", thousands(r.tokens_in)))
-                    .key(format!("{}-in", r.key))
-                    .font(mono)
-                    .color(home_ink("#52525b")),
-            )
-            .child(
-                text(format!("↓{}", thousands(r.tokens_out)))
-                    .key(format!("{}-out", r.key))
-                    .font(mono)
-                    .color(home_ink("#52525b")),
-            );
-        let stamp = clock(&r.at);
-        if !stamp.is_empty() {
-            footer = footer.child(
-                text(stamp)
-                    .key(format!("{}-time", r.key))
-                    .font(mono)
-                    .color(home_ink("#52525b")),
-            );
+            .group_opacity(0.0, 1.0);
+        if r.has_usage {
+            footer = footer
+                .child(
+                    text(format!("↑{}", thousands(r.tokens_in)))
+                        .key(format!("{}-in", r.key))
+                        .font(mono)
+                        .color(home_ink("#52525b")),
+                )
+                .child(
+                    text(format!("↓{}", thousands(r.tokens_out)))
+                        .key(format!("{}-out", r.key))
+                        .font(mono)
+                        .color(home_ink("#52525b")),
+                );
+            let stamp = clock(&r.at);
+            if !stamp.is_empty() {
+                footer = footer.child(
+                    text(stamp)
+                        .key(format!("{}-time", r.key))
+                        .font(mono)
+                        .color(home_ink("#52525b")),
+                );
+            }
         }
+        footer = footer.child(agent_copy_action::<S>(which, r, &final_text));
         group = group.child(footer);
     }
-    group.child(home_agent_actions(
-        s,
-        which,
-        r,
-        &final_text,
-        streaming,
-        retry_prompt,
-    ))
+    group
 }
 
 /// Undo pill state per artifact row is `ArtifactUndo` (`idle` = absent).
@@ -4604,75 +4654,34 @@ fn thousands(n: u64) -> String {
     out
 }
 
-/// Hover-revealed agent actions (the reference UI reserves the 25pt row at rest).
-/// Retry hides while the answer streams; copy always stays. Agent copy has
-/// no Check feedback (the reference UI writes to the clipboard only).
-fn home_agent_actions<S: TranscriptHost + 'static>(
-    _s: &S,
+/// Agent copy action, placed in the footer beside the token/time strip.
+/// Agents never offer rewind or retry here; their turn is already complete.
+fn agent_copy_action<S: TranscriptHost + 'static>(
     which: Thread,
     r: &RowData,
     response: &str,
-    streaming: bool,
-    retry_prompt: &str,
 ) -> El {
-    let mut actions = row()
-        .key(format!("{}-actions", r.key))
-        .w_full()
-        .h(25.0)
-        .justify_end()
-        .items_center()
-        .gap(2.0)
-        .mt(8.0)
-        .group_opacity(0.0, 1.0);
-    if !streaming {
-        let prompt = retry_prompt.to_string();
-        actions = actions.child(
-            rune::el()
-                .key(format!("{}-retry", r.key))
-                .role("button")
-                .focusable(true)
-                .label("Retry — re-run the last request")
-                .size(25.0, 25.0)
-                .radius(6.0)
-                .center()
-                .hover(home_ink("#27272a"))
-                .hover_group()
-                .on_press_tx_enter(move |s: &mut S, _tx: &mut rune::Tx| {
-                    stage_send_prompt(s.thread_mut(which), prompt.clone());
-                })
-                // `.pressable:active { transform: scale(.96) }`; after the
-                // press handler, which is when `press_scale` takes.
-                .press_scale(0.96)
-                .child(crate::motion::hover_icon(
-                    12.0,
-                    home_icon_rotate(12.0, home_ink("#71717a")),
-                    home_icon_rotate(12.0, home_ink("#d4d4d8")),
-                )),
-        );
-    }
     let copy_text = response.to_string();
     let copy_key = r.key.clone();
-    actions.child(
-        rune::el()
-            .key(format!("{}-copy", r.key))
-            .role("button")
-            .focusable(true)
-            .label("Copy to clipboard")
-            .size(25.0, 25.0)
-            .radius(6.0)
-            .center()
-            .hover(home_ink("#27272a"))
-            .hover_group()
-            .on_press_tx_enter(move |s: &mut S, tx: &mut rune::Tx| {
-                copy_message(s, which, &copy_key, copy_text.clone(), false, tx);
-            })
-            .press_scale(0.96)
-            .child(crate::motion::hover_icon(
-                12.0,
-                home_icon_copy(12.0, home_ink("#71717a")),
-                home_icon_copy(12.0, home_ink("#d4d4d8")),
-            )),
-    )
+    rune::el()
+        .key(format!("{}-copy", r.key))
+        .role("button")
+        .focusable(true)
+        .label("Copy to clipboard")
+        .size(25.0, 25.0)
+        .radius(6.0)
+        .center()
+        .hover(home_ink("#27272a"))
+        .hover_group()
+        .on_press_tx_enter(move |s: &mut S, tx: &mut rune::Tx| {
+            copy_message(s, which, &copy_key, copy_text.clone(), false, tx);
+        })
+        .press_scale(0.96)
+        .child(crate::motion::hover_icon(
+            12.0,
+            home_icon_copy(12.0, home_ink("#71717a")),
+            home_icon_copy(12.0, home_ink("#d4d4d8")),
+        ))
 }
 
 /// `MessageBubble` system note (`.system-message-note`).
@@ -5091,80 +5100,150 @@ fn home_row<S: TranscriptHost + 'static>(
     root.child(group)
 }
 
-/// `ConversationRail`: up to six 7×2 turn dashes centered in a 24pt column
-/// at the scroll area's left edge (the reference UI hides it below two turns).
-fn conversation_rail(rows: &[RowData]) -> Option<El> {
-    let mut turns: Vec<Vec<&RowData>> = Vec::new();
-    let mut current: Vec<&RowData> = Vec::new();
-    for r in rows.iter().filter(|r| !raw_of(r).trim().is_empty()) {
-        if r.role == "user" && !current.is_empty() {
-            turns.push(std::mem::take(&mut current));
+/// One-line preview for the rail card: collapse whitespace and clip.
+fn user_preview(body: &str) -> String {
+    let flat: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= 180 {
+        return flat;
+    }
+    let cut: String = flat.chars().take(177).collect();
+    format!("{cut}â€¦")
+}
+
+/// `ConversationRail`: one tick per user message at the scroll area's left
+/// edge. Hovering a tick widens it (and eases its neighbours), then shows a
+/// small preview card with that message; the rail stays out of the way at
+/// rest. Up to twelve newest messages stay direct; older ones fold into one
+/// quiet dash.
+fn conversation_rail<S: TranscriptHost + 'static>(
+    s: &RuneTranscriptState,
+    which: Thread,
+) -> Option<El> {
+    let mut marks: Vec<usize> = Vec::new();
+    for (index, row) in s.rows.iter().enumerate() {
+        if row.role == "user" && !raw_of(row).trim().is_empty() {
+            marks.push(index);
         }
-        current.push(r);
     }
-    if !current.is_empty() {
-        turns.push(current);
-    }
-    if turns.len() < 2 {
+    if marks.is_empty() {
         return None;
     }
-    let role_of = |turn: &[&RowData]| {
-        if turn.iter().any(|r| r.role == "user") {
-            "user"
-        } else if turn.iter().any(|r| r.role == "error") {
-            "error"
-        } else {
-            "agent"
-        }
-    };
-    let mut markers: Vec<(&str, String)> = turns
-        .iter()
-        .enumerate()
-        .map(|(i, turn)| (role_of(turn), format!("mark-{i}")))
-        .collect();
-    if markers.len() > 6 {
-        // Fold everything older than the newest five into one quiet dash.
-        let earlier = markers.len() - 5;
-        let mut folded = vec![("system", "mark-earlier".to_string())];
-        folded.extend(markers.drain(earlier..));
-        markers = folded;
-    }
+    let start = marks.len().saturating_sub(12);
+    let folded = start > 0;
+    let marks = &marks[start..];
+
     let mut rail = col()
         .key("conversation-rail")
         .w(24.0)
         .pin(Some(4.0), Some(16.0), None, Some(16.0))
         .justify_center()
-        .inert();
-    for (role, id) in markers {
-        let color = match role {
-            "user" => rune::Color {
-                r: 1.0,
-                g: 1.0,
-                b: 1.0,
-                a: 0.46,
-            },
-            "error" => home_rgba(251.0, 113.0, 133.0, 0.72),
-            "system" => rune::Color {
-                r: 1.0,
-                g: 1.0,
-                b: 1.0,
-                a: 0.18,
-            },
-            _ => rune::Color {
-                r: 1.0,
-                g: 1.0,
-                b: 1.0,
-                a: 0.28,
-            },
-        };
+        .gap(2.0);
+    if folded {
         rail = rail.child(
             row()
-                .key(format!("conversation-{id}"))
+                .key("conversation-mark-earlier")
                 .w(24.0)
-                .h(14.0)
+                .h(12.0)
                 .items_center()
-                .child(rune::el().size(7.0, 2.0).radius(1.0).fill(color)),
+                .inert()
+                .child(
+                    rune::el()
+                        .size(7.0, 2.0)
+                        .radius(1.0)
+                        .fill(home_rgba(255.0, 255.0, 255.0, 0.14)),
+                ),
         );
+    }
+
+    for (slot, row_index) in marks.iter().enumerate() {
+        let msg = &s.rows[*row_index];
+        let hovered = s.rail_hover == Some(slot);
+        let near = s.rail_hover.is_some_and(|h| h.abs_diff(slot) == 1);
+        // Hovered tick grows most; its direct neighbours grow a little.
+        let width = if hovered {
+            15.0
+        } else if near {
+            10.0
+        } else {
+            7.0
+        };
+        let alpha = if hovered {
+            0.92
+        } else if near {
+            0.55
+        } else {
+            0.28
+        };
+        let mut tick = row()
+            .key(format!("conversation-mark-{slot}"))
+            .w(24.0)
+            .h(14.0)
+            .items_center()
+            .on_hover_change(move |s: &mut S, inside, _tx| {
+                let thread = s.thread_mut(which);
+                if inside {
+                    thread.rail_hover = Some(slot);
+                } else if thread.rail_hover == Some(slot) {
+                    thread.rail_hover = None;
+                }
+            })
+            .child(
+                rune::el()
+                    .size(width, 2.0)
+                    .radius(1.0)
+                    .fill(home_rgba(255.0, 255.0, 255.0, alpha)),
+            );
+        if hovered {
+            let preview = user_preview(&msg.body);
+            let stamp = clock(&msg.at);
+            tick = tick.child(
+                col()
+                    .key("conversation-preview")
+                    .absolute(26.0, -8.0)
+                    .w(252.0)
+                    .gap(4.0)
+                    .px(11.0)
+                    .py(9.0)
+                    .radius(10.0)
+                    .fill(home_ink("#16161a"))
+                    .border(1.0, home_rgba(255.0, 255.0, 255.0, 0.12))
+                    .border_layout()
+                    .box_shadow(rune::Shadow {
+                        x: 0.0,
+                        y: 10.0,
+                        blur: 28.0,
+                        spread: -6.0,
+                        color: home_rgba(0.0, 0.0, 0.0, 0.6),
+                        inset: false,
+                    })
+                    .inert()
+                    .child(
+                        row()
+                            .w_full()
+                            .items_center()
+                            .gap(6.0)
+                            .child(
+                                text("You".to_string())
+                                    .font(rune::tok::TextStyle::new(10.0, 650.0))
+                                    .color(home_ink("#e4e4e7")),
+                            )
+                            .child(rune::el().grow(1.0))
+                            .child(
+                                text(stamp)
+                                    .font(rune::tok::TextStyle::new(9.0, 400.0))
+                                    .color(home_ink("#52525b")),
+                            ),
+                    )
+                    .child(
+                        text(preview)
+                            .w_full()
+                            .wrap()
+                            .font(rune::tok::TextStyle::new(11.0, 400.0))
+                            .color(home_ink("#a1a1aa")),
+                    ),
+            );
+        }
+        rail = rail.child(tick);
     }
     Some(rail)
 }
@@ -5810,7 +5889,7 @@ fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'sta
         .grow(1.0)
         .min_h(0.0)
         .child(viewport);
-    if let Some(rail) = conversation_rail(&s.rows) {
+    if let Some(rail) = conversation_rail::<S>(s, which) {
         view = view.child(rail);
     }
     // Jump-to-latest pill (`.scroll-bottom-pill`). Always mounted with a
@@ -6587,6 +6666,103 @@ pub fn run_headless_or_windowed(extra_args: Vec<String>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn usage_totals_rebuild_from_history_rows() {
+        use super::*;
+        let mut thread = RuneTranscriptState::screenshot();
+        thread.model = "deepseek-v4.1-flash".to_string();
+        thread.rows[1].has_usage = true;
+        thread.rows[1].tokens_in = 1_240;
+        thread.rows[1].tokens_out = 86;
+        thread.rows[1].run_usage = Some(RunUsage {
+            input: 1_240,
+            output: 86,
+            cache_hit: 1_000,
+            cost: 0.012,
+        });
+        thread.sync_usage_from_rows();
+        assert_eq!(thread.usage.input, 1_240);
+        assert_eq!(thread.usage.output, 86);
+        assert_eq!(thread.usage.cache_hit, 1_000);
+        assert!((thread.usage.cost - 0.012).abs() < 1e-9);
+        // Context is the last usage-bearing call.
+        assert_eq!(thread.usage.active, 1_240);
+        assert_eq!(thread.usage.calls.len(), 1);
+    }
+
+    #[test]
+    fn agent_footer_is_copy_only_and_user_keeps_rewind() {
+        use super::*;
+        use rune::{Env, Runtime};
+        let mut init = RuneTranscriptState::screenshot();
+        init.live = false;
+        // A short pair keeps both footers inside the virtual window.
+        init.rows = vec![
+            RowData {
+                key: "short-user".to_string(),
+                role: "user",
+                body: "hello".to_string(),
+                at: "2026-11-24T10:00:00Z".to_string(),
+                ..RowData::default()
+            },
+            RowData {
+                key: "short-agent".to_string(),
+                role: "agent",
+                body: "Hi.".to_string(),
+                final_text: "Hi.".to_string(),
+                at: "2026-11-24T10:00:02Z".to_string(),
+                has_usage: true,
+                tokens_in: 12,
+                tokens_out: 3,
+                run_usage: Some(RunUsage {
+                    input: 12,
+                    output: 3,
+                    ..RunUsage::default()
+                }),
+                ..RowData::default()
+            },
+        ];
+        // The home card is the flat transcript (the sheet uses the canvas
+        // bubble renderer), so render that variant.
+        fn home_view(s: &RuneTranscriptState, _cx: &mut Cx<RuneTranscriptState>) -> El {
+            home_transcript_body::<RuneTranscriptState>(s, Thread::Main, 468.0, 720.0, false)
+        }
+        let mut rt = Runtime::new(init, home_view, (900.0, 700.0), Env::new(true, 1.0));
+        rt.frame(0.0);
+        // Agents: copy only, no retry/rewind in the completed footer.
+        assert!(rt.find("short-agent-copy").is_some(), "agent copy");
+        assert!(rt.find("short-agent-retry").is_none(), "no agent retry");
+        assert!(rt.find("short-agent-rewind").is_none(), "no agent rewind");
+        // Users keep copy and rewind.
+        assert!(rt.find("short-user-copy").is_some(), "user copy");
+        assert!(rt.find("short-user-rewind").is_some(), "user rewind");
+    }
+
+    #[test]
+    fn rail_tick_hover_shows_the_message_preview() {
+        use super::*;
+        use rune::{Env, Runtime};
+        let mut init = RuneTranscriptState::screenshot();
+        init.live = false;
+        let mut rt = Runtime::new(init, transcript_view, (900.0, 700.0), Env::new(true, 1.0));
+        rt.frame(0.0);
+        assert!(rt.find("conversation-rail").is_some());
+        assert!(
+            rt.find("conversation-preview").is_none(),
+            "preview rests hidden"
+        );
+        let (x, y) = rt.find("conversation-mark-0").expect("user tick");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..6 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(
+            rt.find("conversation-preview").is_some(),
+            "hover reveals the preview"
+        );
+    }
+
     use super::*;
     use rune::{Env, Runtime};
 

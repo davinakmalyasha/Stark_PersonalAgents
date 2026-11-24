@@ -955,6 +955,7 @@ impl CanvasState {
             if !thread.live && !thread.aborting {
                 if let Some(rows) = snapshot.messages.get(&key) {
                     thread.rows = rows.iter().map(row_from_chat).collect();
+                    thread.sync_usage_from_rows();
                 }
             }
         }
@@ -1046,6 +1047,7 @@ impl CanvasState {
             rows.iter().map(|row| row.key.clone()).collect();
         thread.seen_rows.retain(|key| live.contains(key));
         thread.rows = rows.iter().map(row_from_chat).collect();
+        thread.sync_usage_from_rows();
         thread.live = false;
         thread.aborting = false;
         if let Some((ws, chat)) = key.split_once(':') {
@@ -2261,16 +2263,16 @@ fn mini_bubble<S: CanvasHost + 'static>(
         .py(10.0)
         .max_w(390.0)
         .child(head)
-        .child(
-            text(r.body.clone())
-                .font({
-                    let mut style = rune::tok::TextStyle::new(12.5, 400.0);
-                    style.line_height = 12.5 * 1.55;
-                    style
-                })
-                .wrap()
-                .color(ink(body_ink)),
-        );
+        .child(crate::rune_transcript::render_markdown_standalone(
+            &format!("{id}-mini-{}-md", r.key),
+            &r.body,
+            body_ink,
+            {
+                let mut style = rune::tok::TextStyle::new(12.5, 400.0);
+                style.line_height = 12.5 * 1.55;
+                style
+            },
+        ));
     if live_row {
         let mut dots = row().items_center().gap(3.0).pt(4.0);
         for (n, delay) in [0.0, 0.14, 0.28].into_iter().enumerate() {

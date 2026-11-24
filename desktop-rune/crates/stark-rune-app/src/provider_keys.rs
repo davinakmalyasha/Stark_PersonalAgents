@@ -87,155 +87,6 @@ impl ProviderUsage {
     }
 }
 
-/// Compact per-model rollup for the provider sheet. Built from local run
-/// history (`UsageCall`s), since the documented OpenCode Go `/usage`
-/// endpoint only returns the three allowance meters.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct LocalModelUsage {
-    pub model: String,
-    pub requests: u64,
-    pub tokens: u64,
-    pub cost: f64,
-    pub percent: f64,
-}
-
-/// One daily bucket for the mini bar strip (`YYYY-MM-DD` + tokens).
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct LocalDailyPoint {
-    pub day: String,
-    pub label: String,
-    pub tokens: u64,
-    pub cost: f64,
-}
-
-/// Device totals shown under the allowance card.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct LocalUsageView {
-    pub total_tokens: u64,
-    pub total_requests: u64,
-    pub total_cost: f64,
-    pub by_model: Vec<LocalModelUsage>,
-    pub daily: Vec<LocalDailyPoint>,
-}
-
-fn short_model(model: &str) -> String {
-    let model = model.trim();
-    if model.is_empty() {
-        return "unknown".to_string();
-    }
-    // Keep the compact dashboard style: last segment after `/` or `:`.
-    let tail = model.rsplit('/').next().unwrap_or(model);
-    let tail = tail.split(':').next().unwrap_or(tail);
-    if tail.is_empty() {
-        model.to_string()
-    } else {
-        tail.to_string()
-    }
-}
-
-fn day_label(iso: &str) -> String {
-    // `2026-11-24T…` -> `11/24`; fall back to the raw prefix.
-    if iso.len() >= 10 && iso.as_bytes()[4] == b'-' && iso.as_bytes()[7] == b'-' {
-        format!("{}/{}", &iso[5..7], &iso[8..10])
-    } else {
-        iso.to_string()
-    }
-}
-
-/// Aggregate local `UsageCall`s into totals + per-model + last-14-day buckets.
-pub fn aggregate_local_calls(calls: &[crate::rune_transcript::UsageCall]) -> LocalUsageView {
-    use std::collections::BTreeMap;
-    let mut total_tokens = 0u64;
-    let mut total_cost = 0.0f64;
-    let mut per_model: BTreeMap<String, (u64, u64, f64)> = BTreeMap::new();
-    let mut per_day: BTreeMap<String, (u64, f64)> = BTreeMap::new();
-    for call in calls {
-        let tokens = call.input.saturating_add(call.output);
-        total_tokens = total_tokens.saturating_add(tokens);
-        total_cost += call.cost;
-        let name = short_model(&call.model);
-        let entry = per_model.entry(name).or_insert((0, 0, 0.0));
-        entry.0 = entry.0.saturating_add(1);
-        entry.1 = entry.1.saturating_add(tokens);
-        entry.2 += call.cost;
-        let day = call.at.get(..10).unwrap_or("").to_string();
-        if !day.is_empty() {
-            let day_entry = per_day.entry(day).or_insert((0, 0.0));
-            day_entry.0 = day_entry.0.saturating_add(tokens);
-            day_entry.1 += call.cost;
-        }
-    }
-    let total_requests = calls.len() as u64;
-    let mut by_model: Vec<LocalModelUsage> = per_model
-        .into_iter()
-        .map(|(model, (requests, tokens, cost))| LocalModelUsage {
-            percent: if total_tokens > 0 {
-                (tokens as f64 / total_tokens as f64 * 100.0).clamp(0.0, 100.0)
-            } else {
-                0.0
-            },
-            model,
-            requests,
-            tokens,
-            cost,
-        })
-        .collect();
-    by_model.sort_by_key(|entry| std::cmp::Reverse(entry.tokens));
-    by_model.truncate(6);
-    // Last 14 days, oldest first, for the mini bar strip.
-    let mut days: Vec<(String, (u64, f64))> = per_day.into_iter().collect();
-    days.sort_by(|a, b| a.0.cmp(&b.0));
-    let daily: Vec<LocalDailyPoint> = days
-        .into_iter()
-        .rev()
-        .take(14)
-        .rev()
-        .map(|(day, (tokens, cost))| LocalDailyPoint {
-            label: day_label(&day),
-            day,
-            tokens,
-            cost,
-        })
-        .collect();
-    LocalUsageView {
-        total_tokens,
-        total_requests,
-        total_cost,
-        by_model,
-        daily,
-    }
-}
-
-/// `6.930B` / `19,893` style compact formatting for the totals row.
-fn format_tokens(n: u64) -> String {
-    if n >= 1_000_000_000 {
-        format!("{:.3}B", n as f64 / 1_000_000_000.0)
-    } else if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else {
-        // Thousands grouping (`19,893`); matches the dashboard style.
-        let s = n.to_string();
-        let mut out = String::with_capacity(s.len() + 1);
-        for (i, ch) in s.chars().enumerate() {
-            if i > 0 && (s.len() - i).is_multiple_of(3) {
-                out.push(',');
-            }
-            out.push(ch);
-        }
-        out
-    }
-}
-
-fn format_cost(cost: f64) -> String {
-    if cost <= 0.0 {
-        "$0.00".to_string()
-    } else if cost < 0.01 {
-        "<$0.01".to_string()
-    } else {
-        format!("${cost:.2}")
-    }
-}
-
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProviderKeyRow {
     pub id: String,
@@ -904,259 +755,49 @@ fn usage_row(label: &str, window: &Option<UsageWindow>) -> El {
     out
 }
 
-fn totals_card(local: &LocalUsageView) -> El {
-    let cell = |key: &str, label: &str, value: String| {
-        col()
-            .key(format!("providerkeys-total-{key}"))
-            .grow(1.0)
-            .min_w(0.0)
-            .gap(1.0)
-            .px(10.0)
-            .py(8.0)
-            .radius(8.0)
-            .fill(ink("#ffffff05"))
-            .border(1.0, ink("#ffffff0d"))
-            .child(
-                text(label.to_string())
-                    .font(rune::tok::TextStyle::new(9.5, 500.0))
-                    .color(ink("#71717a")),
-            )
-            .child(
-                text(value)
-                    .font(rune::tok::TextStyle::new(14.0, 600.0).mono())
-                    .color(ink("#f4f4f5")),
-            )
-    };
-    row()
-        .key("providerkeys-totals")
-        .w_full()
-        .gap(8.0)
-        .child(cell("cost", "Cost", format_cost(local.total_cost)))
-        .child(cell(
-            "requests",
-            "Requests",
-            format_tokens(local.total_requests),
-        ))
-        .child(cell("tokens", "Tokens", format_tokens(local.total_tokens)))
-}
-
-fn daily_strip(local: &LocalUsageView) -> El {
-    let mut body = col()
-        .key("providerkeys-daily")
-        .w_full()
-        .gap(6.0)
-        .px(12.0)
-        .py(10.0)
-        .radius(10.0)
-        .fill(ink("#ffffff05"))
-        .border(1.0, ink("#ffffff0d"))
-        .child(
-            row()
-                .w_full()
-                .items_center()
-                .gap(8.0)
-                .child(
-                    text("Daily tokens".to_string())
-                        .grow(1.0)
-                        .font(rune::tok::TextStyle::new(10.5, 600.0))
-                        .color(ink("#e4e4e7")),
-                )
-                .child(
-                    text("last 14 days · this device".to_string())
-                        .font(rune::tok::TextStyle::new(9.0, 400.0))
-                        .color(ink("#71717a")),
-                ),
-        );
-    if local.daily.is_empty() {
-        body = body.child(
-            text("No local runs yet.".to_string())
-                .font(rune::tok::TextStyle::new(10.0, 400.0))
-                .color(ink("#71717a")),
-        );
-        return body;
-    }
-    let max = local
-        .daily
-        .iter()
-        .map(|day| day.tokens)
-        .max()
-        .unwrap_or(1)
-        .max(1) as f32;
-    let mut bars = row()
-        .key("providerkeys-daily-bars")
-        .w_full()
-        .items_end()
-        .gap(4.0)
-        .h(44.0);
-    for day in &local.daily {
-        let frac = (day.tokens as f32 / max).clamp(0.04, 1.0);
-        let h = (frac * 34.0).clamp(2.0, 34.0);
-        bars = bars.child(
-            col()
-                .grow(1.0)
-                .min_w(0.0)
-                .items_center()
-                .justify_end()
-                .gap(3.0)
-                .child(
-                    rune::el()
-                        .w_full()
-                        .h(h)
-                        .radius(2.0)
-                        .fill(ink(if day.tokens == 0 {
-                            "#ffffff10"
-                        } else {
-                            "#a1a1aa"
-                        })),
-                )
-                .child(
-                    text(day.label.clone())
-                        .font(rune::tok::TextStyle::new(7.5, 400.0))
-                        .color(ink("#52525b")),
-                ),
-        );
-    }
-    body.child(bars)
-}
-
-fn by_model_card(local: &LocalUsageView) -> El {
-    let mut body = col()
-        .key("providerkeys-models")
-        .w_full()
-        .gap(4.0)
-        .px(12.0)
-        .py(10.0)
-        .radius(10.0)
-        .fill(ink("#ffffff05"))
-        .border(1.0, ink("#ffffff0d"))
-        .child(
-            row()
-                .w_full()
-                .items_center()
-                .gap(8.0)
-                .child(
-                    text("Usage by Model".to_string())
-                        .grow(1.0)
-                        .font(rune::tok::TextStyle::new(10.5, 600.0))
-                        .color(ink("#e4e4e7")),
-                )
-                .child(
-                    text(format!(
-                        "{} {} · this device",
-                        local.by_model.len(),
-                        if local.by_model.len() == 1 {
-                            "model"
-                        } else {
-                            "models"
-                        }
-                    ))
-                    .font(rune::tok::TextStyle::new(9.0, 400.0))
-                    .color(ink("#71717a")),
-                ),
-        );
-    if local.by_model.is_empty() {
-        body = body.child(
-            text("No per-model data yet.".to_string())
-                .font(rune::tok::TextStyle::new(10.0, 400.0))
-                .color(ink("#71717a")),
-        );
-        return body;
-    }
-    for entry in &local.by_model {
-        let grow = entry.percent.clamp(0.0, 100.0).max(0.8) as f32;
-        let rest = (100.0 - entry.percent).clamp(0.0, 100.0).max(0.8) as f32;
-        body = body.child(
-            row()
-                .key(format!("providerkeys-model-{}", entry.model))
-                .w_full()
-                .items_center()
-                .gap(8.0)
-                .py(3.0)
-                .child(
-                    text(entry.model.clone())
-                        .w(150.0)
-                        .truncate()
-                        .font(rune::tok::TextStyle::new(10.5, 500.0).mono())
-                        .color(ink("#d4d4d8")),
-                )
-                .child(
-                    row()
-                        .grow(1.0)
-                        .h(4.0)
-                        .radius(2.0)
-                        .fill(ink("#ffffff10"))
-                        .child(
-                            rune::el()
-                                .grow(grow)
-                                .h(4.0)
-                                .fill(ink("#6ee7b7"))
-                                .radius(2.0),
-                        )
-                        .child(rune::el().grow(rest).h(4.0)),
-                )
-                .child(
-                    text(format!("{}%", entry.percent.round() as i64))
-                        .w(36.0)
-                        .font(rune::tok::TextStyle::new(10.0, 600.0).mono())
-                        .color(ink("#e4e4e7")),
-                )
-                .child(
-                    text(format_tokens(entry.tokens))
-                        .w(52.0)
-                        .font(rune::tok::TextStyle::new(10.0, 400.0).mono())
-                        .color(ink("#a1a1aa")),
-                ),
-        );
-    }
-    body
-}
-
-/// Provider sheet. `which` resolves close/actions to the owning thread.
-/// `local` is the aggregated device usage (totals + per-model + daily).
+/// Provider sheet: official allowance + API-key management.
+///
+/// The documented `GET /usage` endpoint only returns the three meters, so
+/// this panel deliberately shows no token/cost/model breakdown; those are
+/// browser-dashboard-only. Height hugs the content so the card stays compact.
 pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
     state: &ProviderKeysState,
     which: crate::rune_transcript::Thread,
     width: f32,
     height: f32,
-    local: &LocalUsageView,
 ) -> El {
-    let card_w = 780.0_f32.min((width - 24.0).max(0.0));
-    let max_card_h = 720.0_f32.min((height - 36.0).max(0.0));
-    // The sheet hugs its content (one key is a small panel) but grows for
-    // the add form and extra keys, then scrolls at the window cap.
+    let card_w = 760.0_f32.min((width - 24.0).max(0.0));
+    let max_card_h = 640.0_f32.min((height - 36.0).max(0.0));
+    // One 54pt row per key; the add form only takes room while open.
     let key_rows = state.keys.len().max(1) as f32;
-    let form_h = if state.add_open { 196.0 } else { 0.0 };
+    let form_h = if state.add_open { 178.0 } else { 0.0 };
     let notice_h = if state.error.is_some() {
-        48.0
+        42.0
     } else if !state.status.is_empty() && !state.add_open {
-        38.0
+        34.0
     } else {
         0.0
     };
-    let issues_h = state.issues.len() as f32 * 14.0;
-    // One wide overlay: hero + allowance + totals + daily + models + keys.
-    let model_rows = local.by_model.len().max(1) as f32;
-    let content_h = 62.0
-        + 32.0
+    let usage_extra = if state.usage.error.is_empty() {
+        0.0
+    } else {
+        16.0
+    };
+    let content_h = 58.0
+        + 12.0
         + 34.0
-        + 16.0
-        + 132.0
-        + 10.0
-        + 54.0
-        + 10.0
-        + 66.0
-        + 10.0
+        + 14.0
+        + 150.0
+        + usage_extra
+        + 14.0
         + 34.0
-        + model_rows * 26.0
-        + 16.0
-        + 40.0
-        + key_rows * 62.0
-        + 16.0
-        + 38.0
+        + 8.0
+        + key_rows * 54.0
         + form_h
         + notice_h
-        + issues_h;
-    let card_h = content_h.min(max_card_h).max(420.0);
+        + 14.0
+        + 46.0;
+    let card_h = content_h.min(max_card_h).max(320.0);
     let close = move |s: &mut S| {
         close_provider_keys(&mut s.thread_mut(which).provider_keys);
     };
@@ -1173,16 +814,16 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
     let mut body = col()
         .key("providerkeys-body")
         .w_full()
-        .grow(1.0)
         .min_h(0.0)
-        .gap(16.0)
-        .px(20.0)
-        .pt(14.0)
-        .pb(18.0)
+        .gap(14.0)
+        .px(18.0)
+        .pt(12.0)
+        .pb(14.0)
         .scroll(rune::ScrollSpec {
             stick_bottom: false,
         });
 
+    // Hero: provider identity + readiness.
     body = body.child(
         row()
             .key("providerkeys-hero")
@@ -1237,13 +878,13 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
             ),
     );
 
-    // Allowance card.
+    // Allowance: the only official per-key usage OpenCode exposes.
     let mut usage_card = col()
         .key("providerkeys-usage")
         .w_full()
-        .gap(10.0)
+        .gap(9.0)
         .px(14.0)
-        .py(14.0)
+        .py(12.0)
         .radius(12.0)
         .fill(ink("#ffffff05"))
         .border(1.0, ink("#ffffff10"))
@@ -1288,6 +929,7 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                     .py(4.0)
                     .radius(6.0)
                     .fill(ink("#ffffff08"))
+                    .hover(ink("#ffffff14"))
                     .on_press_enter(move |s: &mut S| {
                         let st = &mut s.thread_mut(which).provider_keys;
                         if st.usage_loading {
@@ -1308,7 +950,7 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                 .w_full()
                 .wrap()
                 .font(rune::tok::TextStyle::new(10.0, 400.0))
-                .color(ink("#fca5a5")),
+                .color(ink("#f87171")),
         );
     } else if state.usage.empty() && !state.usage_loading {
         usage_card = usage_card.child(
@@ -1318,11 +960,8 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
         );
     }
     body = body.child(usage_card);
-    body = body.child(totals_card(local));
-    body = body.child(daily_strip(local));
-    body = body.child(by_model_card(local));
 
-    // Keys.
+    // API keys: explicit Use / Delete actions per row.
     let mut keys = col().key("providerkeys-keys").w_full().gap(8.0).child(
         row()
             .w_full()
@@ -1338,7 +977,7 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                             .color(ink("#e4e4e7")),
                     )
                     .child(
-                        text("Click a key to use it. Its own usage loads above.".to_string())
+                        text("Use switches the active key. Allowance reloads above.".to_string())
                             .font(rune::tok::TextStyle::new(9.5, 400.0))
                             .color(ink("#71717a")),
                     ),
@@ -1361,12 +1000,12 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                     "Add an API key"
                 })
                 .font(rune::tok::TextStyle::new(10.5, 600.0))
-                .color(ink("#e4e4e7"))
-                .px(9.0)
+                .color(ink("#09090b"))
+                .px(10.0)
                 .py(5.0)
                 .radius(7.0)
-                .fill(ink("#ffffff10"))
-                .border(1.0, ink("#ffffff1f"))
+                .fill(ink("#f4f4f5"))
+                .hover(ink("#ffffff"))
                 .on_press_tx_enter(move |s: &mut S, tx: &mut rune::Tx| {
                     let st = &mut s.thread_mut(which).provider_keys;
                     st.add_open = !st.add_open;
@@ -1401,27 +1040,21 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
         );
     }
     for key in &state.keys {
-        let row_id = key.id.clone();
         let row_label = key.label.clone();
         let row_masked = key.masked.clone();
         let row_source = key.source.clone();
         let row_active = key.active;
+        let confirming = state.confirm_remove.as_deref() == Some(key.id.as_str());
         let mut key_row = row()
             .key(format!("providerkeys-key-{}", key.id))
             .w_full()
             .items_center()
             .gap(10.0)
             .px(12.0)
-            .py(10.0)
+            .py(9.0)
             .radius(10.0)
-            .fill(ink(if row_active { "#ffffff10" } else { "#00000000" }))
+            .fill(ink(if row_active { "#ffffff0a" } else { "#ffffff03" }))
             .border(1.0, ink(if row_active { "#ffffff1f" } else { "#ffffff0d" }))
-            .role("button")
-            .focusable(true)
-            .label(format!("Use {}", row_label))
-            .on_press_enter(move |s: &mut S| {
-                activate_provider_key(&mut s.thread_mut(which).provider_keys, &row_id);
-            })
             .child(
                 rune::el()
                     .size(8.0, 8.0)
@@ -1434,118 +1067,118 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                     .min_w(0.0)
                     .gap(1.0)
                     .child(
-                        text(row_label)
-                            .font(rune::tok::TextStyle::new(11.5, 500.0))
-                            .color(ink(if row_active { "#f4f4f5" } else { "#d4d4d8" })),
+                        row()
+                            .items_center()
+                            .gap(6.0)
+                            .child(
+                                text(row_label)
+                                    .font(rune::tok::TextStyle::new(11.5, 500.0))
+                                    .color(ink(if row_active { "#f4f4f5" } else { "#d4d4d8" })),
+                            )
+                            .child(
+                                text(row_source.to_ascii_uppercase())
+                                    .font(rune::tok::TextStyle::new(8.0, 700.0))
+                                    .color(ink("#52525b")),
+                            ),
                     )
                     .child(
                         text(row_masked)
                             .font(rune::tok::TextStyle::new(10.0, 400.0).mono())
                             .color(ink("#71717a")),
                     ),
-            )
-            .child(
-                text(row_source.to_ascii_uppercase())
-                    .font(rune::tok::TextStyle::new(8.5, 700.0))
-                    .color(ink("#71717a")),
             );
-        if row_active {
+        if confirming {
+            let cancel = move |s: &mut S| {
+                s.thread_mut(which).provider_keys.confirm_remove = None;
+            };
+            let remove_id = key.id.clone();
+            let remove = move |s: &mut S| {
+                remove_provider_key(&mut s.thread_mut(which).provider_keys, &remove_id);
+            };
+            key_row = key_row
+                .child(
+                    text("Cancel".to_string())
+                        .key(format!("providerkeys-cancel-{}", key.id))
+                        .role("button")
+                        .focusable(true)
+                        .label(format!("Keep {}", key.label))
+                        .font(rune::tok::TextStyle::new(10.0, 500.0))
+                        .color(ink("#a1a1aa"))
+                        .px(9.0)
+                        .py(5.0)
+                        .radius(7.0)
+                        .hover(ink("#ffffff10"))
+                        .on_press_enter(cancel),
+                )
+                .child(
+                    text("Delete".to_string())
+                        .key(format!("providerkeys-confirm-remove-{}", key.id))
+                        .role("button")
+                        .focusable(true)
+                        .label(format!("Delete {}", key.label))
+                        .font(rune::tok::TextStyle::new(10.0, 600.0))
+                        .color(ink("#fecaca"))
+                        .px(10.0)
+                        .py(5.0)
+                        .radius(7.0)
+                        .fill(ink("#ef444433"))
+                        .border(1.0, ink("#ef444466"))
+                        .hover(ink("#ef444455"))
+                        .on_press_enter(remove),
+                );
+        } else if row_active {
             key_row = key_row.child(
                 text("ACTIVE".to_string())
+                    .key(format!("providerkeys-active-{}", key.id))
                     .font(rune::tok::TextStyle::new(8.5, 700.0))
-                    .px(6.0)
-                    .py(2.0)
+                    .px(7.0)
+                    .py(3.0)
                     .radius(999.0)
                     .fill(ink("#6ee7b71f"))
                     .border(1.0, ink("#6ee7b740"))
                     .color(ink("#6ee7b7")),
             );
+        } else {
+            let use_id = key.id.clone();
+            key_row = key_row.child(
+                text("Use".to_string())
+                    .key(format!("providerkeys-use-{}", key.id))
+                    .role("button")
+                    .focusable(true)
+                    .label(format!("Use {}", key.label))
+                    .font(rune::tok::TextStyle::new(10.0, 600.0))
+                    .color(ink("#09090b"))
+                    .px(10.0)
+                    .py(5.0)
+                    .radius(7.0)
+                    .fill(ink("#f4f4f5"))
+                    .hover(ink("#ffffff"))
+                    .on_press_enter(move |s: &mut S| {
+                        activate_provider_key(&mut s.thread_mut(which).provider_keys, &use_id);
+                    }),
+            );
         }
-        if row_source == "managed" {
+        if row_source == "managed" && !confirming {
             let remove_id = key.id.clone();
             key_row = key_row.child(
-                text("×".to_string())
+                text("Delete".to_string())
                     .key(format!("providerkeys-remove-{}", key.id))
                     .role("button")
                     .focusable(true)
-                    .label(format!("Remove {}", key.label))
-                    .font(rune::tok::TextStyle::new(14.0, 400.0))
-                    .color(ink("#8a8a93"))
-                    .px(6.0)
-                    .py(1.0)
-                    .radius(6.0)
+                    .label(format!("Delete {}", key.label))
+                    .font(rune::tok::TextStyle::new(10.0, 500.0))
+                    .color(ink("#a1a1aa"))
+                    .px(9.0)
+                    .py(5.0)
+                    .radius(7.0)
+                    .border(1.0, ink("#ffffff14"))
+                    .hover(ink("#ef444426"))
                     .on_press_enter(move |s: &mut S| {
                         s.thread_mut(which).provider_keys.confirm_remove = Some(remove_id.clone());
                     }),
             );
         }
         keys = keys.child(key_row);
-    }
-
-    if let Some(id) = &state.confirm_remove {
-        let label = state
-            .keys
-            .iter()
-            .find(|key| &key.id == id)
-            .map(|key| key.label.clone())
-            .unwrap_or_else(|| "this key".to_string());
-        let cancel = {
-            let close = id.clone();
-            move |s: &mut S| {
-                let _ = close;
-                s.thread_mut(which).provider_keys.confirm_remove = None;
-            }
-        };
-        let remove = {
-            let target = id.clone();
-            move |s: &mut S| {
-                remove_provider_key(&mut s.thread_mut(which).provider_keys, &target);
-            }
-        };
-        keys = keys.child(
-            row()
-                .key("providerkeys-confirm")
-                .w_full()
-                .items_center()
-                .gap(8.0)
-                .px(12.0)
-                .py(8.0)
-                .radius(9.0)
-                .fill(ink("#ef44441a"))
-                .border(1.0, ink("#ef444440"))
-                .child(
-                    text(format!("Remove {label}?"))
-                        .grow(1.0)
-                        .font(rune::tok::TextStyle::new(10.5, 500.0))
-                        .color(ink("#fca5a5")),
-                )
-                .child(
-                    text("Cancel".to_string())
-                        .role("button")
-                        .focusable(true)
-                        .label("Cancel removing the key")
-                        .font(rune::tok::TextStyle::new(10.0, 500.0))
-                        .color(ink("#a1a1aa"))
-                        .px(7.0)
-                        .py(4.0)
-                        .radius(6.0)
-                        .on_press_enter(cancel),
-                )
-                .child(
-                    text("Remove".to_string())
-                        .key("providerkeys-confirm-remove")
-                        .role("button")
-                        .focusable(true)
-                        .label("Confirm removing the key")
-                        .font(rune::tok::TextStyle::new(10.0, 600.0))
-                        .color(ink("#fecaca"))
-                        .px(8.0)
-                        .py(4.0)
-                        .radius(6.0)
-                        .fill(ink("#ef444433"))
-                        .on_press_enter(remove),
-                ),
-        );
     }
 
     if state.add_open {
@@ -1570,9 +1203,7 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                     .fill(ink("#08080a"))
                     .border(1.0, ink("#ffffff14"))
                     .placeholder("Personal, work, backup…", ink("#52525b"))
-                    .on_edit(move |s: &mut S| {
-                        &mut s.thread_mut(which).provider_keys.label_edit
-                    }),
+                    .on_edit(move |s: &mut S| &mut s.thread_mut(which).provider_keys.label_edit),
             )
             .child(field_label("API key"))
             .child(
@@ -1629,29 +1260,33 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                     .items_center()
                     .gap(8.0)
                     .child(
-                        text(
-                            "Checked with OpenCode before saving. Only a masked value is stored for display."
-                                .to_string(),
-                        )
-                        .grow(1.0)
-                        .font(rune::tok::TextStyle::new(9.0, 400.0))
-                        .color(ink("#71717a")),
+                        text("Validated with OpenCode before saving.".to_string())
+                            .grow(1.0)
+                            .font(rune::tok::TextStyle::new(9.0, 400.0))
+                            .color(ink("#71717a")),
                     )
                     .child(
-                        text(if state.busy { "Checking…" } else { "Add & use" }.to_string())
-                            .key("providerkeys-save")
-                            .role("button")
-                            .focusable(true)
-                            .label("Save this API key and make it active")
-                            .font(rune::tok::TextStyle::new(10.5, 600.0))
-                            .color(ink("#09090b"))
-                            .px(10.0)
-                            .py(5.0)
-                            .radius(7.0)
-                            .fill(ink("#f4f4f5"))
-                            .on_press_enter(move |s: &mut S| {
-                                save_provider_key(&mut s.thread_mut(which).provider_keys);
-                            }),
+                        text(
+                            if state.busy {
+                                "Checking…"
+                            } else {
+                                "Add & use"
+                            }
+                            .to_string(),
+                        )
+                        .key("providerkeys-save")
+                        .role("button")
+                        .focusable(true)
+                        .label("Save this API key and make it active")
+                        .font(rune::tok::TextStyle::new(10.5, 600.0))
+                        .color(ink("#09090b"))
+                        .px(10.0)
+                        .py(5.0)
+                        .radius(7.0)
+                        .fill(ink("#f4f4f5"))
+                        .on_press_enter(move |s: &mut S| {
+                            save_provider_key(&mut s.thread_mut(which).provider_keys);
+                        }),
                     ),
             );
         if state.busy {
@@ -1681,12 +1316,12 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                 .w_full()
                 .wrap()
                 .px(9.0)
-                .py(9.0)
+                .py(8.0)
                 .radius(8.0)
                 .fill(ink("#ef44441a"))
                 .border(1.0, ink("#ef444440"))
                 .font(rune::tok::TextStyle::new(10.0, 400.0))
-                .color(ink("#fca5a5")),
+                .color(ink("#f87171")),
         );
     } else if !state.status.is_empty() && !state.add_open {
         body = body.child(
@@ -1695,7 +1330,7 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                 .w_full()
                 .wrap()
                 .px(9.0)
-                .py(9.0)
+                .py(8.0)
                 .radius(8.0)
                 .fill(ink("#ffffff05"))
                 .border(1.0, ink("#ffffff10"))
@@ -1709,9 +1344,9 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
         .w_full()
         .items_center()
         .gap(8.0)
-        .px(20.0)
+        .px(18.0)
         .pt(6.0)
-        .pb(14.0)
+        .pb(12.0)
         .child(
             text("Agent settings".to_string())
                 .role("button")
@@ -1719,6 +1354,7 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                 .label("Open agent settings")
                 .font(rune::tok::TextStyle::new(10.0, 400.0))
                 .color(ink("#71717a"))
+                .hover(ink("#e4e4e7"))
                 .on_press_enter(move |s: &mut S| {
                     let (host, port) = {
                         let st = &mut s.thread_mut(which).provider_keys;
@@ -1746,6 +1382,7 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                 .radius(7.0)
                 .fill(ink("#ffffff0d"))
                 .border(1.0, ink("#ffffff14"))
+                .hover(ink("#ffffff1a"))
                 .on_press_enter(close),
         );
 
@@ -1779,9 +1416,9 @@ pub fn provider_keys_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                 .w_full()
                 .items_center()
                 .gap(10.0)
-                .px(20.0)
-                .pt(16.0)
-                .pb(12.0)
+                .px(18.0)
+                .pt(14.0)
+                .pb(10.0)
                 .child(
                     col()
                         .grow(1.0)
@@ -1977,53 +1614,7 @@ mod tests {
     }
 
     #[test]
-    fn local_usage_aggregates_totals_and_models() {
-        use crate::rune_transcript::UsageCall;
-        let calls = vec![
-            UsageCall {
-                agent: "chat".to_string(),
-                model: "opencode/deepseek-v4.1-flash".to_string(),
-                input: 1_000,
-                output: 500,
-                hits: 0,
-                misses: 0,
-                cost: 0.02,
-                at: "2026-11-20T10:00:00Z".to_string(),
-            },
-            UsageCall {
-                agent: "chat".to_string(),
-                model: "muse-spark-1.3-contributor".to_string(),
-                input: 2_000,
-                output: 1_000,
-                hits: 0,
-                misses: 0,
-                cost: 0.01,
-                at: "2026-11-21T10:00:00Z".to_string(),
-            },
-            UsageCall {
-                agent: "chat".to_string(),
-                model: "opencode/deepseek-v4.1-flash".to_string(),
-                input: 500,
-                output: 500,
-                hits: 0,
-                misses: 0,
-                cost: 0.0,
-                at: "2026-11-21T12:00:00Z".to_string(),
-            },
-        ];
-        let local = aggregate_local_calls(&calls);
-        assert_eq!(local.total_requests, 3);
-        assert_eq!(local.total_tokens, 5_500);
-        assert_eq!(local.by_model.len(), 2);
-        assert_eq!(local.by_model[0].model, "muse-spark-1.3-contributor");
-        assert!(local.by_model[0].percent > 50.0);
-        assert_eq!(local.daily.len(), 2);
-        assert_eq!(format_tokens(19_893), "19,893");
-        assert_eq!(format_cost(0.0), "$0.00");
-    }
-
-    #[test]
-    fn sheet_mounts_totals_daily_and_models() {
+    fn sheet_is_compact_and_hides_non_api_sections() {
         use rune::{Env, Runtime};
         let mut init = crate::rune_transcript::RuneTranscriptState::screenshot();
         init.live = false;
@@ -2039,30 +1630,106 @@ mod tests {
             source: "env".to_string(),
             active: true,
         }];
-        init.usage.calls = vec![crate::rune_transcript::UsageCall {
-            agent: "chat".to_string(),
-            model: "deepseek-v4.1-flash".to_string(),
-            input: 100,
-            output: 50,
-            hits: 0,
-            misses: 0,
-            cost: 0.01,
-            at: "2026-11-24T10:00:00Z".to_string(),
-        }];
         let mut rt = Runtime::new(
             init,
             crate::rune_transcript::transcript_view,
-            (1000.0, 800.0),
+            (1280.0, 900.0),
             Env::new(true, 1.0),
         );
         rt.frame(0.0);
         for key in [
-            "providerkeys-totals",
-            "providerkeys-daily",
-            "providerkeys-models",
-            "providerkeys-model-deepseek-v4.1-flash",
+            "providerkeys-overlay",
+            "providerkeys-card",
+            "providerkeys-usage",
+            "providerkeys-key-env",
+            "providerkeys-active-env",
+            "providerkeys-add-toggle",
         ] {
             assert!(rt.find(key).is_some(), "{key} mounted");
         }
+        // Token/cost/model cards are dashboard-only data; they must be gone.
+        for gone in [
+            "providerkeys-totals",
+            "providerkeys-daily",
+            "providerkeys-models",
+        ] {
+            assert!(rt.find(gone).is_none(), "{gone} removed");
+        }
+        let (rect, _) = rt.presented("providerkeys-card").expect("card rect");
+        assert!(rect[3] <= 480.0, "compact card height, got {}", rect[3]);
+    }
+
+    #[test]
+    fn key_rows_expose_use_and_delete_actions() {
+        use rune::{Env, Runtime};
+        let mut init = crate::rune_transcript::RuneTranscriptState::screenshot();
+        init.live = false;
+        init.provider_keys.open = true;
+        init.provider_keys.provider = "opencode".to_string();
+        init.provider_keys.label = "OpenCode Go".to_string();
+        init.provider_keys.active = "key-1".to_string();
+        init.provider_keys.has_key = true;
+        init.provider_keys.keys = vec![
+            ProviderKeyRow {
+                id: "env".to_string(),
+                label: "Environment (.env)".to_string(),
+                masked: "oc_…a1b2".to_string(),
+                source: "env".to_string(),
+                active: false,
+            },
+            ProviderKeyRow {
+                id: "key-1".to_string(),
+                label: "Personal".to_string(),
+                masked: "oc_…c3d4".to_string(),
+                source: "managed".to_string(),
+                active: true,
+            },
+            ProviderKeyRow {
+                id: "key-2".to_string(),
+                label: "Backup".to_string(),
+                masked: "oc_…e5f6".to_string(),
+                source: "managed".to_string(),
+                active: false,
+            },
+        ];
+        let mut rt = Runtime::new(
+            init,
+            crate::rune_transcript::transcript_view,
+            (1280.0, 900.0),
+            Env::new(true, 1.0),
+        );
+        rt.frame(0.0);
+        assert!(rt.find("providerkeys-use-env").is_some(), "env has Use");
+        assert!(
+            rt.find("providerkeys-active-key-1").is_some(),
+            "active key shows ACTIVE"
+        );
+        assert!(
+            rt.find("providerkeys-use-key-2").is_some(),
+            "inactive managed key has Use"
+        );
+        assert!(
+            rt.find("providerkeys-remove-key-2").is_some(),
+            "managed key has Delete"
+        );
+        assert!(
+            rt.find("providerkeys-remove-env").is_none(),
+            "env fallback is not deletable"
+        );
+        // Delete asks inline; the row swaps to Cancel/Delete.
+        let (x, y) = rt.find("providerkeys-remove-key-2").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..5 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(
+            rt.find("providerkeys-confirm-remove-key-2").is_some(),
+            "confirm delete appears"
+        );
+        assert!(
+            rt.find("providerkeys-cancel-key-2").is_some(),
+            "cancel appears"
+        );
     }
 }

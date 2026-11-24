@@ -309,9 +309,10 @@ pub struct ShellState {
     /// Phone drawer. Desktop ignores it; below `md` it is closed until the
     /// topbar or bottom nav asks for a panel.
     pub mobile_panel_open: bool,
-    /// Desktop navigation: the icon rail and side panel. The titlebar menu
-    /// hides both so the canvas can use the full width.
-    pub nav_open: bool,
+    /// Desktop chat panel (the chat list / agents / projects board docked
+    /// beside the rail). The rail itself never hides: it owns the toggle and
+    /// every destination, so the panel alone can collapse.
+    pub panel_open: bool,
     /// Home chat card folded to its prompt dock (`HouseChat` minimize). The
     /// card is not keyed by chat, so this persists across chat switches like
     /// The reference UI's local `minimized` state.
@@ -347,7 +348,7 @@ impl Default for ShellState {
             settings: crate::settings::SettingsState::default(),
             pairing: PairingState::default(),
             mobile_panel_open: false,
-            nav_open: true,
+            panel_open: true,
             home_minimized: false,
             home_controls: HomeControls(rune::Live::new(0.0)),
             audio_owner: "main".to_string(),
@@ -826,6 +827,9 @@ fn rail_button(s: &ShellState, tab: RailTab) -> El {
         .hover_group()
         .on_press_enter(move |s: &mut ShellState| {
             s.canvas.rail = tab;
+            // Picking a destination always brings its panel back into view;
+            // the rail itself never moves.
+            s.panel_open = true;
             if tab == RailTab::Group
                 && !s.canvas.projects.loading
                 && s.canvas.projects.projects.is_empty()
@@ -1069,20 +1073,11 @@ fn active_chat_sheets(s: &ShellState) -> Vec<El> {
     }
     if t.provider_keys.open {
         let (w, h) = unsafe { (WINDOW_W, WINDOW_H) };
-        // Device totals: main + personal + every open session thread.
-        let mut calls: Vec<crate::rune_transcript::UsageCall> = Vec::new();
-        calls.extend(s.transcript.usage.calls.iter().cloned());
-        calls.extend(s.personal.usage.calls.iter().cloned());
-        for thread in s.canvas.sessions.threads.values() {
-            calls.extend(thread.usage.calls.iter().cloned());
-        }
-        let local = crate::provider_keys::aggregate_local_calls(&calls);
         sheets.push(crate::provider_keys::provider_keys_sheet::<ShellState>(
             &t.provider_keys,
             Thread::Open,
             w,
             h,
-            &local,
         ));
     }
     if let Some(file) = t.attachment_preview.clone() {
@@ -1103,27 +1098,9 @@ fn active_chat_sheets(s: &ShellState) -> Vec<El> {
     sheets
 }
 
-/// Lucide `Menu` for the titlebar's navigation toggle.
+/// Lucide `Menu` for the rail's chat-panel toggle.
 fn icon_menu(size: f32, color: rune::Color) -> Shape {
     crate::icons::lucide(&["M4 6h16", "M4 12h16", "M4 18h16"], size, 2.0, color)
-}
-
-/// A 30-point ghost control in the titlebar. Its press handler is attached by
-/// the caller so the menu and search buttons keep their own actions.
-fn topbar_control(key: &str, label: &str, glyph: Shape) -> El {
-    rune::el()
-        .key(key)
-        .role("button")
-        .focusable(true)
-        .label(label)
-        .help(label)
-        .size(30.0, 30.0)
-        .radius(8.0)
-        .center()
-        .hover(rgba(1.0, 1.0, 1.0, 0.07))
-        .focus_ring(1.0, 1.0, rgba(1.0, 1.0, 1.0, 0.5))
-        .press_scale(0.94)
-        .child(rune::el().size(15.0, 15.0).inert().shape(glyph))
 }
 
 /// A compact `+` after the last tab. Unlike the old dashed "New session" pill,
@@ -1187,9 +1164,11 @@ fn new_session_button() -> El {
         )
 }
 
-/// The one app-drawn titlebar: navigation controls, open-session tabs, the
-/// compact new-session action, and Rune's Windows caption buttons over the
-/// trailing edge. The band drags the window; presses on its controls win.
+/// The one app-drawn titlebar: open-session tabs, the compact new-session
+/// action, and Rune's Windows caption buttons over the trailing edge. The
+/// band drags the window; presses on its controls win.
+///
+/// Navigation lives in the rail, not here: the topbar is only the chat strip.
 fn shell_topbar(s: &ShellState, cx: &mut Cx<ShellState>, w: f32) -> El {
     let chrome = cx.chrome_insets();
     cx.caption_color(ink("#d4d4d8"));
@@ -1198,33 +1177,13 @@ fn shell_topbar(s: &ShellState, cx: &mut Cx<ShellState>, w: f32) -> El {
     } else {
         TOPBAR_H
     };
-    let folded = w < PANEL_FOLD_W;
-    let menu_label = if folded {
-        if s.mobile_panel_open {
-            "Close navigation"
-        } else {
-            "Open navigation"
-        }
-    } else if s.nav_open {
-        "Hide sidebar"
-    } else {
-        "Show sidebar"
-    };
-    let menu = topbar_control("topbar-menu", menu_label, icon_menu(15.0, ink("#a1a1aa")))
-        .on_press_enter(move |s: &mut ShellState| {
-            if folded {
-                s.mobile_panel_open = !s.mobile_panel_open;
-            } else {
-                s.nav_open = !s.nav_open;
-            }
-        });
 
     // Give tabs equal shares of the visible strip, like the reference UI:
     // 210pt with room, shrinking to 96pt before the strip scrolls.
     let tabs_n = s.canvas.sessions.order.len();
-    // Menu + `+`, both outer gutters and the two gaps; the rest is
-    // the tab strip. The caption reservation is part of the trailing gutter.
-    let fixed = 8.0 + 6.0 + chrome.trailing + 30.0 * 2.0 + TAB_GAP * 2.0;
+    // `+`, both outer gutters and the gap; the rest is the tab strip. The
+    // caption reservation is part of the trailing gutter.
+    let fixed = 8.0 + 6.0 + chrome.trailing + 30.0 + TAB_GAP;
     let strip_w = (w - chrome.leading - fixed).max(120.0);
     let tab_w = if tabs_n == 0 {
         210.0
@@ -1276,7 +1235,6 @@ fn shell_topbar(s: &ShellState, cx: &mut Cx<ShellState>, w: f32) -> El {
         // springing their positions would briefly overlap hit targets.
         .instant_changes()
         .window_drag()
-        .child(menu)
         .child(tabs)
         .child(new_session_button())
 }
@@ -1315,15 +1273,17 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
                 .key("rail-menu")
                 .role("button")
                 .focusable(true)
-                .label("Toggle sidebar")
-                .help("Toggle sidebar")
+                .label("Toggle chat panel")
+                .help("Toggle chat panel")
                 .size(36.0, 36.0)
                 .radius(12.0)
                 .center()
                 .hover(rgba(1.0, 1.0, 1.0, 0.07))
                 .hover_group()
                 .on_press_enter(move |s: &mut ShellState| {
-                    s.nav_open = !s.nav_open;
+                    // Only the panel collapses; the rail stays so settings,
+                    // chats, group, and cloud remain reachable.
+                    s.panel_open = !s.panel_open;
                 })
                 .press_scale(0.94)
                 .child(
@@ -1406,10 +1366,13 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
                         ),
                 ),
         );
-    // The titlebar menu folds both desktop columns; phones keep the rail
-    // hidden and open the drawer instead.
-    let nav_open = !folded && s.nav_open;
-    let stage_w = (w - if nav_open { RAIL_W + PANEL_W } else { 0.0 }).max(320.0);
+    // Desktop keeps the rail permanently; only its panel folds. Phones hide
+    // both and open the drawer instead.
+    let rail_visible = !folded;
+    let panel_visible = !folded && s.panel_open;
+    let stage_w =
+        (w - if rail_visible { RAIL_W } else { 0.0 } - if panel_visible { PANEL_W } else { 0.0 })
+            .max(320.0);
     let stage_h = (h
         - TOPBAR_H
         - if folded {
@@ -1444,10 +1407,13 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
         .grow(1.0)
         .min_h(0.0)
         .fill(ink("#0a0a0a"));
-    if nav_open {
+    if rail_visible {
         // Desktop: icon rail + docked panel. Below `md` both disappear and
         // The panel becomes an on-demand drawer (the reference UI `House.tsx`).
-        main = main.child(rail).child(side_panel(s, PANEL_W));
+        main = main.child(rail);
+        if panel_visible {
+            main = main.child(side_panel(s, PANEL_W));
+        }
     }
     main = main.child(stage);
     let mut root = col()
@@ -1936,8 +1902,15 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
     // drives `fitView`). While the camera is auto it refits on resize.
     let (win_w, win_h, safe_bottom) = unsafe { (WINDOW_W, WINDOW_H, WINDOW_SAFE_BOTTOM) };
     let folded = win_w < PANEL_FOLD_W;
-    let nav_open = !folded && s.nav_open;
-    let stage_w = (win_w - if nav_open { RAIL_W + PANEL_W } else { 0.0 } - 40.0).max(320.0);
+    let stage_w = (win_w
+        - if folded { 0.0 } else { RAIL_W }
+        - if !folded && s.panel_open {
+            PANEL_W
+        } else {
+            0.0
+        }
+        - 40.0)
+        .max(320.0);
     let stage_h = (win_h
         - TOPBAR_H
         - 12.0
@@ -3063,12 +3036,15 @@ mod tests {
         assert!(rt.find("side-panel").is_some(), "chats panel in drawer");
         let (drawer, _) = rt.presented("side-drawer").expect("drawer rect");
         assert!(drawer[1] >= TOPBAR_H, "drawer starts below the titlebar");
-        // The titlebar stays above the drawer, so its menu can close it.
-        let (x, y) = rt.find("topbar-menu").expect("menu above drawer");
-        rt.pointer_down(x, y);
-        rt.pointer_up(x, y);
+        // The titlebar is chat-only now; the backdrop closes the drawer.
+        assert!(rt.find("topbar-menu").is_none(), "no titlebar navigation");
+        let (backdrop, _) = rt.presented("side-backdrop").expect("backdrop");
+        let bx = backdrop[0] + backdrop[2] - 8.0;
+        let by = backdrop[1] + backdrop[3] * 0.5;
+        rt.pointer_down(bx, by);
+        rt.pointer_up(bx, by);
         rt.frame(1.0 / 60.0);
-        assert!(!rt.state.mobile_panel_open, "titlebar menu closes drawer");
+        assert!(!rt.state.mobile_panel_open, "backdrop closes drawer");
         let (x, y) = rt.find("mobile-chats").expect("chats button");
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
@@ -3209,44 +3185,51 @@ mod tests {
     }
 
     #[test]
-    fn titlebar_menu_folds_navigation_and_rail_menu_restores_it() {
+    fn rail_menu_folds_only_the_panel_and_rail_stays() {
         let env = Env::new(true, 1.0);
         let mut rt = Runtime::new(ShellState::default(), shell_view, (1280.0, 900.0), env);
         rt.frame(0.0);
         assert!(rt.find("icon-rail").is_some());
         assert!(rt.find("map-sidebar").is_some());
+        assert!(rt.find("topbar-menu").is_none(), "topbar has no navigation");
 
-        let (x, y) = rt.find("topbar-menu").expect("menu");
+        // The rail hamburger folds the chat panel only. Settings, chats,
+        // group, and cloud stay reachable because the rail never hides.
+        let (x, y) = rt.find("rail-menu").expect("rail menu");
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
         for _ in 0..8 {
             rt.frame(1.0 / 60.0);
         }
-        assert!(!rt.state.nav_open);
-        assert!(rt.find("icon-rail").is_none(), "rail folded");
+        assert!(!rt.state.panel_open);
+        assert!(rt.find("icon-rail").is_some(), "rail stays visible");
         assert!(rt.find("map-sidebar").is_none(), "panel folded");
+        assert!(
+            rt.find("rail-settings").is_some(),
+            "settings stays reachable"
+        );
+        assert!(rt.find("rail-Chats").is_some(), "chats stays reachable");
         assert!(rt.find("shell-titlebar").is_some(), "titlebar stays");
 
-        // The hamburger now lives at the top of the rail (rail-menu),
-        // replacing the old new-chat pen. The titlebar has no search
-        // button; the panel search input stays mounted.
-        let (x, y) = rt.find("topbar-menu").expect("menu restores");
+        // Pressing the hamburger again restores the same panel.
+        let (x, y) = rt.find("rail-menu").expect("rail menu restores");
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
         for _ in 0..5 {
             rt.frame(1.0 / 60.0);
         }
-        assert!(rt.state.nav_open, "menu restores navigation");
-        assert!(rt.find("rail-menu").is_some(), "rail menu mounted");
+        assert!(rt.state.panel_open, "panel restored");
         assert!(rt.find("map-search").is_some());
 
-        let (x, y) = rt.find("rail-menu").expect("rail menu toggles");
+        // Choosing a rail destination also brings the panel back.
+        let (x, y) = rt.find("rail-Cloud").expect("cloud");
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
         for _ in 0..5 {
             rt.frame(1.0 / 60.0);
         }
-        assert!(!rt.state.nav_open, "rail menu folds navigation");
+        assert!(rt.state.panel_open, "destination opens its panel");
+        assert!(rt.find("cloud-board").is_some());
     }
 
     #[test]

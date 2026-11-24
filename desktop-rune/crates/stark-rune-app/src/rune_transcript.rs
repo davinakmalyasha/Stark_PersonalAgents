@@ -6024,13 +6024,11 @@ fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'sta
         }
         if s.provider_keys.open {
             let (w, h) = transcript_window();
-            let local = super::provider_keys::aggregate_local_calls(&s.usage.calls);
             root = root.child(super::provider_keys::provider_keys_sheet::<S>(
                 &s.provider_keys,
                 which,
                 w,
                 h,
-                &local,
             ));
         }
         if let Some(file) = s.attachment_preview.clone() {

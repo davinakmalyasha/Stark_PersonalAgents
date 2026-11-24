@@ -1140,17 +1140,21 @@ fn shell_topbar(s: &ShellState, cx: &mut Cx<ShellState>, w: f32) -> El {
     // caption reservation is part of the trailing gutter.
     let fixed = 8.0 + 6.0 + chrome.trailing;
     let strip_w = (w - chrome.leading - fixed).max(120.0);
+    // Each inactive pair carries a hairline divider (1pt + its two gaps).
+    let sep_total = 1.0 + TAB_GAP * 2.0;
+    let separators = tabs_n.saturating_sub(1) as f32;
     let tab_w = if tabs_n == 0 {
         210.0
     } else {
-        ((strip_w - TAB_GAP * tabs_n.saturating_sub(1) as f32) / tabs_n as f32).clamp(96.0, 210.0)
+        ((strip_w - TAB_GAP * separators - sep_total * separators) / tabs_n as f32)
+            .clamp(96.0, 210.0)
     };
     // The strip hugs the tabs, and `+` sits right after it. Beyond the
     // visible width the strip scrolls instead of pushing the button aside.
     let tabs_width = if tabs_n == 0 {
         0.0
     } else {
-        (tab_w * tabs_n as f32 + TAB_GAP * (tabs_n.saturating_sub(1)) as f32).min(strip_w)
+        (tab_w * tabs_n as f32 + TAB_GAP * separators + sep_total * separators).min(strip_w)
     };
     let mut tabs = row()
         .key("shell-tabs")
@@ -1168,8 +1172,23 @@ fn shell_topbar(s: &ShellState, cx: &mut Cx<ShellState>, w: f32) -> El {
         .role("tablist")
         .label("Sessions")
         .focus_group();
-    for id in s.canvas.sessions.order.clone() {
-        tabs = tabs.child(session_tab(s, &id, tab_w));
+    let mut previous_active = false;
+    for (index, id) in s.canvas.sessions.order.clone().iter().enumerate() {
+        let active = s.canvas.active_id == *id;
+        // A divider between two quiet tabs; the active pill separates itself.
+        if index > 0 && !active && !previous_active {
+            tabs = tabs.child(
+                rune::el()
+                    .key(format!("tab-sep-{index}"))
+                    .w(1.0)
+                    .h(14.0)
+                    .radius(0.5)
+                    .fill(ink("#ffffff14"))
+                    .inert(),
+            );
+        }
+        tabs = tabs.child(session_tab(s, id, tab_w));
+        previous_active = active;
     }
 
     row()
@@ -3162,6 +3181,20 @@ mod tests {
             .clone();
         let (tab, _) = rt.presented(&format!("session-{last}")).expect("last tab");
         assert!(tab[0] >= 0.0, "tab inside the strip");
+
+        // Quiet tabs are separated by a hairline; the active pill is not.
+        let ids = rt.state.canvas.sessions.order.clone();
+        let active = rt.state.canvas.active_id.clone();
+        let mut saw_separator = false;
+        for index in 1..ids.len() {
+            let key = format!("tab-sep-{index}");
+            let adjacent_active = ids[index] == active || ids[index - 1] == active;
+            if rt.find(&key).is_some() {
+                saw_separator = true;
+                assert!(!adjacent_active, "active tab keeps no divider");
+            }
+        }
+        assert!(saw_separator, "open tabs show dividers");
     }
 
     #[test]

@@ -660,26 +660,63 @@ pub fn format_time(value: &str) -> String {
     format!("{} {d}, {h:02}:{mi:02}", MONTHS[(mo - 1) as usize])
 }
 
-fn stat_cell(label: &str, value: String, key: String) -> El {
+fn stat_tile(label: &str, value: String, key: String) -> El {
+    col()
+        .key(key)
+        .grow(1.0)
+        .min_w(0.0)
+        .gap(1.0)
+        .child(
+            text(label.to_string())
+                .font(rune::tok::TextStyle::new(8.5, 500.0))
+                .color(ink("#52525b")),
+        )
+        .child(
+            text(value)
+                .font(rune::tok::TextStyle::new(10.5, 500.0).mono())
+                .truncate()
+                .color(ink("#e4e4e7")),
+        )
+}
+
+fn picker_label(label: &str) -> El {
+    text(label.to_string())
+        .font(rune::tok::TextStyle::new(8.5, 600.0))
+        .color(ink("#52525b"))
+}
+
+fn picker_row(key: String, label: String, selected: bool, caption: String) -> El {
     row()
         .key(key)
         .w_full()
         .items_center()
         .gap(8.0)
+        .radius(8.0)
+        .px(9.0)
+        .py(6.0)
+        .fill(ink(if selected { "#ffffff0f" } else { "#00000000" }))
+        .border(1.0, ink(if selected { "#ffffff24" } else { "#00000000" }))
+        .border_layout()
+        .role("button")
+        .focusable(true)
+        .label(caption)
+        .hover(ink("#ffffff0a"))
+        .child(rune::el().size(6.0, 6.0).radius(3.0).fill(ink(if selected {
+            "#f4f4f5"
+        } else {
+            "#3f3f46"
+        })))
         .child(
-            text(label.to_string())
+            text(label)
                 .grow(1.0)
+                .min_w(0.0)
+                .truncate()
                 .font(rune::tok::TextStyle::new(11.0, 400.0))
-                .color(ink("#71717a")),
-        )
-        .child(
-            text(value)
-                .font(rune::tok::TextStyle::new(11.0, 400.0).mono())
-                .color(ink("#e4e4e7")),
+                .color(ink(if selected { "#e4e4e7" } else { "#a1a1aa" })),
         )
 }
 
-/// Full CloudRuns board: live dot, status grid, send form, handoffs.
+/// Full CloudRuns board: live status, send form, handoffs.
 /// Stateful pickers use tap rows (Rune has no `<select>`): workspaces, then
 /// The selected workspace's chats with a "Whole workspace" head row.
 pub fn cloud_view<S: CloudHost + 'static>(s: &CloudState) -> El {
@@ -692,91 +729,67 @@ pub fn cloud_view<S: CloudHost + 'static>(s: &CloudState) -> El {
     let detail = match &s.active {
         Some(a) if !a.workspace_path.is_empty() => a.workspace_path.clone(),
         Some(a) if !a.chat_id.is_empty() => format!("chat {}", a.chat_id),
-        _ => "no run reported yet".to_string(),
+        _ => "No run reported yet".to_string(),
     };
+    let refresh_glyph = crate::icons::lucide(
+        &["M21 12a9 9 0 1 1-2.64-6.36", "M21 3v6h-6"],
+        13.0,
+        2.0,
+        ink(if s.loading || s.board_loading {
+            "#52525b"
+        } else {
+            "#a1a1aa"
+        }),
+    );
     let mut body = col()
         .key("cloud-board")
         .w_full()
         .grow(1.0)
         .min_h(0.0)
-        .fill(ink("#0a0a0a"))
-        .pt(4.0)
         .gap(10.0)
+        .scroll(rune::ScrollSpec {
+            stick_bottom: false,
+        })
         .child(
             row()
                 .key("cloud-head")
                 .w_full()
                 .items_center()
+                .gap(7.0)
                 .child(
-                    text("Cloud runs".to_string())
+                    text("Cloud".to_string())
                         .key("cloud-title")
-                        .grow(1.0)
-                        .font(rune::tok::TextStyle::new(15.0, 650.0))
-                        .color(ink("#f2f2f5")),
+                        .font(rune::tok::TextStyle::new(12.5, 650.0))
+                        .color(ink("#f4f4f5")),
                 )
-                .child(
-                    text(
-                        if s.loading || s.board_loading {
-                            "…"
-                        } else {
-                            "Refresh"
-                        }
-                        .to_string(),
-                    )
-                    .key("cloud-refresh")
-                    .role("button")
-                    .focusable(true)
-                    .label("Refresh cloud status")
-                    .font(rune::tok::TextStyle::new(11.0, 600.0))
-                    .px(12.0)
-                    .py(8.0)
-                    .radius(8.0)
-                    .fill(ink("#ffffff0d"))
-                    .color(ink("#d4d4d8"))
-                    .on_press_enter(|s: &mut S| {
-                        let c = s.cloud_mut();
-                        refresh_cloud(c);
-                        refresh_board(c);
-                    }),
-                ),
-        )
-        .child(
-            row()
-                .key("cloud-status")
-                .w_full()
-                .items_center()
-                .gap(10.0)
-                .radius(12.0)
-                .fill(ink("#141417"))
-                .border(1.0, ink("#ffffff14"))
-                .px(14.0)
-                .py(12.0)
                 .child(
                     rune::el()
-                        .key("cloud-dot")
-                        .size(8.0, 8.0)
-                        .radius(4.0)
-                        .fill(ink(if running { "#7ee0a8" } else { "#52525b" })),
+                        .key("cloud-head-dot")
+                        .size(6.0, 6.0)
+                        .radius(3.0)
+                        .fill(ink(if running { "#6ee7b7" } else { "#3f3f46" })),
                 )
+                .child(rune::el().grow(1.0))
                 .child(
-                    col()
-                        .grow(1.0)
-                        .min_h(0.0)
-                        .child(
-                            text(status_label.to_string())
-                                .key("cloud-state")
-                                .font(rune::tok::TextStyle::new(13.0, 600.0))
-                                .color(ink("#e4e4e7")),
-                        )
-                        .child(
-                            text(detail)
-                                .key("cloud-detail")
-                                .font(rune::tok::TextStyle::new(11.0, 400.0))
-                                .color(ink("#8a8a93")),
-                        ),
+                    rune::el()
+                        .key("cloud-refresh")
+                        .role("button")
+                        .focusable(true)
+                        .label("Refresh cloud status")
+                        .size(22.0, 22.0)
+                        .radius(6.0)
+                        .center()
+                        .hover(ink("#ffffff10"))
+                        .on_press_enter(|s: &mut S| {
+                            let c = s.cloud_mut();
+                            refresh_cloud(c);
+                            refresh_board(c);
+                        })
+                        .child(rune::el().size(13.0, 13.0).inert().shape(refresh_glyph)),
                 ),
         );
-    // Status grid ("This machine").
+
+    // Live status + this machine.
     {
         let (origin, cap, vps) = match &s.status {
             Some(st) => (
@@ -794,41 +807,73 @@ pub fn cloud_view<S: CloudHost + 'static>(s: &CloudState) -> El {
             ),
             None => ("connecting…".to_string(), "—".to_string(), "—".to_string()),
         };
-        body = body.child(
-            col()
-                .key("cloud-grid")
-                .w_full()
-                .gap(8.0)
-                .radius(12.0)
-                .fill(ink("#141417"))
-                .border(1.0, ink("#ffffff14"))
-                .px(14.0)
-                .py(12.0)
-                .child(
-                    text("This machine".to_string())
-                        .key("cloud-grid-title")
-                        .font(rune::tok::TextStyle::new(12.0, 700.0))
-                        .color(ink("#e4e4e7")),
-                )
-                .child(stat_cell("Origin", origin, "cloud-origin".to_string()))
-                .child(stat_cell("Running", cap, "cloud-running".to_string()))
-                .child(stat_cell("VPS target", vps, "cloud-vps".to_string()))
-                .child(stat_cell(
-                    "Handoffs",
-                    s.handoffs.len().to_string(),
-                    "cloud-handoffs-count".to_string(),
-                )),
-        );
+        let mut status = col()
+            .key("cloud-status")
+            .w_full()
+            .gap(10.0)
+            .radius(12.0)
+            .fill(ink("#ffffff05"))
+            .border(1.0, ink("#ffffff10"))
+            .px(12.0)
+            .py(11.0)
+            .child(
+                row()
+                    .w_full()
+                    .items_center()
+                    .gap(8.0)
+                    .child(
+                        rune::el()
+                            .key("cloud-dot")
+                            .size(7.0, 7.0)
+                            .radius(3.5)
+                            .fill(ink(if running { "#6ee7b7" } else { "#52525b" })),
+                    )
+                    .child(
+                        col()
+                            .grow(1.0)
+                            .min_w(0.0)
+                            .gap(1.0)
+                            .child(
+                                text(status_label.to_string())
+                                    .key("cloud-state")
+                                    .font(rune::tok::TextStyle::new(11.5, 600.0))
+                                    .color(ink("#e4e4e7")),
+                            )
+                            .child(
+                                text(detail)
+                                    .key("cloud-detail")
+                                    .min_w(0.0)
+                                    .truncate()
+                                    .font(rune::tok::TextStyle::new(9.5, 400.0))
+                                    .color(ink("#71717a")),
+                            ),
+                    ),
+            )
+            .child(
+                row()
+                    .key("cloud-grid")
+                    .w_full()
+                    .items_center()
+                    .gap(8.0)
+                    .child(stat_tile("Origin", origin, "cloud-origin".to_string()))
+                    .child(stat_tile("Runs", cap, "cloud-running".to_string()))
+                    .child(stat_tile("Target", vps, "cloud-vps".to_string())),
+            );
         if !s.status.as_ref().is_some_and(|st| st.configured) {
-            body = body.child(
-                text("Set STARK_CLOUD_URL + STARK_CLOUD_TOKEN (a VPS pairing-device token) to push directly; otherwise handoffs stage a package you carry over.".to_string())
-                    .key("cloud-unconfigured")
-                    .font(rune::tok::TextStyle::new(11.0, 400.0))
-                    .wrap()
-                    .color(ink("#71717a")),
+            status = status.child(
+                text(
+                    "Add STARK_CLOUD_URL and STARK_CLOUD_TOKEN to push directly; otherwise handoffs stage a package to carry over."
+                        .to_string(),
+                )
+                .key("cloud-unconfigured")
+                .font(rune::tok::TextStyle::new(9.5, 400.0))
+                .wrap()
+                .color(ink("#71717a")),
             );
         }
+        body = body.child(status);
     }
+
     // Send form.
     {
         let mut send = col()
@@ -836,21 +881,35 @@ pub fn cloud_view<S: CloudHost + 'static>(s: &CloudState) -> El {
             .w_full()
             .gap(8.0)
             .radius(12.0)
-            .fill(ink("#141417"))
-            .border(1.0, ink("#ffffff14"))
-            .px(14.0)
-            .py(12.0)
+            .fill(ink("#ffffff05"))
+            .border(1.0, ink("#ffffff10"))
+            .px(12.0)
+            .py(11.0)
             .child(
-                text("Send to Cloud".to_string())
-                    .key("cloud-send-title")
-                    .font(rune::tok::TextStyle::new(12.0, 700.0))
-                    .color(ink("#e4e4e7")),
-            );
+                row()
+                    .w_full()
+                    .items_center()
+                    .gap(6.0)
+                    .child(
+                        text("Send to cloud".to_string())
+                            .key("cloud-send-title")
+                            .grow(1.0)
+                            .font(rune::tok::TextStyle::new(11.5, 600.0))
+                            .color(ink("#e4e4e7")),
+                    )
+                    .child(
+                        rune::el()
+                            .size(12.0, 12.0)
+                            .inert()
+                            .shape(crate::icons::cloud(12.0, ink("#52525b"))),
+                    ),
+            )
+            .child(picker_label("Workspace"));
         if s.workspaces.is_empty() {
             send = send.child(
                 text("No workspaces yet.".to_string())
                     .key("cloud-send-nows")
-                    .font(rune::tok::TextStyle::new(11.0, 400.0))
+                    .font(rune::tok::TextStyle::new(10.5, 400.0))
                     .color(ink("#52525b")),
             );
         }
@@ -858,101 +917,78 @@ pub fn cloud_view<S: CloudHost + 'static>(s: &CloudState) -> El {
             let id = ws.id.clone();
             let selected = ws.id == s.workspace_id;
             send = send.child(
-                row()
-                    .key(format!("cloud-ws-{id}"))
-                    .w_full()
-                    .items_center()
-                    .gap(8.0)
-                    .radius(8.0)
-                    .px(10.0)
-                    .py(6.0)
-                    .fill(ink(if selected { "#1b1b20" } else { "#00000000" }))
-                    .border(1.0, ink(if selected { "#ffffff30" } else { "#ffffff14" }))
-                    .role("button")
-                    .focusable(true)
-                    .label(format!("Send from {}", ws.name))
-                    .on_press_enter(move |s: &mut S| {
-                        let c = s.cloud_mut();
-                        c.workspace_id = id.clone();
-                        c.chat_id.clear();
-                        refresh_board(c);
-                    })
-                    .child(
-                        text(ws.name.clone())
-                            .font(rune::tok::TextStyle::new(12.0, 600.0))
-                            .color(ink(if selected { "#e4e4e7" } else { "#a1a1aa" })),
-                    ),
+                picker_row(
+                    format!("cloud-ws-{id}"),
+                    ws.name.clone(),
+                    selected,
+                    format!("Send from {}", ws.name),
+                )
+                .on_press_enter(move |s: &mut S| {
+                    let c = s.cloud_mut();
+                    c.workspace_id = id.clone();
+                    c.chat_id.clear();
+                    refresh_board(c);
+                }),
             );
         }
-        // Chat picker: whole-workspace head row + chats of the selection.
+        send = send.child(picker_label("Chat"));
         let whole = s.chat_id.trim().is_empty();
         send = send.child(
-            row()
-                .key("cloud-chat-whole")
-                .w_full()
-                .items_center()
-                .gap(8.0)
-                .radius(8.0)
-                .px(10.0)
-                .py(6.0)
-                .fill(ink(if whole { "#1b1b20" } else { "#00000000" }))
-                .border(1.0, ink(if whole { "#ffffff30" } else { "#ffffff14" }))
-                .role("button")
-                .focusable(true)
-                .label("Send whole workspace")
-                .on_press_enter(move |s: &mut S| {
-                    s.cloud_mut().chat_id.clear();
-                })
-                .child(
-                    text("Whole workspace".to_string())
-                        .font(rune::tok::TextStyle::new(11.0, 400.0))
-                        .color(ink(if whole { "#e4e4e7" } else { "#71717a" })),
-                ),
+            picker_row(
+                "cloud-chat-whole".to_string(),
+                "Whole workspace".to_string(),
+                whole,
+                "Send whole workspace".to_string(),
+            )
+            .on_press_enter(move |s: &mut S| {
+                s.cloud_mut().chat_id.clear();
+            }),
         );
         for chat in &s.chats {
             let id = chat.id.clone();
             let selected = chat.id == s.chat_id;
             send = send.child(
-                row()
-                    .key(format!("cloud-chat-{id}"))
-                    .w_full()
-                    .items_center()
-                    .gap(8.0)
-                    .radius(8.0)
-                    .px(10.0)
-                    .py(6.0)
-                    .fill(ink(if selected { "#1b1b20" } else { "#00000000" }))
-                    .border(1.0, ink(if selected { "#ffffff30" } else { "#ffffff14" }))
-                    .role("button")
-                    .focusable(true)
-                    .label(format!("Send {}", chat.title))
-                    .on_press_enter(move |s: &mut S| {
-                        s.cloud_mut().chat_id = id.clone();
-                    })
-                    .child(
-                        text(chat.title.clone())
-                            .font(rune::tok::TextStyle::new(11.0, 400.0))
-                            .color(ink(if selected { "#e4e4e7" } else { "#a1a1aa" })),
-                    ),
+                picker_row(
+                    format!("cloud-chat-{id}"),
+                    chat.title.clone(),
+                    selected,
+                    format!("Send {}", chat.title),
+                )
+                .on_press_enter(move |s: &mut S| {
+                    s.cloud_mut().chat_id = id.clone();
+                }),
             );
         }
         send = send.child(
-            text_input(&s.task_edit, rune::tok::TextStyle::new(12.0, 400.0))
+            text_input(&s.task_edit, rune::tok::TextStyle::new(11.0, 400.0))
                 .key("cloud-task")
                 .w_full()
-                .placeholder(
-                    "e.g. finish the failing tests on cloud/fix-login-…",
-                    ink("#52525b"),
-                )
+                .px(9.0)
+                .py(7.0)
+                .radius(8.0)
+                .fill(ink("#08080a"))
+                .border(1.0, ink("#ffffff14"))
+                .placeholder("What should the cloud finish?", ink("#52525b"))
                 .caret(ink("#f2f2f4"), crate::motion::TEXT_SELECTION)
                 .on_edit(move |s: &mut S| &mut s.cloud_mut().task_edit),
         );
+        let ready = !s.workspace_id.trim().is_empty();
         send = send.child(
             row()
                 .key("cloud-sendrow")
                 .w_full()
                 .items_center()
-                .gap(8.0)
+                .justify_center()
+                .py(8.0)
+                .radius(8.0)
+                .fill(ink(if ready { "#f4f4f5" } else { "#ffffff0d" }))
+                .role("button")
+                .focusable(true)
+                .label("Send to cloud")
+                .hover(ink(if ready { "#ffffff" } else { "#ffffff0d" }))
+                .on_press_enter(move |s: &mut S| {
+                    send_cloud(s.cloud_mut());
+                })
                 .child(
                     text(
                         if s.sending {
@@ -963,66 +999,63 @@ pub fn cloud_view<S: CloudHost + 'static>(s: &CloudState) -> El {
                         .to_string(),
                     )
                     .key("cloud-send-button")
-                    .role("button")
-                    .focusable(true)
-                    .label("Send to cloud")
-                    .font(rune::tok::TextStyle::new(12.0, 600.0))
-                    .px(12.0)
-                    .py(8.0)
-                    .radius(8.0)
-                    .fill(ink(if s.workspace_id.trim().is_empty() {
-                        "#a1a1aa33"
-                    } else {
-                        "#a1a1aa55"
-                    }))
-                    .border(1.0, ink("#a1a1aa55"))
-                    .color(ink(if s.workspace_id.trim().is_empty() {
-                        "#a1a1aa88"
-                    } else {
-                        "#e4e4e7"
-                    }))
-                    .on_press_enter(move |s: &mut S| {
-                        send_cloud(s.cloud_mut());
-                    }),
+                    .font(rune::tok::TextStyle::new(11.0, 600.0))
+                    .color(ink(if ready { "#09090b" } else { "#52525b" })),
                 ),
         );
         if let Some(notice) = &s.notice {
             send = send.child(
                 text(notice.clone())
                     .key("cloud-notice")
-                    .font(rune::tok::TextStyle::new(11.0, 400.0))
+                    .font(rune::tok::TextStyle::new(10.0, 400.0))
                     .wrap()
                     .color(ink("#a1a1aa")),
             );
         }
         body = body.child(send);
     }
+
     // Handoffs.
     {
         let mut section = col()
             .key("cloud-handoffs")
             .w_full()
-            .gap(8.0)
+            .gap(7.0)
             .radius(12.0)
-            .fill(ink("#141417"))
-            .border(1.0, ink("#ffffff14"))
-            .px(14.0)
-            .py(12.0)
+            .fill(ink("#ffffff05"))
+            .border(1.0, ink("#ffffff10"))
+            .px(12.0)
+            .py(11.0)
             .child(
-                text("Handoffs".to_string())
-                    .key("cloud-handoffs-title")
-                    .font(rune::tok::TextStyle::new(12.0, 700.0))
-                    .color(ink("#e4e4e7")),
+                row()
+                    .w_full()
+                    .items_center()
+                    .gap(6.0)
+                    .child(
+                        text("Handoffs".to_string())
+                            .key("cloud-handoffs-title")
+                            .grow(1.0)
+                            .font(rune::tok::TextStyle::new(11.5, 600.0))
+                            .color(ink("#e4e4e7")),
+                    )
+                    .child(
+                        text(s.handoffs.len().to_string())
+                            .key("cloud-handoffs-count")
+                            .font(rune::tok::TextStyle::new(9.0, 650.0))
+                            .px(5.0)
+                            .py(1.0)
+                            .radius(5.0)
+                            .fill(ink("#ffffff0d"))
+                            .color(ink("#a1a1aa")),
+                    ),
             );
         if s.handoffs.is_empty() {
             section = section.child(
-                text(
-                    "No handoffs yet. Send a chat above and it lands here with its branch."
-                        .to_string(),
-                )
-                .key("cloud-handoffs-empty")
-                .font(rune::tok::TextStyle::new(12.0, 400.0))
-                .color(ink("#52525b")),
+                text("Nothing sent yet. A handoff appears here with its branch.".to_string())
+                    .key("cloud-handoffs-empty")
+                    .font(rune::tok::TextStyle::new(9.5, 400.0))
+                    .wrap()
+                    .color(ink("#52525b")),
             );
         }
         for h in &s.handoffs {
@@ -1031,76 +1064,72 @@ pub fn cloud_view<S: CloudHost + 'static>(s: &CloudState) -> El {
                 .key(format!("cloud-handoff-{id}", id = h.id))
                 .w_full()
                 .gap(4.0)
-                .radius(8.0)
-                .fill(rune::Color {
-                    r: 1.0,
-                    g: 1.0,
-                    b: 1.0,
-                    a: 0.02,
-                })
-                .border(1.0, ink("#ffffff0f"))
-                .px(12.0)
+                .radius(9.0)
+                .fill(ink("#0c0c0c"))
+                .border(1.0, ink("#ffffff0d"))
+                .px(10.0)
                 .py(8.0)
                 .child(
                     row()
                         .key(format!("cloud-handoff-{id}-head", id = h.id))
                         .w_full()
                         .items_center()
-                        .gap(8.0)
+                        .gap(6.0)
                         .child(
                             text(h.status.clone())
                                 .key(format!("cloud-handoff-{id}-status", id = h.id))
-                                .font(rune::tok::TextStyle::new(10.0, 600.0))
-                                .px(6.0)
-                                .py(2.0)
+                                .font(rune::tok::TextStyle::new(9.0, 600.0))
+                                .px(5.0)
+                                .py(1.0)
                                 .radius(4.0)
                                 .fill(ink(chip_bg))
-                                .border(1.0, ink(chip_ink))
                                 .color(ink(chip_ink)),
                         )
                         .child(
                             text(h.branch.clone())
                                 .key(format!("cloud-handoff-{id}-branch", id = h.id))
                                 .grow(1.0)
-                                .font(rune::tok::TextStyle::new(11.0, 400.0).mono())
-                                .color(ink("#e4e4e7")),
+                                .min_w(0.0)
+                                .truncate()
+                                .font(rune::tok::TextStyle::new(10.0, 400.0).mono())
+                                .color(ink("#d4d4d8")),
                         )
                         .child(
                             text(format_time(&h.updated))
                                 .key(format!("cloud-handoff-{id}-time", id = h.id))
-                                .font(rune::tok::TextStyle::new(10.0, 400.0))
+                                .font(rune::tok::TextStyle::new(9.0, 400.0))
                                 .color(ink("#52525b")),
                         ),
-                )
-                .child(
-                    text(format!(
-                        "chat: {}  ws: {}  from: {}",
-                        h.chat_id.chars().take(12).collect::<String>(),
-                        h.workspace_id.chars().take(12).collect::<String>(),
-                        h.origin
-                    ))
-                    .key(format!("cloud-handoff-{id}-meta", id = h.id))
-                    .font(rune::tok::TextStyle::new(11.0, 400.0).mono())
-                    .color(ink("#71717a")),
                 );
             if !h.task.is_empty() {
                 card = card.child(
                     text(h.task.clone())
                         .key(format!("cloud-handoff-{id}-task", id = h.id))
-                        .font(rune::tok::TextStyle::new(11.0, 400.0))
+                        .font(rune::tok::TextStyle::new(10.0, 400.0))
                         .wrap()
                         .color(ink("#a1a1aa")),
                 );
             }
+            card = card.child(
+                text(format!(
+                    "{} · {} · {}",
+                    h.chat_id.chars().take(10).collect::<String>(),
+                    h.workspace_id.chars().take(10).collect::<String>(),
+                    h.origin
+                ))
+                .key(format!("cloud-handoff-{id}-meta", id = h.id))
+                .font(rune::tok::TextStyle::new(9.0, 400.0).mono())
+                .color(ink("#52525b")),
+            );
             if !h.error.is_empty() {
                 card = card.child(
                     text(h.error.clone())
                         .key(format!("cloud-handoff-{id}-error", id = h.id))
                         .role("alert")
                         .live_region(rune::LiveRegion::Assertive)
-                        .font(rune::tok::TextStyle::new(11.0, 400.0))
+                        .font(rune::tok::TextStyle::new(10.0, 400.0))
                         .wrap()
-                        .color(ink("#fda4af")),
+                        .color(ink("#f87171")),
                 );
             }
             section = section.child(card);
@@ -1113,8 +1142,8 @@ pub fn cloud_view<S: CloudHost + 'static>(s: &CloudState) -> El {
                 .key("cloud-error")
                 .role("alert")
                 .live_region(rune::LiveRegion::Assertive)
-                .font(rune::tok::TextStyle::new(11.0, 400.0))
-                .color(ink("#fda4af")),
+                .font(rune::tok::TextStyle::new(10.0, 400.0))
+                .color(ink("#f87171")),
         );
     }
     body

@@ -118,42 +118,57 @@ fn icon_home(size: f32, color: rune::Color) -> Shape {
 }
 
 fn icon_group(size: f32, color: rune::Color) -> Shape {
-    // Three side-by-side agents: middle bust higher/taller than left/right.
-    // Each bust = head circle + shoulder arc, stroked like Lucide.
+    // Three side-by-side bots: square-ish heads with eyes and antennas, a
+    // taller middle unit, and simple shoulders. Stroked Lucide-style.
     let mut p = Path::new();
-    // Left head.
-    p = p.move_to([6.2, 10.4]);
-    p = p.cubic_to([6.2, 9.2], [5.2, 8.2], [4.0, 8.2]);
-    p = p.cubic_to([2.8, 8.2], [1.8, 9.2], [1.8, 10.4]);
-    p = p.cubic_to([1.8, 11.6], [2.8, 12.6], [4.0, 12.6]);
-    p = p.cubic_to([5.2, 12.6], [6.2, 11.6], [6.2, 10.4]);
+
+    // Rounded head outline: x0,y0 → x1,y1 with corner radius r.
+    let head = |mut p: Path, x0: f32, y0: f32, x1: f32, y1: f32, r: f32| {
+        p = p.move_to([x0 + r, y0]);
+        p = p.line_to([x1 - r, y0]);
+        p = p.cubic_to([x1, y0], [x1, y0], [x1, y0 + r]);
+        p = p.line_to([x1, y1 - r]);
+        p = p.cubic_to([x1, y1], [x1, y1], [x1 - r, y1]);
+        p = p.line_to([x0 + r, y1]);
+        p = p.cubic_to([x0, y1], [x0, y1], [x0, y1 - r]);
+        p = p.line_to([x0, y0 + r]);
+        p = p.cubic_to([x0, y0], [x0, y0], [x0 + r, y0]);
+        p.close()
+    };
+
+    // Left bot: antenna, head, eyes, shoulders.
+    p = p.move_to([4.0, 6.3]).line_to([4.0, 7.4]);
+    p = head(p, 1.8, 7.4, 6.2, 12.0, 1.0);
+    p = p.move_to([3.2, 9.0]).line_to([3.2, 9.8]);
+    p = p.move_to([4.8, 9.0]).line_to([4.8, 9.8]);
+    p = p.move_to([2.4, 17.6]);
+    p = p.cubic_to([2.4, 15.2], [3.1, 14.0], [4.0, 14.0]);
+    p = p.cubic_to([4.9, 14.0], [5.6, 15.2], [5.6, 17.6]);
+
+    // Right bot: mirror of the left.
+    p = p.move_to([20.0, 6.3]).line_to([20.0, 7.4]);
+    p = head(p, 17.8, 7.4, 22.2, 12.0, 1.0);
+    p = p.move_to([19.2, 9.0]).line_to([19.2, 9.8]);
+    p = p.move_to([20.8, 9.0]).line_to([20.8, 9.8]);
+    p = p.move_to([18.4, 17.6]);
+    p = p.cubic_to([18.4, 15.2], [19.1, 14.0], [20.0, 14.0]);
+    p = p.cubic_to([20.9, 14.0], [21.6, 15.2], [21.6, 17.6]);
+
+    // Middle bot: taller, antenna with a tip, wider head/eyes.
+    p = p.move_to([12.0, 4.4]).line_to([12.0, 2.8]);
+    p = p.move_to([12.9, 2.3]);
+    p = p.cubic_to([12.9, 2.8], [12.5, 3.2], [12.0, 3.2]);
+    p = p.cubic_to([11.5, 3.2], [11.1, 2.8], [11.1, 2.3]);
+    p = p.cubic_to([11.1, 1.8], [11.5, 1.4], [12.0, 1.4]);
+    p = p.cubic_to([12.5, 1.4], [12.9, 1.8], [12.9, 2.3]);
     p = p.close();
-    // Left shoulders.
-    p = p.move_to([0.8, 19.0]);
-    p = p.cubic_to([0.8, 16.2], [2.1, 14.4], [4.0, 14.4]);
-    p = p.cubic_to([5.9, 14.4], [7.2, 16.2], [7.2, 19.0]);
-    // Right head.
-    p = p.move_to([22.2, 10.4]);
-    p = p.cubic_to([22.2, 9.2], [21.2, 8.2], [20.0, 8.2]);
-    p = p.cubic_to([18.8, 8.2], [17.8, 9.2], [17.8, 10.4]);
-    p = p.cubic_to([17.8, 11.6], [18.8, 12.6], [20.0, 12.6]);
-    p = p.cubic_to([21.2, 12.6], [22.2, 11.6], [22.2, 10.4]);
-    p = p.close();
-    // Right shoulders.
-    p = p.move_to([16.8, 19.0]);
-    p = p.cubic_to([16.8, 16.2], [18.1, 14.4], [20.0, 14.4]);
-    p = p.cubic_to([21.9, 14.4], [23.2, 16.2], [23.2, 19.0]);
-    // Middle head (higher, larger).
-    p = p.move_to([14.8, 7.6]);
-    p = p.cubic_to([14.8, 6.0], [13.6, 4.8], [12.0, 4.8]);
-    p = p.cubic_to([10.4, 4.8], [9.2, 6.0], [9.2, 7.6]);
-    p = p.cubic_to([9.2, 9.2], [10.4, 10.4], [12.0, 10.4]);
-    p = p.cubic_to([13.6, 10.4], [14.8, 9.2], [14.8, 7.6]);
-    p = p.close();
-    // Middle shoulders (taller).
-    p = p.move_to([8.0, 19.0]);
-    p = p.cubic_to([8.0, 15.2], [9.7, 12.6], [12.0, 12.6]);
-    p = p.cubic_to([14.3, 12.6], [16.0, 15.2], [16.0, 19.0]);
+    p = head(p, 8.6, 4.4, 15.4, 10.8, 1.2);
+    p = p.move_to([10.9, 6.9]).line_to([10.9, 8.0]);
+    p = p.move_to([13.1, 6.9]).line_to([13.1, 8.0]);
+    p = p.move_to([7.4, 18.2]);
+    p = p.cubic_to([7.4, 15.0], [8.6, 13.2], [12.0, 13.2]);
+    p = p.cubic_to([15.4, 13.2], [16.6, 15.0], [16.6, 18.2]);
+
     icon_shape(p, size, color)
 }
 
@@ -1103,67 +1118,6 @@ fn icon_menu(size: f32, color: rune::Color) -> Shape {
     crate::icons::lucide(&["M4 6h16", "M4 12h16", "M4 18h16"], size, 2.0, color)
 }
 
-/// A compact `+` after the last tab. Unlike the old dashed "New session" pill,
-/// this stays a fixed 30×30 target and never stretches with the strip.
-fn new_session_button() -> El {
-    let plus = |color: rune::Color| {
-        Shape::new()
-            .line(
-                [12.0, 5.0],
-                [12.0, 19.0],
-                crate::lucide_stroke(14.0),
-                LineCap::Round,
-                color,
-            )
-            .line(
-                [5.0, 12.0],
-                [19.0, 12.0],
-                crate::lucide_stroke(14.0),
-                LineCap::Round,
-                color,
-            )
-            .view_box(24.0, 24.0)
-    };
-    rune::el()
-        .key("session-new")
-        .role("button")
-        .focusable(true)
-        .label("New session")
-        .help("New session")
-        .size(30.0, 30.0)
-        .radius(8.0)
-        .center()
-        .hover(rgba(1.0, 1.0, 1.0, 0.07))
-        .focus_ring(1.0, 1.0, rgba(1.0, 1.0, 1.0, 0.5))
-        .hover_group()
-        .press_scale(0.94)
-        .on_press_tx_enter(|s: &mut ShellState, tx: &mut rune::Tx| {
-            s.canvas.new_session();
-            if let Some(id) = s.canvas.sessions.order.last() {
-                tx.scroll_into_view(format!("session-{id}"));
-            }
-        })
-        .child(
-            rune::el()
-                .size(14.0, 14.0)
-                .inert()
-                .child(
-                    rune::el()
-                        .size(14.0, 14.0)
-                        .inert()
-                        .shape(plus(ink("#71717a"))),
-                )
-                .child(
-                    rune::el()
-                        .size(14.0, 14.0)
-                        .absolute(0.0, 0.0)
-                        .inert()
-                        .group_opacity(0.0, 1.0)
-                        .shape(plus(ink("#e4e4e7"))),
-                ),
-        )
-}
-
 /// The one app-drawn titlebar: open-session tabs, the compact new-session
 /// action, and Rune's Windows caption buttons over the trailing edge. The
 /// band drags the window; presses on its controls win.
@@ -1183,7 +1137,7 @@ fn shell_topbar(s: &ShellState, cx: &mut Cx<ShellState>, w: f32) -> El {
     let tabs_n = s.canvas.sessions.order.len();
     // `+`, both outer gutters and the gap; the rest is the tab strip. The
     // caption reservation is part of the trailing gutter.
-    let fixed = 8.0 + 6.0 + chrome.trailing + 30.0 + TAB_GAP;
+    let fixed = 8.0 + 6.0 + chrome.trailing;
     let strip_w = (w - chrome.leading - fixed).max(120.0);
     let tab_w = if tabs_n == 0 {
         210.0
@@ -1236,7 +1190,6 @@ fn shell_topbar(s: &ShellState, cx: &mut Cx<ShellState>, w: f32) -> El {
         .instant_changes()
         .window_drag()
         .child(tabs)
-        .child(new_session_button())
 }
 
 pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
@@ -3068,7 +3021,9 @@ mod tests {
         // Session tabs seeded from the scene cards, rail + chats panel up,
         // canvas always mounted — one page, no routes.
         assert!(rt.find("session-chat:ws-general:chat-1").is_some());
-        assert!(rt.find("session-new").is_some());
+        // The titlebar is chat-only; new chats come from the panel header.
+        assert!(rt.find("session-new").is_none());
+        assert!(rt.find("map-new").is_some());
         assert!(rt.find("icon-rail").is_some());
         assert!(rt.find("map-sidebar").is_some());
         assert!(rt.find("canvas-world").is_some());
@@ -3112,8 +3067,8 @@ mod tests {
         let mut rt = Runtime::new(ShellState::default(), shell_view, (1280.0, 900.0), env);
         rt.frame(0.0);
         let n = rt.state.canvas.sessions.order.len();
-        // New session adds a card + tab and selects it.
-        let (x, y) = rt.find("session-new").unwrap();
+        // New session (panel header `+`) adds a card + tab and selects it.
+        let (x, y) = rt.find("map-new").unwrap();
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
         for _ in 0..5 {
@@ -3158,15 +3113,10 @@ mod tests {
         assert!((rect[3] - TOPBAR_H).abs() < 0.5, "one 44pt row");
         assert!(rt.presented("shell-tabs").is_some());
 
-        // New session is a fixed square, never a full-width dashed box.
-        let (plus, _) = rt.presented("session-new").expect("new session");
-        assert!((plus[2] - 30.0).abs() < 0.5, "width {}", plus[2]);
-        assert!((plus[3] - 30.0).abs() < 0.5, "height {}", plus[3]);
-        assert!(
-            rt.find("session-new-label").is_none(),
-            "the visible New session text is gone"
-        );
-        // It follows the last tab and never overlays a tab's close target.
+        // The titlebar carries tabs only: no add/search controls, so the
+        // strip always starts at the leading gutter.
+        assert!(rt.find("session-new").is_none(), "no titlebar add button");
+        assert!(rt.find("topbar-menu").is_none(), "no titlebar menu");
         let last = rt
             .state
             .canvas
@@ -3176,12 +3126,7 @@ mod tests {
             .expect("a tab")
             .clone();
         let (tab, _) = rt.presented(&format!("session-{last}")).expect("last tab");
-        assert!(
-            plus[0] >= tab[0] + tab[2] + TAB_GAP - 0.5,
-            "plus {} overlaps tab right {}",
-            plus[0],
-            tab[0] + tab[2]
-        );
+        assert!(tab[0] >= 0.0, "tab inside the strip");
     }
 
     #[test]

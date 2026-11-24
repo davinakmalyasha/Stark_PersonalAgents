@@ -649,64 +649,154 @@ async fn complete_new_project_wasm(
     })
 }
 
-/// Projects sidebar section: the Group panel's project list
-/// (`useGroupProjects` + `GroupProjectModal` list half). Scoped by
-/// `ProjectsState.workspace_id` (empty = global, the only mode now — chats
-/// are the only type); the `scoped` badge shows what the server applied.
+/// Projects sidebar section: the Group panel's project list.
+///
+/// Scoped by `ProjectsState.workspace_id` (empty = global); the `scoped`
+/// badge shows what the server applied. Cards keep their live keys so the
+/// shell tests and hit targets stay stable.
 pub fn projects_section<S: ProjectsHost + 'static>(s: &ProjectsState) -> El {
-    let mut body = col().key("side-projects").w_full().gap(6.0).pt(10.0).child(
-        row()
-            .key("side-projects-head")
-            .w_full()
-            .items_center()
-            .gap(6.0)
-            .child(
-                text("Projects".to_string())
-                    .key("side-projects-title")
-                    .grow(1.0)
-                    .font(rune::tok::TextStyle::new(11.0, 600.0))
-                    .color(ink("#8a8a93")),
-            )
-            .child(
-                text(if s.scoped { "Scoped" } else { "All" }.to_string())
-                    .key("side-projects-scope")
-                    .font(rune::tok::TextStyle::new(9.0, 600.0))
-                    .px(6.0)
-                    .py(2.0)
-                    .radius(5.0)
-                    .fill(ink("#ffffff0d"))
-                    .color(ink("#71717a")),
-            )
-            .child(
-                text(if s.loading { "…" } else { "↻" }.to_string())
-                    .key("side-projects-refresh")
-                    .role("button")
-                    .focusable(true)
-                    .label("Refresh projects")
-                    .help("Refresh projects")
-                    .font(rune::tok::TextStyle::new(12.0, 600.0))
-                    .color(ink("#a1a1aa"))
-                    .on_press_enter(|s: &mut S| {
-                        refresh_projects(s.projects_mut());
-                    }),
-            ),
+    let count = s.projects.len();
+    let refresh_glyph = crate::icons::lucide(
+        &["M21 12a9 9 0 1 1-2.64-6.36", "M21 3v6h-6"],
+        13.0,
+        2.0,
+        ink(if s.loading { "#52525b" } else { "#a1a1aa" }),
     );
+    let mut body = col()
+        .key("side-projects")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .gap(10.0)
+        .scroll(rune::ScrollSpec {
+            stick_bottom: false,
+        })
+        .child(
+            row()
+                .key("side-projects-head")
+                .w_full()
+                .items_center()
+                .gap(6.0)
+                .child(
+                    text("Projects".to_string())
+                        .key("side-projects-title")
+                        .font(rune::tok::TextStyle::new(12.5, 650.0))
+                        .color(ink("#f4f4f5")),
+                )
+                .child(
+                    text(count.to_string())
+                        .key("side-projects-count")
+                        .font(rune::tok::TextStyle::new(9.0, 650.0))
+                        .px(5.0)
+                        .py(1.0)
+                        .radius(5.0)
+                        .fill(ink("#ffffff0d"))
+                        .color(ink("#a1a1aa")),
+                )
+                .child(rune::el().grow(1.0))
+                .child(
+                    text(if s.scoped { "Scoped" } else { "All" }.to_string())
+                        .key("side-projects-scope")
+                        .font(rune::tok::TextStyle::new(8.5, 600.0))
+                        .color(ink("#52525b")),
+                )
+                .child(
+                    rune::el()
+                        .key("side-projects-refresh")
+                        .role("button")
+                        .focusable(true)
+                        .label("Refresh projects")
+                        .help("Refresh projects")
+                        .size(22.0, 22.0)
+                        .radius(6.0)
+                        .center()
+                        .hover(ink("#ffffff10"))
+                        .on_press_enter(|s: &mut S| {
+                            refresh_projects(s.projects_mut());
+                        })
+                        .child(rune::el().size(13.0, 13.0).inert().shape(refresh_glyph)),
+                ),
+        )
+        .child(
+            text("Split work across agents.".to_string())
+                .font(rune::tok::TextStyle::new(10.5, 400.0))
+                .color(ink("#71717a")),
+        )
+        .child(
+            row()
+                .key("side-projects-new")
+                .w_full()
+                .items_center()
+                .justify_center()
+                .gap(7.0)
+                .py(9.0)
+                .radius(10.0)
+                .fill(ink("#ffffff0a"))
+                .border(1.0, ink("#ffffff1a"))
+                .border_layout()
+                .role("button")
+                .focusable(true)
+                .label("New project")
+                .help("New group project")
+                .hover(ink("#ffffff14"))
+                .on_press_enter(|s: &mut S| open_new_project(s.projects_mut()))
+                .child(
+                    rune::el()
+                        .size(12.0, 12.0)
+                        .inert()
+                        .shape(crate::icons::plus(12.0, ink("#e4e4e7"))),
+                )
+                .child(
+                    text("New project".to_string())
+                        .font(rune::tok::TextStyle::new(11.0, 600.0))
+                        .color(ink("#e4e4e7")),
+                ),
+        );
+
     if s.projects.is_empty() && !s.loading {
         body = body.child(
-            text("No projects".to_string())
+            col()
                 .key("side-projects-empty")
-                .font(rune::tok::TextStyle::new(11.0, 400.0))
+                .w_full()
+                .items_center()
+                .gap(6.0)
+                .py(18.0)
+                .child(
+                    rune::el()
+                        .size(22.0, 22.0)
+                        .inert()
+                        .shape(crate::icons::bot(22.0, ink("#3f3f46"))),
+                )
+                .child(
+                    text("No projects yet".to_string())
+                        .font(rune::tok::TextStyle::new(11.0, 600.0))
+                        .color(ink("#a1a1aa")),
+                )
+                .child(
+                    text("Create one to hand a goal to a team.".to_string())
+                        .font(rune::tok::TextStyle::new(9.5, 400.0))
+                        .color(ink("#52525b")),
+                ),
+        );
+    } else if !s.projects.is_empty() {
+        body = body.child(
+            text("ACTIVE".to_string())
+                .font(rune::tok::TextStyle::new(8.5, 700.0))
                 .color(ink("#52525b")),
         );
     }
-    for p in &s.projects {
+
+    // Waiting projects first, otherwise server order (stable sort).
+    let mut ordered: Vec<&GroupProject> = s.projects.iter().collect();
+    ordered.sort_by_key(|p| std::cmp::Reverse(p.waiting));
+    for p in ordered {
         body = body.child(project_card::<S>("side-projects", p, true));
     }
     if p_waiting_note(s) {
         body = body.child(
-            text("waiting on you".to_string())
+            text("Waiting on your approval".to_string())
                 .key("side-projects-waiting")
-                .font(rune::tok::TextStyle::new(10.0, 600.0))
+                .font(rune::tok::TextStyle::new(9.5, 500.0))
                 .color(ink("#a1a1aa")),
         );
     }
@@ -717,26 +807,9 @@ pub fn projects_section<S: ProjectsHost + 'static>(s: &ProjectsState) -> El {
                 .role("alert")
                 .live_region(rune::LiveRegion::Assertive)
                 .font(rune::tok::TextStyle::new(10.0, 400.0))
-                .color(ink("#fda4af")),
+                .color(ink("#f87171")),
         );
     }
-    // The full `NewProjectDialog` is a top-level modal; the rail only owns
-    // The entry point.
-    body = body.child(
-        text("+ New project".to_string())
-            .key("side-projects-new")
-            .role("button")
-            .focusable(true)
-            .label("New project")
-            .help("New group project")
-            .font(rune::tok::TextStyle::new(11.0, 600.0))
-            .px(10.0)
-            .py(6.0)
-            .radius(8.0)
-            .fill(ink("#ffffff0d"))
-            .color(ink("#d4d4d8"))
-            .on_press_enter(|s: &mut S| open_new_project(s.projects_mut())),
-    );
     body
 }
 
@@ -1392,26 +1465,34 @@ pub fn new_project_dialog<S: ProjectsHost + 'static>(s: &ProjectsState, w: f32, 
 /// `side-projects` section); `compact` tightens padding/type for the rail.
 fn project_card<S: ProjectsHost + 'static>(prefix: &str, p: &GroupProject, compact: bool) -> El {
     let (pad_x, pad_y, title_size) = if compact {
-        (10.0, 8.0, 12.0)
+        (11.0, 10.0, 11.5)
     } else {
         (14.0, 12.0, 13.0)
     };
     let open_id = p.id.clone();
+    let status = p.status.to_ascii_lowercase();
+    let dot = match status.as_str() {
+        "running" | "doing" | "active" => "#6ee7b7",
+        "done" | "complete" | "completed" => "#6ee7b7",
+        "failed" | "error" => "#f87171",
+        _ => "#52525b",
+    };
+    let waiting = p.waiting > 0;
     let mut card = col()
         .key(format!("{prefix}-{id}", id = p.id))
         .w_full()
-        .gap(if compact { 6.0 } else { 8.0 })
-        .radius(12.0)
-        .fill(ink("#141417"))
-        .border(1.0, ink("#ffffff14"))
+        .gap(7.0)
+        .radius(11.0)
+        .fill(ink(if waiting { "#ffffff0a" } else { "#ffffff05" }))
+        .border(1.0, ink(if waiting { "#ffffff24" } else { "#ffffff10" }))
         .px(pad_x)
         .py(pad_y)
+        .border_layout()
         .role("button")
         .focusable(true)
         .label(format!("Open project {}", p.title))
-        .focusable(true)
         .focus_ring(2.0, 2.0, ink("#ffffff8c"))
-        .hover(ink("#ffffff0a"))
+        .hover(ink("#ffffff0f"))
         .on_press_enter(move |s: &mut S| {
             let projects = s.projects_mut();
             let (host, port) = (projects.host.clone(), projects.port);
@@ -1422,41 +1503,61 @@ fn project_card<S: ProjectsHost + 'static>(prefix: &str, p: &GroupProject, compa
                 .key(format!("{prefix}-{id}-head", id = p.id))
                 .w_full()
                 .items_center()
-                .gap(8.0)
+                .gap(7.0)
+                .child(rune::el().size(6.0, 6.0).radius(3.0).fill(ink(dot)))
                 .child(
                     text(p.title.clone())
                         .key(format!("{prefix}-{id}-title", id = p.id))
                         .grow(1.0)
+                        .min_w(0.0)
+                        .truncate()
                         .font(rune::tok::TextStyle::new(title_size, 600.0))
                         .color(ink("#e4e4e7")),
                 )
                 .child(
                     text(p.status.clone())
                         .key(format!("{prefix}-{id}-status", id = p.id))
-                        .font(rune::tok::TextStyle::new(10.0, 600.0))
-                        .px(8.0)
-                        .py(3.0)
-                        .radius(6.0)
-                        .fill(ink("#ffffff0d"))
-                        .color(ink("#a1a1aa")),
+                        .font(rune::tok::TextStyle::new(9.0, 600.0))
+                        .color(ink("#71717a")),
                 ),
         )
         .child(progress_bar(
             &format!("{prefix}-{id}", id = p.id),
             p.fraction(),
+            dot,
         ))
         .child(
-            text(format!("{} of {} items", p.done, p.total))
-                .key(format!("{prefix}-{id}-counts", id = p.id))
-                .font(rune::tok::TextStyle::new(10.0, 400.0))
-                .color(ink("#71717a")),
+            row()
+                .w_full()
+                .items_center()
+                .gap(6.0)
+                .child(
+                    text(if p.total == 0 {
+                        "not started".to_string()
+                    } else {
+                        format!("{} of {} items", p.done, p.total)
+                    })
+                    .key(format!("{prefix}-{id}-counts", id = p.id))
+                    .grow(1.0)
+                    .font(rune::tok::TextStyle::new(9.5, 400.0))
+                    .color(ink("#71717a")),
+                )
+                .child(
+                    text(format!("{}%", (p.fraction() * 100.0).round() as i64))
+                        .font(rune::tok::TextStyle::new(9.5, 600.0).mono())
+                        .color(ink("#a1a1aa")),
+                ),
         );
     if p.waiting > 0 {
         card = card.child(
             text(format!("{} waiting", p.waiting))
                 .key(format!("{prefix}-{id}-waiting", id = p.id))
-                .font(rune::tok::TextStyle::new(10.0, 600.0))
-                .color(ink("#a1a1aa")),
+                .font(rune::tok::TextStyle::new(9.0, 600.0))
+                .px(6.0)
+                .py(2.0)
+                .radius(5.0)
+                .fill(ink("#ffffff10"))
+                .color(ink("#e4e4e7")),
         );
     }
     card
@@ -1470,7 +1571,7 @@ fn p_waiting_note(s: &ProjectsState) -> bool {
 /// The track: implemented as a row where the fill grows and a spacer takes
 /// The rest, so no absolute measuring is needed. `stem` is the full key stem
 /// (`projects-p1`, `side-projects-p1`) — the bar/fill/rest keys hang off it.
-fn progress_bar(stem: &str, fraction: f32) -> El {
+fn progress_bar(stem: &str, fraction: f32, color: &'static str) -> El {
     let fill = (fraction.clamp(0.0, 1.0) * 1000.0).round() / 10.0;
     row()
         .key(format!("{stem}-bar"))
@@ -1483,7 +1584,7 @@ fn progress_bar(stem: &str, fraction: f32) -> El {
                 .key(format!("{stem}-fill"))
                 .h_full()
                 .radius(2.0)
-                .fill(ink("#d4d4d8"))
+                .fill(ink(color))
                 // Fractional width via flex weight out of 1000.
                 .grow(fill.max(1.0))
                 .min_h(0.0),

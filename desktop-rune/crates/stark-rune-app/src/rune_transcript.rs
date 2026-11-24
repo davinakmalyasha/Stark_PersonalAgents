@@ -2435,7 +2435,19 @@ pub fn transcript_view_body<S: TranscriptHost + crate::settings::SettingsHost + 
     s: &RuneTranscriptState,
     which: Thread,
 ) -> El {
-    transcript_body_with::<S>(s, which, true, false, true, 0.0, 0.0, false)
+    let mut root = transcript_body_with::<S>(s, which, true, false, true, 0.0, 0.0, false);
+    // The app docks this beside the chat; the standalone transcript overlays
+    // it on the right edge so the drill still has a home outside the shell.
+    if let Some(panel) = subagent_panel::<S>(s, which, 420.0) {
+        root = root.child(
+            col()
+                .key("subagent-panel-overlay")
+                .pin(None, Some(0.0), Some(0.0), Some(0.0))
+                .h_full()
+                .child(panel),
+        );
+    }
+    root
 }
 
 /// Deduped home transcript state (`MessageStream`): agent rows that merely
@@ -5285,6 +5297,7 @@ fn subagent_drill_view<S: TranscriptHost + 'static>(
     s: &RuneTranscriptState,
     which: Thread,
     max_w: f32,
+    panel: bool,
 ) -> El {
     let Some(drill) = s.active_subagent.as_ref() else {
         return col().key("subagent-view-empty");
@@ -5311,8 +5324,9 @@ fn subagent_drill_view<S: TranscriptHost + 'static>(
         .px(14.0)
         .border_sides([0.0, 0.0, 1.0, 0.0], home_rgba(255.0, 255.0, 255.0, 0.075))
         .border_layout()
-        .fill(home_ink("#0b0b0b"))
-        .child(
+        .fill(home_ink("#0b0b0b"));
+    if !panel {
+        header = header.child(
             rune::el()
                 .key("subagent-view-back")
                 .role("button")
@@ -5329,41 +5343,61 @@ fn subagent_drill_view<S: TranscriptHost + 'static>(
                         .inert()
                         .shape(drill_back_icon(15.0, home_ink("#8e9098"))),
                 ),
-        )
-        .child(
-            row()
-                .key("subagent-view-crumb")
-                .grow(1.0)
-                .min_w(0.0)
-                .items_center()
-                .gap(7.0)
-                .child(
-                    text(parent_title)
-                        .key("subagent-view-parent")
-                        .role("button")
-                        .focusable(true)
-                        .label("Back to main session")
-                        .font(rune::tok::TextStyle::new(12.0, 400.0))
-                        .color(home_ink("#777982"))
-                        .truncate()
-                        .max_w(132.0)
-                        .on_press_enter(move |s: &mut S| close_subagent(s.thread_mut(which))),
-                )
-                .child(
-                    text("/".to_string())
-                        .font(rune::tok::TextStyle::new(12.0, 400.0))
-                        .color(home_ink("#62646d")),
-                )
-                .child(
-                    text(child_label)
-                        .key("subagent-view-child")
-                        .grow(1.0)
-                        .min_w(0.0)
-                        .truncate()
-                        .font(rune::tok::TextStyle::new(12.5, 600.0))
-                        .color(home_ink("#e1e1e5")),
-                ),
         );
+    }
+    header = header.child(
+        row()
+            .key("subagent-view-crumb")
+            .grow(1.0)
+            .min_w(0.0)
+            .items_center()
+            .gap(7.0)
+            .child(
+                text(parent_title)
+                    .key("subagent-view-parent")
+                    .role("button")
+                    .focusable(true)
+                    .label("Back to main session")
+                    .font(rune::tok::TextStyle::new(12.0, 400.0))
+                    .color(home_ink("#777982"))
+                    .truncate()
+                    .max_w(132.0)
+                    .on_press_enter(move |s: &mut S| close_subagent(s.thread_mut(which))),
+            )
+            .child(
+                text("/".to_string())
+                    .font(rune::tok::TextStyle::new(12.0, 400.0))
+                    .color(home_ink("#62646d")),
+            )
+            .child(
+                text(child_label)
+                    .key("subagent-view-child")
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .truncate()
+                    .font(rune::tok::TextStyle::new(12.5, 600.0))
+                    .color(home_ink("#e1e1e5")),
+            ),
+    );
+    if panel {
+        header = header.child(
+            rune::el()
+                .key("subagent-panel-close")
+                .role("button")
+                .focusable(true)
+                .label("Close subagent panel")
+                .size(26.0, 26.0)
+                .radius(7.0)
+                .center()
+                .hover(home_rgba(255.0, 255.0, 255.0, 0.08))
+                .on_press_enter(move |s: &mut S| close_subagent(s.thread_mut(which)))
+                .child(rune::el().size(14.0, 14.0).inert().shape(crate::lucide_x(
+                    14.0,
+                    2.0,
+                    home_ink("#8e9098"),
+                ))),
+        );
+    }
     if loading {
         header = header.child(
             row()
@@ -5470,7 +5504,7 @@ fn subagent_drill_view<S: TranscriptHost + 'static>(
         col()
             .key("subagent-view-rows")
             .w_full()
-            .pl(32.0)
+            .pl(if panel { 16.0 } else { 32.0 })
             .pr(16.0)
             .pt(12.0)
             .pb(12.0)
@@ -5531,7 +5565,11 @@ fn subagent_drill_view<S: TranscriptHost + 'static>(
                 .color(home_ink("#777982")),
         );
     col()
-        .key("subagent-view")
+        .key(if panel {
+            "subagent-panel-surface"
+        } else {
+            "subagent-view"
+        })
         .w_full()
         .grow(1.0)
         .min_h(0.0)
@@ -5549,6 +5587,29 @@ fn subagent_drill_view<S: TranscriptHost + 'static>(
         .child(dock)
 }
 
+/// Right-hand subagent session panel (`SubagentSessionView` docked like the
+/// reference split view): the main chat stays visible and the child session
+/// slides in beside it. Desktop only; phones keep the full-width drill.
+pub fn subagent_panel<S: TranscriptHost + 'static>(
+    s: &RuneTranscriptState,
+    which: Thread,
+    width: f32,
+) -> Option<El> {
+    s.active_subagent.as_ref()?;
+    let inner_w = (width - 32.0).max(200.0);
+    Some(
+        col()
+            .key("subagent-panel")
+            .w(width)
+            .h_full()
+            .min_h(0.0)
+            .fill(home_ink("#0b0b0b"))
+            .border_sides([1.0, 0.0, 0.0, 0.0], home_rgba(255.0, 255.0, 255.0, 0.10))
+            .border_layout()
+            .child(subagent_drill_view::<S>(s, which, inner_w * 0.85, true)),
+    )
+}
+
 // Layout flags stay explicit: head, dock, sheets, home width, window height, fold.
 #[allow(clippy::too_many_arguments)]
 fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'static>(
@@ -5561,12 +5622,6 @@ fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'sta
     window_h: f32,
     folded: bool,
 ) -> El {
-    // Session-keyed drill (`SubagentSessionView`): conditional content replaces
-    // The body, Rune `collapsible` style — no height animation, just open content.
-    // A folded home card skips the drill with the rest of the message area.
-    if s.active_subagent.is_some() && !folded {
-        return subagent_drill_view::<S>(s, which, home_max_w);
-    }
     // Index-built rows: layout builds only the mounted window (viewport + up to
     // two viewports either side), so a 10k transcript commits in window time.
     // Handlers must find items by key, never by index (see `RowSource` docs).
@@ -7723,7 +7778,18 @@ mod tests {
     fn tapping_delegation_card_opens_drill() {
         use crate::stream_accum::{ChildRef, LiveToolEvent, StreamSegment, ToolStatus};
         fn home_view(s: &RuneTranscriptState, _cx: &mut Cx<RuneTranscriptState>) -> El {
-            home_transcript_body::<RuneTranscriptState>(s, Thread::Main, 468.0, 720.0, false)
+            let mut root = col().key("test-home").w_full().h_full();
+            root = root.child(home_transcript_body::<RuneTranscriptState>(
+                s,
+                Thread::Main,
+                468.0,
+                720.0,
+                false,
+            ));
+            if let Some(panel) = subagent_panel::<RuneTranscriptState>(s, Thread::Main, 420.0) {
+                root = root.child(panel);
+            }
+            root
         }
         let mut s = RuneTranscriptState::screenshot();
         s.workspace_id = "_general".to_string();
@@ -7771,7 +7837,10 @@ mod tests {
         assert_eq!(drill.child_id, "child-9");
         assert_eq!(drill.workspace_id, "_general", "hint falls back");
         rt.frame(1.0 / 60.0);
-        assert!(rt.find("subagent-view").is_some(), "drill mounted");
+        assert!(
+            rt.find("subagent-panel-surface").is_some(),
+            "drill panel mounted"
+        );
     }
 
     #[test]
@@ -7793,8 +7862,12 @@ mod tests {
         let env = Env::new(true, 2.0);
         let mut rt = Runtime::new(s, transcript_view, (468.0, 720.0), env);
         rt.frame(0.0);
-        assert!(rt.find("subagent-view").is_some(), "drill mounted");
-        assert!(rt.find("subagent-view-back").is_some(), "back button");
+        assert!(rt.find("subagent-panel").is_some(), "drill mounted");
+        assert!(rt.find("subagent-panel-surface").is_some(), "panel surface");
+        assert!(
+            rt.find("subagent-panel-close").is_some(),
+            "panel close button"
+        );
         assert!(
             rt.find("subagent-view-parent").is_some(),
             "breadcrumb parent"
@@ -7804,14 +7877,14 @@ mod tests {
             rt.find("subagent-view-readonly").is_some(),
             "read-only dock"
         );
-        // Back closes the drill.
-        let (bx, by) = rt.find("subagent-view-back").expect("back placed");
+        // Close dismisses the docked panel.
+        let (bx, by) = rt.find("subagent-panel-close").expect("close placed");
         rt.pointer_down(bx, by);
         rt.pointer_up(bx, by);
         rt.frame(1.0 / 60.0);
         assert!(
             rt.state.active_subagent.is_none(),
-            "back closes drill, like SubagentSessionView onBack"
+            "close dismisses the drill"
         );
     }
 

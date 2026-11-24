@@ -38,6 +38,8 @@ const TOPBAR_H: f32 = 44.0;
 const TAB_GAP: f32 = 4.0;
 /// Side panel width (`HouseSidebar` w-[248px]).
 const PANEL_W: f32 = 248.0;
+/// Right-hand subagent session panel (reference split view).
+const DRILL_W: f32 = 420.0;
 /// Phone bottom nav (icons + labels), before safe-area padding.
 const MOBILE_NAV_H: f32 = 52.0;
 
@@ -1050,6 +1052,18 @@ fn home_chat_overlay(s: &ShellState, stage_w: f32, stage_h: f32, window_h: f32) 
 /// Modals owned by the active card thread. They render at the shell root so
 /// The home chat card's clipping never crops them (the reference UI portals its dialogs
 /// over the whole workspace).
+/// Thread whose subagent session is open, if any. Mirrors the home card's
+/// own fallback: with no sheet, a fresh account still owns the main thread.
+fn drill_thread(s: &ShellState) -> Option<&crate::rune_transcript::RuneTranscriptState> {
+    s.canvas.sheet_thread().or({
+        if s.canvas.cards.is_empty() {
+            Some(&s.transcript)
+        } else {
+            None
+        }
+    })
+}
+
 fn active_chat_sheets(s: &ShellState) -> Vec<El> {
     // A fresh account has no canvas sheet yet, but the always-mounted home
     // card still owns the main thread's dock. Its modals must mount at the
@@ -1323,9 +1337,15 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
     // both and open the drawer instead.
     let rail_visible = !folded;
     let panel_visible = !folded && s.panel_open;
-    let stage_w =
-        (w - if rail_visible { RAIL_W } else { 0.0 } - if panel_visible { PANEL_W } else { 0.0 })
-            .max(320.0);
+    // A subagent session docks to the right of the chat, like the reference
+    // split view, instead of replacing the conversation.
+    let drill_thread = drill_thread(s).filter(|thread| thread.active_subagent.is_some() && !folded);
+    let drill_w = if drill_thread.is_some() { DRILL_W } else { 0.0 };
+    let stage_w = (w
+        - if rail_visible { RAIL_W } else { 0.0 }
+        - if panel_visible { PANEL_W } else { 0.0 }
+        - drill_w)
+        .max(320.0);
     let stage_h = (h
         - TOPBAR_H
         - if folded {
@@ -1369,6 +1389,13 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
         }
     }
     main = main.child(stage);
+    if let Some(thread) = drill_thread {
+        if let Some(panel) =
+            crate::rune_transcript::subagent_panel::<ShellState>(thread, Thread::Open, DRILL_W)
+        {
+            main = main.child(panel);
+        }
+    }
     let mut root = col()
         .key("stark-shell")
         .w_full()
@@ -1855,6 +1882,8 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
     // drives `fitView`). While the camera is auto it refits on resize.
     let (win_w, win_h, safe_bottom) = unsafe { (WINDOW_W, WINDOW_H, WINDOW_SAFE_BOTTOM) };
     let folded = win_w < PANEL_FOLD_W;
+    let drill_open =
+        !folded && drill_thread(s).is_some_and(|thread| thread.active_subagent.is_some());
     let stage_w = (win_w
         - if folded { 0.0 } else { RAIL_W }
         - if !folded && s.panel_open {
@@ -1862,6 +1891,7 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
         } else {
             0.0
         }
+        - if drill_open { DRILL_W } else { 0.0 }
         - 40.0)
         .max(320.0);
     let stage_h = (win_h
@@ -3128,6 +3158,53 @@ mod tests {
             .clone();
         let (tab, _) = rt.presented(&format!("session-{last}")).expect("last tab");
         assert!(tab[0] >= 0.0, "tab inside the strip");
+    }
+
+    #[test]
+    fn subagent_drill_docks_right_of_the_chat() {
+        let env = Env::new(true, 1.0);
+        let mut state = ShellState::default();
+        // Open the drill on the visible card thread (the sheet), which is
+        // the same thread the home card renders.
+        let active = state.canvas.active_id.clone();
+        let thread = state.canvas.thread_mut(&active);
+        crate::rune_transcript::open_subagent(thread, "child-1", "Dev", None);
+        thread.drill_inbox = None;
+        thread.active_subagent.as_mut().expect("drill").loading = false;
+        let mut rt = Runtime::new(state, shell_view, (1280.0, 900.0), env);
+        rt.frame(0.0);
+        // The conversation stays mounted; the child session docks to its right.
+        assert!(rt.find("home-chat-card").is_some(), "chat stays mounted");
+        assert!(rt.find("subagent-panel").is_some(), "panel mounted");
+        assert!(rt.find("subagent-panel-surface").is_some(), "panel surface");
+        assert!(
+            rt.find("subagent-panel-close").is_some(),
+            "panel close button"
+        );
+        let (card, _) = rt.presented("home-chat-card").expect("card rect");
+        let (panel, _) = rt.presented("subagent-panel").expect("panel rect");
+        assert!(
+            panel[0] >= card[0] + card[2] - 1.0,
+            "panel sits right of the card: panel {} card {}",
+            panel[0],
+            card[0] + card[2]
+        );
+        // Close returns the width to the chat.
+        let (x, y) = rt.find("subagent-panel-close").expect("close placed");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..8 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(
+            rt.state
+                .canvas
+                .sheet_thread()
+                .is_none_or(|t| t.active_subagent.is_none()),
+            "drill closed"
+        );
+        assert!(rt.find("subagent-panel").is_none(), "panel closed");
+        assert!(rt.find("home-chat-card").is_some(), "chat still mounted");
     }
 
     #[test]

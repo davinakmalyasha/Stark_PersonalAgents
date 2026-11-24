@@ -136,12 +136,39 @@ pub fn summary(name: &str) -> &str {
 }
 
 /// `ToolIcon` category.
+/// Icon family per tool. Grouped so related tools read alike while still
+/// looking like the action (terminal, file, bot, globe, ...).
 pub fn icon_kind(name: &str) -> IconKind {
     match name {
-        "bash" | "run_command" | "ds_shell" | "job" => IconKind::Terminal,
-        "grep" | "glob" | "search_code" | "web_search" => IconKind::Search,
-        "read" | "read_image" | "read_file" | "write" | "write_file" | "edit" | "edit_file"
-        | "list_files" => IconKind::File,
+        "bash" | "run_command" | "ds_shell" | "job" | "job_cancel" | "job_message" | "run_code" => {
+            IconKind::Terminal
+        }
+        "grep" | "search_code" | "tool_search" | "web_search" => IconKind::Search,
+        "glob" | "list_files" => IconKind::Folder,
+        "read" | "read_image" | "read_file" | "read_pdf" => IconKind::File,
+        "write"
+        | "write_file"
+        | "edit"
+        | "edit_file"
+        | "apply_patch"
+        | "create_docx"
+        | "create_xlsx"
+        | "update_feature"
+        | "update_plan"
+        | "update_project_meta" => IconKind::FileEdit,
+        "browser_act" | "look_at_screen" | "set_screen_share" => IconKind::Globe,
+        "agent" | "delegate" | "spawn_agent" | "message_agent" | "interrupt_agent"
+        | "close_agent" | "wait_agent" | "delegation_status" => IconKind::Bot,
+        "memory" | "give_note" => IconKind::Database,
+        "schedule" => IconKind::Clock,
+        "create_group" | "group_board" | "group_events" | "group_item_detail" | "group_update" => {
+            IconKind::Checklist
+        }
+        "dfd_bridge" | "files_changed" => IconKind::GitBranch,
+        "house_get_device" | "house_get_history" | "house_get_state" | "house_run_scene"
+        | "house_set_device" => IconKind::House,
+        "ask_user_question" => IconKind::Message,
+        "skill" | "canvas_mode" | "personal_os" | "workspace" => IconKind::Sparkles,
         _ => IconKind::Wrench,
     }
 }
@@ -150,7 +177,18 @@ pub fn icon_kind(name: &str) -> IconKind {
 pub enum IconKind {
     Terminal,
     Search,
+    Folder,
     File,
+    FileEdit,
+    Globe,
+    Bot,
+    Database,
+    Clock,
+    Checklist,
+    GitBranch,
+    House,
+    Message,
+    Sparkles,
     Wrench,
 }
 

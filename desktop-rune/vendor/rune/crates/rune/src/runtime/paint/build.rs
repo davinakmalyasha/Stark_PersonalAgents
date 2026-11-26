@@ -914,13 +914,20 @@ impl<S: 'static> Runtime<S> {
                 let (border_kind, border_uv) = border_bottom.map_or((KIND_RECT, [0.0; 4]), |b| (KIND_GRADIENT, b));
                 let border_a = border[3].max(border_uv[3]);
                 // A dashed ring is its own instance over the fill, which then draws without a ring.
+                // A `BorderSweep` loop turns the dash pattern into an orbiting border segment:
+                // the same per-frame phase used by the gradient sweep drives the dash offset.
+                let dash_phase = if n.looping.as_deref().is_some_and(|l| matches!(l.kind, rune_motion::LoopKind::BorderSweep)) {
+                    n.vis.border_dash_phase + border_phase as f32 * (n.vis.border_dash.map_or(0.0, |[dash, gap]| dash + gap))
+                } else {
+                    n.vis.border_dash_phase
+                };
                 let dashed = n.vis.border_dash.filter(|_| bw > 0.0 && border_a > 0.0005).map(|[dash, gap]| Instance {
                     rect: [r[0], r[1], w, h],
                     radii,
                     fill: border,
                     border: border_bottom.unwrap_or(border),
                     params: [bw, KIND_DASHED, blur * s, 1.0],
-                    uv: [dash * k_px, gap * k_px, n.vis.border_dash_phase * k_px, 0.0],
+                    uv: [dash * k_px, gap * k_px, dash_phase * k_px, 0.0],
                     clip,
                     fade: crate::render::pack_fade(fade, clip, clip),
                 });

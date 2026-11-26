@@ -247,11 +247,9 @@ fn voice_icon(color: rune::Color) -> rune::Shape {
 /// island's mic (or Ctrl+Space while armed). `S` is the owning view's state
 /// type.
 ///
-/// While armed, four dots chase each other around the button's edge (each a
-/// staggered `LoopSpec::opacity`) and the bars shimmer. Both are paint-only
-/// loops: no shell wake, no rebuild. A `LoopSpec::rotation` would not work
-/// here — it only turns icon images, never shapes — and `border_sweep`'s
-/// gradient band is sized to the box, so it washes out at 32 pt.
+/// While armed, one dash of an inner border ring orbits the button and the
+/// bars shimmer. Both are paint-only loops: no shell wake, no rebuild. The
+/// ring follows the button's rounded square, not a separate circle.
 fn voice_button<S: 'static>(
     voice: &crate::voice::VoiceMeter,
     on_voice: impl Fn(&mut S) + 'static,
@@ -294,29 +292,24 @@ fn voice_button<S: 'static>(
                     .inert(),
             );
         }
-        // Four dots ride the button's edge in a chase, one quarter-period
-        // apart: the border itself reads as circling. `border_sweep` was too
-        // faint at 32 pt (its gradient band scales with the box), and a
-        // rotation loop only turns icon images, never shapes.
-        const DOTS: [(f32, f32); 4] = [(14.5, 0.5), (28.5, 14.5), (14.5, 28.5), (0.5, 14.5)];
-        for (i, (x, y)) in DOTS.iter().enumerate() {
-            button = button.child(
-                rune::el()
-                    .key(format!("composer-voice-run-{i}"))
-                    .absolute(*x, *y)
-                    .size(3.0, 3.0)
-                    .radius(1.5)
-                    .fill(ink("#111113"))
-                    .looping(rune::LoopSpec::opacity(1.2, i as f64 * 0.3, 0.10, 1.0))
-                    .inert(),
-            );
-        }
-        button = button
-            .fill(ink("#ffffff"))
-            // A hairline track for the chase to ride; the border itself
-            // follows the button's 11 pt radii.
-            .border(1.0, ink("#e4e4e7"))
-            .child(bars);
+        // One long dash on a ring just inside the disc, fully over the white
+        // fill (an element's own border draws at the outer edge and half of
+        // it would blend into the dark dock). The gaps show white, so the
+        // visible line is a border segment travelling around the rounded
+        // square rather than a separate ring or dots.
+        let orbit = rune::el()
+            .key("composer-voice-border")
+            .absolute(1.0, 1.0)
+            .size(30.0, 30.0)
+            .radius(10.0)
+            .border(1.6, ink("#111113"))
+            .border_layout()
+            // One dash plus its gap is about the ring's perimeter (≈103 pt),
+            // so the loop wraps without a visible jump.
+            .border_dash(32.0, 71.0)
+            .looping(rune::LoopSpec::border_sweep(1.6))
+            .inert();
+        button = button.fill(ink("#ffffff")).child(bars).child(orbit);
     } else {
         button = button
             .fill(ink("#303035"))

@@ -7428,8 +7428,8 @@ mod tests {
             "armed bars render"
         );
         assert!(
-            rt.find("composer-voice-run-0").is_some(),
-            "armed edge chase renders"
+            rt.find("composer-voice-border").is_some(),
+            "armed border orbit renders"
         );
         let (x2, y2) = rt.find("composer-voice").unwrap();
         rt.pointer_down(x2, y2);
@@ -7444,8 +7444,8 @@ mod tests {
             "armed bars leave with live mode"
         );
         assert!(
-            rt.find("composer-voice-run-0").is_none(),
-            "edge chase leaves with live mode"
+            rt.find("composer-voice-border").is_none(),
+            "border orbit leaves with live mode"
         );
     }
 

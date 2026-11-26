@@ -63,8 +63,7 @@ impl VoiceRuntime {
             }
         };
         *self.stt.write().unwrap() = Some(stt.clone());
-        *self.capture.write().unwrap() =
-            Some(Arc::new(CaptureManager::new(stt.clone())));
+        *self.capture.write().unwrap() = Some(Arc::new(CaptureManager::new(stt.clone())));
         Ok(stt)
     }
 
@@ -79,11 +78,7 @@ impl VoiceRuntime {
     /// Drop the ASR service and its backend capture worker. Returns true when
     /// something was actually released so live-mode off can stay idempotent.
     pub fn release_asr(&self) -> bool {
-        let had = self
-            .stt
-            .read()
-            .map(|g| g.is_some())
-            .unwrap_or(false);
+        let had = self.stt.read().map(|g| g.is_some()).unwrap_or(false);
         *self.capture.write().unwrap() = None;
         *self.stt.write().unwrap() = None;
         had

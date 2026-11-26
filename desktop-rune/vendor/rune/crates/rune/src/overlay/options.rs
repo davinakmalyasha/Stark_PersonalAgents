@@ -116,6 +116,11 @@ pub struct OverlayOptions {
     /// `OverlayHandle::set_exclude_from_capture` changes it later.
     pub exclude_from_capture: bool,
     pub keys: KeyPolicy,
+    /// Windows only: let a click on an input region activate this overlay, so
+    /// a focused text field can receive keys. Off by default — overlays never
+    /// take focus unless their host asks. Showing still never activates.
+    /// `OverlayHandle::set_activatable` changes it later.
+    pub activatable: bool,
     pub input: OverlayInput,
     /// Create and warm a hidden native host on the event thread at startup. Desktop hosts
     /// retain their window and GPU surface across hide/show (unless

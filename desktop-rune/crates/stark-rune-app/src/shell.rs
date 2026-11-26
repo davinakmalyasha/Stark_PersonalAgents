@@ -1986,6 +1986,8 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
         .collect();
     for (id, workspace, chat) in rekeys {
         if s.canvas.rekey_local_chat(&id, &workspace, &chat) {
+            #[cfg(not(target_arch = "wasm32"))]
+            crate::presence::rekey_island_chat(s, &id, &workspace, &chat);
             changed = true;
         } else if let Some(thread) = s.canvas.sessions.threads.get_mut(&id) {
             thread.pending_rekey = None;

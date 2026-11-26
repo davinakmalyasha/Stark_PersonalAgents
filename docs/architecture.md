@@ -40,16 +40,24 @@ root so they escape clipping.
 The native app is also a background desktop surface:
 
 - **Stark Island** (`island.rs`) is a Rune overlay at the top-center of the
-  primary display. It is transparent, topmost, non-activating and skipped from
-  the taskbar; only the notch itself is an input region, so the rest of its
-  520×420 window is click-through. The island exists only in live mode, and
-  arming alone raises it: the prompt-dock mic warms the speech models and
-  shows the idle island (104×24 mark + status dot, white hairline, no glow),
-  while only the island's mic — or `Ctrl+Space` while armed — starts capture.
-  Hover expands the cockpit, and listening shows the live waveform and
-  interim transcript. Turning the dock off disarms every bus, releases the
-  models and hides the island. A hidden island releases its GPU surface
-  after 20s.
+  primary display. It is transparent, topmost and skipped from the taskbar;
+  only the notch itself is an input region, so the rest of its 620×720 window
+  is click-through. The island exists only in live mode, and arming alone
+  raises it: the prompt-dock mic warms the speech models and shows the idle
+  island (104×24 mark + status dot, white hairline, no glow), while only the
+  island's mic — or `Ctrl+Space` while armed — starts capture.
+  Hover expands the **activity shelf**: running chats, active group projects
+  and cloud runs, three rows at a time with the rest scrolling. The top-right
+  add control fans into Chat / Group / Cloud; each offers a new item or picks
+  an existing one. Choosing a chat opens a pinned in-overlay chat (compact
+  prompt dock with mic and send, up to three tabs for concurrent work),
+  backed by the same markdown renderer as the main transcript. Chat is the
+  only screen that opts into keyboard focus: on Windows the overlay window is
+  otherwise `WS_EX_NOACTIVATE` and becomes activatable only while that screen
+  is up (`OverlayHandle::set_activatable`), and it captures the whole surface
+  so a click can never leak through to the app underneath. Turning the dock
+  off disarms every bus, releases the models and hides the island. A hidden
+  island releases its GPU surface after 20s.
 - **Background lifetime** (`presence.rs`, `shell.rs`) uses `keep_running`:
   closing the main window hides it and stops capture but keeps live mode
   armed — agents, the tray and the idle island stay alive. `--background`

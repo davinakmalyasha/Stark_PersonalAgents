@@ -45,6 +45,9 @@ struct Input {
     captured: Cell<bool>,
     visible: Cell<bool>,
     input: Cell<OverlayInput>,
+    /// A click on an input region may activate this overlay (a text field
+    /// needs focus). Off: the overlay never takes activation, as before.
+    activatable: Cell<bool>,
     follow: Cell<bool>,
     level: OverlayLevel,
     /// Fading out (`OverlayWindow::fade`): every click goes through.
@@ -94,6 +97,16 @@ unsafe extern "system" fn subclass(hwnd: HWND, message: u32, wparam: WPARAM, lpa
             let point = (lparam as i16 as f32 / input.scale.get(), (lparam >> 16) as i16 as f32 / input.scale.get());
             input.clicks.borrow_mut().push_back((down, point));
         }
+        WM_MOUSEACTIVATE => {
+            // Windows sends this only for a click that reached this window
+            // (a click outside an input region hit-tests through), so the
+            // opt-in alone decides whether it may take activation.
+            return if input.activatable.get() {
+                MA_ACTIVATE as LRESULT
+            } else {
+                MA_NOACTIVATE as LRESULT
+            };
+        }
         WM_CAPTURECHANGED => input.captured.set(false),
         _ => {}
     }
@@ -112,11 +125,11 @@ impl OverlayWindow {
     pub fn new(window: &winit::window::Window, interactive: bool, options: &OverlayOptions, wake: Option<crate::Waker>) -> Result<Self, String> {
         let hwnd = hwnd(window).ok_or("the overlay window has no Win32 handle")?;
         let mode = options.input.resolved(interactive);
-        overlay_styles(hwnd, mode)?;
+        overlay_styles(hwnd, mode, options.activatable)?;
         let exclusion = if options.exclude_from_capture {
             if unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) } != 0 { OverlaySupport::Requested } else { OverlaySupport::Failed }
         } else { OverlaySupport::Unknown };
-        let input = Rc::new(Input { hwnd, regions: RefCell::default(), scale: Cell::new(window.scale_factor() as f32), clicks: RefCell::default(), captured: Cell::new(false), visible: Cell::new(false), input: Cell::new(mode), follow: Cell::new(options.follow_pointer), level: options.level, fading: Cell::new(false) });
+        let input = Rc::new(Input { hwnd, regions: RefCell::default(), scale: Cell::new(window.scale_factor() as f32), clicks: RefCell::default(), captured: Cell::new(false), visible: Cell::new(false), input: Cell::new(mode), activatable: Cell::new(options.activatable), follow: Cell::new(options.follow_pointer), level: options.level, fading: Cell::new(false) });
         if unsafe { SetWindowSubclass(hwnd, Some(subclass), 0x52554e45, Rc::as_ptr(&input) as usize) } == 0 {
             return Err(format!("SetWindowSubclass failed: {}", last_error()));
         }
@@ -142,6 +155,12 @@ impl OverlayWindow {
         self.input.input.set(input);
         self.refresh_watch();
         if let Some((x, y)) = pointer_position() { self.input.observe(POINT { x, y }); }
+    }
+
+    /// Toggle whether a click on an input region can activate the window.
+    pub fn set_activatable(&mut self, active: bool) {
+        self.input.activatable.set(active);
+        let _ = overlay_styles(self.input.hwnd, self.input.input.get(), active);
     }
     pub fn set_follow_pointer(&mut self, follow: bool) { self.input.follow.set(follow); self.refresh_watch(); }
 
@@ -170,7 +189,7 @@ impl OverlayWindow {
         let hwnd = self.input.hwnd;
         // Opaque again, after any fade-out.
         self.input.fading.set(false);
-        overlay_styles(hwnd, self.input.input.get())?;
+        overlay_styles(hwnd, self.input.input.get(), self.input.activatable.get())?;
         // SAFETY: Win32 calls on a live window owned by this thread.
         let visible = unsafe {
             ShowWindow(hwnd, SW_SHOWNOACTIVATE);
@@ -225,12 +244,15 @@ impl Drop for OverlayWindow {
 /// layered window, its DirectComposition content included, only once it has layered
 /// attributes: without them it stays invisible however often it is shown (#510 in Hex).
 /// Opaque attributes leave the content's own alpha as the only transparency.
-fn overlay_styles(hwnd: HWND, mode: OverlayInput) -> Result<(), String> {
+fn overlay_styles(hwnd: HWND, mode: OverlayInput, activatable: bool) -> Result<(), String> {
     let through = if mode == OverlayInput::All { 0 } else { WS_EX_TRANSPARENT };
+    let activate = if activatable { 0 } else { WS_EX_NOACTIVATE };
     // SAFETY: style changes on a live window owned by this thread.
     unsafe {
         let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
-        let next = style | WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | through;
+        let mut next = style | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | through;
+        next &= !WS_EX_NOACTIVATE;
+        next |= activate;
         if next != style { SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next as isize); }
         if SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA) == 0 {
             return Err(format!("SetLayeredWindowAttributes failed: {}", last_error()));

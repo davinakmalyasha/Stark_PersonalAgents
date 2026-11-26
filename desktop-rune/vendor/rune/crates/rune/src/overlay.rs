@@ -167,6 +167,10 @@ impl<T: 'static> OverlayHandle<T> {
     /// the overlay is shown; set while hidden, it takes effect at the next show, so there is no
     /// need to toggle it around show and hide.
     pub fn set_exclude_from_capture(&self, exclude: bool) { self.request(|q| q.exclude_from_capture = Some(exclude)); }
+    /// Changes `OverlayOptions::activatable` (Windows): with it on, a click on
+    /// an input region activates the overlay so a focused text field takes
+    /// keys. Showing never activates, and a hidden overlay is unchanged.
+    pub fn set_activatable(&self, active: bool) { self.request(|q| q.activatable = Some(active)); }
     /// Changes `OverlayOptions::xwayland_input`. It applies when the surface is next made, so
     /// a call before `show` in the same turn covers that show.
     pub fn set_xwayland_input(&self, allow: bool) { self.request(|q| q.xwayland_input = Some(allow)); }

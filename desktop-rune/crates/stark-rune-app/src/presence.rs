@@ -12,11 +12,15 @@ use std::time::Duration;
 
 use rune::Tx;
 
+use crate::cloud::CloudRun;
 use crate::island::{
-    IslandAttention, IslandAttentionKind, IslandCommand, IslandLink, IslandModel, IslandRun,
-    IslandTarget,
+    IslandAttention, IslandAttentionKind, IslandChat, IslandChatRow, IslandCommand, IslandKind,
+    IslandLink, IslandModel, IslandRun, IslandShelfItem, IslandTarget,
 };
-use crate::rune_transcript::{stage_abort, stage_send, RuneTranscriptState};
+use crate::projects::GroupProject;
+use crate::rune_transcript::{
+    stage_abort, stage_send, stage_send_prompt_with_attachments, RuneTranscriptState,
+};
 use crate::shell::ShellState;
 
 /// Everything the native presence layer remembers between frames.
@@ -30,6 +34,12 @@ pub struct PresenceState {
     pub open_requested: bool,
     last_final: HashMap<String, u64>,
     last_live: HashMap<String, bool>,
+    /// The chat the overlay is showing; its compact transcript is published
+    /// until the overlay goes back to the shelf.
+    island_chat: Option<IslandTarget>,
+    /// A chat the shell created for the overlay (new chat, project, etc.).
+    island_focus: Option<IslandTarget>,
+    island_focus_seq: u64,
     /// Newest completion/draft/error card. Pending questions are read live
     /// from each thread and take priority over this.
     toast: Option<IslandAttention>,
@@ -261,6 +271,379 @@ fn collect_runs(s: &ShellState, now_ms: f64) -> Vec<IslandRun> {
     runs
 }
 
+fn workspace_label(s: &ShellState, id: &str) -> String {
+    if id.is_empty() {
+        return "Chat".to_string();
+    }
+    s.canvas
+        .workspaces
+        .iter()
+        .find(|ws| ws.id == id)
+        .map(|ws| {
+            if ws.name.trim().is_empty() {
+                ws.id.clone()
+            } else {
+                ws.name.clone()
+            }
+        })
+        .unwrap_or_else(|| id.to_string())
+}
+
+fn push_unique(items: &mut Vec<IslandShelfItem>, item: IslandShelfItem) {
+    if !items.iter().any(|existing| existing.key == item.key) {
+        items.push(item);
+    }
+}
+
+fn chat_shelf_item(
+    s: &ShellState,
+    key: &str,
+    running: bool,
+    meta: String,
+) -> Option<IslandShelfItem> {
+    let thread = thread_ref(s, key)?;
+    let target = target_for(s, key)?;
+    let subtitle = if running {
+        activity_of(thread)
+    } else {
+        workspace_label(s, &thread.workspace_id)
+    };
+    Some(IslandShelfItem {
+        key: target.thread_key.clone(),
+        kind: IslandKind::Chat,
+        title: target.display().to_string(),
+        subtitle,
+        meta,
+        running,
+        waiting: 0,
+        target,
+        project_id: String::new(),
+    })
+}
+
+fn project_shelf_item(p: &GroupProject) -> IslandShelfItem {
+    let status = p.status.to_ascii_lowercase();
+    let active = p.waiting > 0
+        || matches!(status.as_str(), "running" | "doing" | "active")
+        || (status.is_empty() && p.total > 0);
+    let meta = if p.waiting > 0 {
+        format!("{} waiting", p.waiting)
+    } else if p.total > 0 {
+        format!("{}/{}", p.done, p.total)
+    } else {
+        p.status.clone()
+    };
+    IslandShelfItem {
+        key: format!("project:{}", p.id),
+        kind: IslandKind::Project,
+        title: if p.title.trim().is_empty() {
+            "Group project".to_string()
+        } else {
+            p.title.clone()
+        },
+        subtitle: "Group project".to_string(),
+        meta,
+        running: active,
+        waiting: p.waiting,
+        target: IslandTarget::default(),
+        project_id: p.id.clone(),
+    }
+}
+
+fn cloud_shelf_item(s: &ShellState, run: &CloudRun) -> IslandShelfItem {
+    let key = if run.chat_id.trim().is_empty() {
+        format!("cloud:{}", run.workspace_path)
+    } else {
+        format!("cloud:{}", run.chat_id)
+    };
+    let row = s
+        .canvas
+        .chat_rows
+        .iter()
+        .find(|row| !run.chat_id.is_empty() && row.id == run.chat_id);
+    let target = row
+        .map(|row| {
+            let thread_key = format!("chat:{}", row.key());
+            IslandTarget {
+                thread_key: thread_key.clone(),
+                title: crate::chats::display_title(&row.title),
+                card_id: Some(thread_key),
+                workspace_id: row.workspace_id.clone(),
+                chat_id: row.id.clone(),
+            }
+        })
+        .unwrap_or_else(|| IslandTarget {
+            thread_key: key.clone(),
+            title: "Cloud run".to_string(),
+            card_id: None,
+            workspace_id: String::new(),
+            chat_id: run.chat_id.clone(),
+        });
+    IslandShelfItem {
+        key,
+        kind: IslandKind::Cloud,
+        title: target.display().to_string(),
+        subtitle: if run.workspace_path.trim().is_empty() {
+            "Running on the VPS".to_string()
+        } else {
+            run.workspace_path.clone()
+        },
+        meta: "VPS".to_string(),
+        running: run.running,
+        waiting: 0,
+        target,
+        project_id: String::new(),
+    }
+}
+
+/// The default expanded shelf: live work only, so it stays a glanceable
+/// answer to "what is happening now".
+fn collect_shelf(s: &ShellState, now_ms: f64) -> Vec<IslandShelfItem> {
+    let mut items = Vec::new();
+    for run in collect_runs(s, now_ms) {
+        push_unique(
+            &mut items,
+            IslandShelfItem {
+                key: run.target.thread_key.clone(),
+                kind: IslandKind::Chat,
+                title: run.target.display().to_string(),
+                subtitle: run.activity.clone(),
+                meta: run.elapsed.clone(),
+                running: true,
+                waiting: 0,
+                target: run.target,
+                project_id: String::new(),
+            },
+        );
+    }
+    for project in &s.canvas.projects.projects {
+        if project.waiting > 0
+            || matches!(
+                project.status.to_ascii_lowercase().as_str(),
+                "running" | "doing" | "active"
+            )
+        {
+            push_unique(&mut items, project_shelf_item(project));
+        }
+    }
+    if let Some(status) = &s.cloud.status {
+        for run in status.runs.iter().filter(|run| run.running) {
+            push_unique(&mut items, cloud_shelf_item(s, run));
+        }
+    }
+    items
+}
+
+/// Everything the radial add menu can attach, active or idle. Open tabs lead,
+/// then recent server chats, then projects and cloud runs.
+fn collect_existing(s: &ShellState) -> Vec<IslandShelfItem> {
+    let mut items = Vec::new();
+    let mut chat_keys = Vec::new();
+    for key in ["main", "personal"] {
+        if !chat_keys.iter().any(|existing| existing == key) {
+            chat_keys.push(key.to_string());
+        }
+    }
+    for key in &s.canvas.sessions.order {
+        if !chat_keys.iter().any(|existing| existing == key) {
+            chat_keys.push(key.clone());
+        }
+    }
+    let mut chat_count = 0;
+    for key in &chat_keys {
+        let running = thread_ref(s, key).is_some_and(|thread| thread.live);
+        let meta = if running {
+            "Running".to_string()
+        } else {
+            "Open".to_string()
+        };
+        if let Some(item) = chat_shelf_item(s, key, running, meta) {
+            push_unique(&mut items, item);
+            chat_count += 1;
+        }
+    }
+    for row in &s.canvas.chat_rows {
+        if chat_count >= 16 {
+            break;
+        }
+        // Canvas threads use the `chat:<workspace>:<chat>` card id as their
+        // key; the server row's bare `workspace:chat` page key would watch a
+        // thread the shell does not have.
+        let thread_key = format!("chat:{}", row.key());
+        let running = thread_ref(s, &thread_key).is_some_and(|thread| thread.live);
+        let item = IslandShelfItem {
+            key: thread_key.clone(),
+            kind: IslandKind::Chat,
+            title: crate::chats::display_title(&row.title),
+            subtitle: if row.workspace_name.trim().is_empty() {
+                workspace_label(s, &row.workspace_id)
+            } else {
+                row.workspace_name.clone()
+            },
+            meta: if running {
+                "Running".to_string()
+            } else {
+                crate::chats::relative_time_short(&row.updated_at)
+            },
+            running,
+            waiting: 0,
+            target: IslandTarget {
+                thread_key: thread_key.clone(),
+                title: crate::chats::display_title(&row.title),
+                card_id: Some(thread_key),
+                workspace_id: row.workspace_id.clone(),
+                chat_id: row.id.clone(),
+            },
+            project_id: String::new(),
+        };
+        let before = items.len();
+        push_unique(&mut items, item);
+        if items.len() > before {
+            chat_count += 1;
+        }
+    }
+    for (project_count, project) in s.canvas.projects.projects.iter().enumerate() {
+        if project_count >= 8 {
+            break;
+        }
+        push_unique(&mut items, project_shelf_item(project));
+    }
+    if let Some(status) = &s.cloud.status {
+        for run in status.runs.iter().take(6) {
+            push_unique(&mut items, cloud_shelf_item(s, run));
+        }
+    }
+    if let Some(active) = s.chats.active_run.as_ref().filter(|run| run.running) {
+        let run = CloudRun {
+            running: true,
+            chat_id: active.chat_id.clone(),
+            workspace_path: active.workspace_path.clone(),
+            started_at: active.started_at.clone(),
+        };
+        push_unique(&mut items, cloud_shelf_item(s, &run));
+    }
+    items
+}
+
+fn compact_body(row: &crate::rune_transcript::RowData) -> String {
+    let mut body = if !row.body.trim().is_empty() {
+        row.body.clone()
+    } else if !row.final_text.trim().is_empty() {
+        row.final_text.clone()
+    } else {
+        row.timeline
+            .iter()
+            .rev()
+            .find_map(|segment| segment.text_of())
+            .unwrap_or("")
+            .to_string()
+    };
+    body = body.trim().to_string();
+    // The overlay is a glance, not the full transcript: keep enough to read
+    // the last answer without cloning an entire code-heavy message.
+    const LIMIT: usize = 1_400;
+    if body.chars().count() > LIMIT {
+        body = body.chars().take(LIMIT).collect::<String>();
+        body.push('…');
+    }
+    body
+}
+
+/// Compact transcript for the overlay's open chat. Reuses the shell thread's
+/// rows; only the tail is cloned, and events become one-line dividers.
+fn chat_snapshot(s: &ShellState, target: &IslandTarget) -> Option<IslandChat> {
+    let thread = thread_ref(s, &target.thread_key)?;
+    let mut rows: Vec<IslandChatRow> = Vec::new();
+    for row in thread.rows.iter().rev() {
+        if rows.len() >= 24 {
+            break;
+        }
+        let (role, body) = match row.role {
+            "user" => ("user", compact_body(row)),
+            "error" => ("error", compact_body(row)),
+            "system" => {
+                if row.event.is_empty() {
+                    continue;
+                }
+                let copy = if row.event == "aborted" {
+                    "Run stopped".to_string()
+                } else {
+                    "Context compacted".to_string()
+                };
+                ("event", copy)
+            }
+            _ => {
+                if row.hide_body && !row.is_streaming {
+                    continue;
+                }
+                ("agent", compact_body(row))
+            }
+        };
+        if body.is_empty() && !row.is_streaming && role != "event" {
+            continue;
+        }
+        rows.push(IslandChatRow {
+            key: row.key.clone(),
+            role: role.to_string(),
+            body,
+            at: row.at.clone(),
+            agent: if row.agent_name.trim().is_empty() {
+                "Stark".to_string()
+            } else {
+                row.agent_name.clone()
+            },
+            streaming: row.is_streaming,
+        });
+    }
+    rows.reverse();
+    Some(IslandChat {
+        target: target_for(s, &target.thread_key).unwrap_or_else(|| target.clone()),
+        rows,
+        live: thread.live,
+        status: if thread.aborting {
+            "Stopping…".to_string()
+        } else if thread.live {
+            activity_of(thread)
+        } else {
+            "Ready".to_string()
+        },
+        draft: thread.edit.text.clone(),
+        draft_rev: thread.voice.final_seq,
+    })
+}
+
+/// A canvas draft chat is rekeyed to its real server id after the first send.
+/// The overlay is watching the old key; carry its target (and the add menu's
+/// focus) across so the compact transcript keeps publishing under the new one.
+pub fn rekey_island_chat(s: &mut ShellState, old_key: &str, workspace: &str, chat: &str) {
+    let new_key = format!("chat:{workspace}:{chat}");
+    let update = |target: &mut IslandTarget| {
+        if target.thread_key == old_key {
+            target.thread_key = new_key.clone();
+            target.workspace_id = workspace.to_string();
+            target.chat_id = chat.to_string();
+            target.card_id = Some(new_key.clone());
+        }
+    };
+    if let Some(target) = s.presence.island_chat.as_mut() {
+        update(target);
+    }
+    if let Some(target) = s.presence.island_focus.as_mut() {
+        update(target);
+    }
+}
+
+fn ensure_island_thread(s: &mut ShellState, target: &IslandTarget) -> bool {
+    if thread_ref(s, &target.thread_key).is_some() {
+        return true;
+    }
+    if !target.workspace_id.is_empty() && !target.chat_id.is_empty() {
+        s.canvas
+            .open_chat_row(&target.workspace_id, &target.chat_id);
+    }
+    thread_ref(s, &target.thread_key).is_some()
+}
+
 fn pending_question(s: &ShellState) -> Option<IslandAttention> {
     for key in thread_keys(s) {
         let Some(thread) = thread_ref(s, &key) else {
@@ -343,6 +726,7 @@ fn is_voice_attention(attention: &IslandAttention) -> bool {
 
 struct VoiceView {
     target: IslandTarget,
+    key: String,
     live: bool,
     level: f32,
     text: String,
@@ -356,6 +740,7 @@ fn voice_view(s: &ShellState) -> VoiceView {
         if thread.voice.live {
             return VoiceView {
                 target: target_for(s, &active).unwrap_or_default(),
+                key: active,
                 live: true,
                 level: thread.voice.level,
                 text: thread.voice.live_text.clone(),
@@ -369,6 +754,7 @@ fn voice_view(s: &ShellState) -> VoiceView {
         if thread.voice.live {
             return VoiceView {
                 target: target_for(s, &key).unwrap_or_default(),
+                key,
                 live: true,
                 level: thread.voice.level,
                 text: thread.voice.live_text.clone(),
@@ -378,6 +764,7 @@ fn voice_view(s: &ShellState) -> VoiceView {
     let thread = thread_ref(s, &active);
     VoiceView {
         target: target_for(s, &active).unwrap_or_default(),
+        key: active,
         live: false,
         level: thread.map(|t| t.voice.level).unwrap_or(0.0),
         text: thread
@@ -388,6 +775,13 @@ fn voice_view(s: &ShellState) -> VoiceView {
 
 fn snapshot(s: &ShellState, now_ms: u64) -> IslandModel {
     let runs = collect_runs(s, crate::clock::monotonic_millis());
+    let shelf = collect_shelf(s, crate::clock::monotonic_millis());
+    let existing = collect_existing(s);
+    let chat = s
+        .presence
+        .island_chat
+        .as_ref()
+        .and_then(|target| chat_snapshot(s, target));
     let voice = voice_view(s);
     let toast = s
         .presence
@@ -398,7 +792,7 @@ fn snapshot(s: &ShellState, now_ms: u64) -> IslandModel {
     let target = if voice.target.thread_key.is_empty() {
         active_target(s)
     } else {
-        voice.target
+        voice.target.clone()
     };
     // Live mode is the island's only trigger, and arming alone raises it:
     // the dock arms (warms models, shows the island idle) while only the
@@ -410,6 +804,12 @@ fn snapshot(s: &ShellState, now_ms: u64) -> IslandModel {
     let tick_step = if voice.live { 80 } else { 1000 };
     IslandModel {
         runs,
+        shelf,
+        existing,
+        chat,
+        focus_seq: s.presence.island_focus_seq,
+        focus: s.presence.island_focus.clone(),
+        voice_thread: if voice.live { voice.key } else { String::new() },
         listening: voice.live,
         armed,
         level: voice.level,
@@ -493,6 +893,20 @@ fn arm_active(s: &mut ShellState) {
     if let Some(thread) = thread_mut(s, &key) {
         thread.voice.note = None;
         thread.voice.set_armed(true);
+    }
+}
+
+/// The overlay's own mic button targets the chat it is showing, which is not
+/// always the shell's active tab. If any bus is live, one press stops it.
+fn toggle_capture_on(s: &mut ShellState, key: &str) {
+    if any_live_voice(s) {
+        stop_all_voice(s);
+        return;
+    }
+    if let Some(thread) = thread_mut(s, key) {
+        thread.voice.note = None;
+        thread.voice.set_armed(true);
+        thread.voice.start_capture();
     }
 }
 
@@ -592,9 +1006,7 @@ fn handle_commands(s: &mut ShellState) -> bool {
     }
     for command in commands {
         match command {
-            IslandCommand::ToggleListen => toggle_capture(s),
             IslandCommand::StopListen => stop_all_voice(s),
-            IslandCommand::OpenMain => open_main(s),
             IslandCommand::OpenChat(target) => open_target(s, &target),
             IslandCommand::StopRun(key) => {
                 if let Some(thread) = thread_mut(s, &key) {
@@ -621,6 +1033,72 @@ fn handle_commands(s: &mut ShellState) -> bool {
                 if let Some(thread) = thread_mut(s, &key) {
                     thread.voice.note = None;
                 }
+            }
+            IslandCommand::WatchChat(target) => {
+                if ensure_island_thread(s, &target) {
+                    s.presence.island_chat = Some(target);
+                }
+            }
+            IslandCommand::UnwatchChat => s.presence.island_chat = None,
+            IslandCommand::SendPrompt { target, text } => {
+                if ensure_island_thread(s, &target) {
+                    s.presence.island_chat = Some(target.clone());
+                    let key = target.thread_key.clone();
+                    if let Some(thread) = thread_mut(s, &key) {
+                        if stage_send_prompt_with_attachments(thread, text, Vec::new()) {
+                            // The island owns the prompt lifecycle; leave no
+                            // shell draft for the next publish to seed back
+                            // into the overlay composer.
+                            thread.edit.text.clear();
+                            thread.edit.anchor = 0;
+                            thread.edit.focus = 0;
+                        } else {
+                            s.presence.toast = Some(IslandAttention {
+                                kind: IslandAttentionKind::Error,
+                                title: "Not sent".to_string(),
+                                body: format!("{} is busy", target.display()),
+                                target,
+                                expires_ms: crate::clock::now_millis() + 3_500,
+                            });
+                        }
+                    }
+                }
+            }
+            IslandCommand::NewChat => {
+                let id = s.canvas.new_session();
+                if let Some(target) = target_for(s, &id) {
+                    s.presence.island_chat = Some(target.clone());
+                    s.presence.island_focus = Some(target);
+                    s.presence.island_focus_seq = s.presence.island_focus_seq.wrapping_add(1);
+                }
+            }
+            IslandCommand::NewProject => {
+                s.panel_open = true;
+                s.canvas.rail = crate::rune_canvas::RailTab::Group;
+                crate::projects::open_new_project(&mut s.canvas.projects);
+                open_main(s);
+            }
+            IslandCommand::NewCloudTask | IslandCommand::OpenCloud => {
+                s.panel_open = true;
+                s.canvas.rail = crate::rune_canvas::RailTab::Cloud;
+                crate::cloud::refresh_cloud(&mut s.cloud);
+                crate::cloud::refresh_board(&mut s.cloud);
+                open_main(s);
+            }
+            IslandCommand::OpenProject(id) => {
+                let (host, port) = (s.canvas.projects.host.clone(), s.canvas.projects.port);
+                s.canvas.projects.group.open(host, port, id);
+                open_main(s);
+            }
+            IslandCommand::ToggleVoice(key) => toggle_capture_on(s, &key),
+            IslandCommand::FocusKeys => link.request_keys(),
+            IslandCommand::SetActivatable(active) => link.set_activatable(active),
+            IslandCommand::SetFullInput(all) => {
+                link.set_input(if all {
+                    rune::OverlayInput::All
+                } else {
+                    rune::OverlayInput::Regions
+                });
             }
         }
     }
@@ -1076,6 +1554,81 @@ mod tests {
             island_desired(true, &model),
             "dropping to idle keeps the island, not hides it"
         );
+    }
+
+    #[test]
+    fn snapshot_carries_the_watched_chats_compact_transcript() {
+        use crate::rune_transcript::RowData;
+
+        let mut s = shell();
+        s.transcript.title = "Writer".to_string();
+        s.transcript.rows = vec![
+            RowData {
+                key: "u0".to_string(),
+                role: "user",
+                body: "ship the island".to_string(),
+                ..RowData::default()
+            },
+            RowData {
+                key: "a1".to_string(),
+                role: "agent",
+                body: "On it.".to_string(),
+                agent_name: "Stark".to_string(),
+                ..RowData::default()
+            },
+        ];
+        s.presence.island_chat = target_for(&s, "main");
+        let model = snapshot(&s, crate::clock::now_millis());
+        let chat = model.chat.expect("watched chat publishes");
+        assert_eq!(chat.target.thread_key, "main");
+        assert_eq!(chat.target.title, "Writer");
+        assert_eq!(chat.rows.len(), 2);
+        assert_eq!(chat.rows[0].role, "user");
+        assert_eq!(chat.rows[1].agent, "Stark");
+        assert_eq!(chat.rows[1].body, "On it.");
+        assert!(!chat.live);
+    }
+
+    #[test]
+    fn existing_chats_include_server_rows_before_they_are_opened() {
+        use crate::chats::ChatSummary;
+
+        let mut s = shell();
+        s.canvas.chat_rows.push(ChatSummary {
+            id: "c9".to_string(),
+            workspace_id: "ws".to_string(),
+            workspace_name: "General".to_string(),
+            title: "Offline chat".to_string(),
+            updated_at: String::new(),
+            ..ChatSummary::default()
+        });
+        let items = collect_existing(&s);
+        let row = items
+            .iter()
+            .find(|item| item.target.chat_id == "c9")
+            .expect("server chat is attachable");
+        assert_eq!(row.kind, IslandKind::Chat);
+        assert_eq!(row.key, "chat:ws:c9");
+        assert_eq!(row.target.thread_key, "chat:ws:c9");
+        assert_eq!(row.target.workspace_id, "ws");
+        assert_eq!(row.subtitle, "General");
+    }
+
+    #[test]
+    fn a_rekeyed_draft_carries_the_island_target_to_the_real_key() {
+        use crate::island::IslandTarget;
+
+        let mut s = shell();
+        s.presence.island_chat = Some(IslandTarget {
+            thread_key: "chat:local:s1".to_string(),
+            ..IslandTarget::default()
+        });
+        rekey_island_chat(&mut s, "chat:local:s1", "ws", "c1");
+        let target = s.presence.island_chat.as_ref().expect("watched");
+        assert_eq!(target.thread_key, "chat:ws:c1");
+        assert_eq!(target.workspace_id, "ws");
+        assert_eq!(target.chat_id, "c1");
+        assert_eq!(target.card_id.as_deref(), Some("chat:ws:c1"));
     }
 
     #[test]

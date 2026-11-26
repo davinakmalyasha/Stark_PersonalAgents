@@ -423,20 +423,41 @@ impl SttEngine {
     }
 }
 
-static ENGINE: std::sync::OnceLock<std::sync::Arc<SttEngine>> = std::sync::OnceLock::new();
+static ENGINE: std::sync::Mutex<Option<std::sync::Arc<SttEngine>>> = std::sync::Mutex::new(None);
 
-/// Load once per process (the medium model is ~190 MB); fast validation runs
-/// on every call so a missing dir fails without the slow load.
+/// Load on first live-mode use (the medium model is ~190 MB); live-mode off
+/// drops it again via [`release_engine`] so an idle app holds no STT memory.
+/// Fast validation runs on every call so a missing dir fails without the slow
+/// load.
 #[cfg(all(target_env = "msvc", feature = "voice-stt"))]
 pub fn ensure_engine() -> Result<std::sync::Arc<SttEngine>, String> {
-    if let Some(engine) = ENGINE.get() {
-        return Ok(engine.clone());
+    if let Some(engine) = ENGINE.lock().map(|g| g.clone()).unwrap_or(None) {
+        return Ok(engine);
     }
     let models_dir =
         resolve_models_dir().ok_or_else(|| "voice models dir not found".to_string())?;
     let engine = std::sync::Arc::new(SttEngine::load(&models_dir)?);
-    let _ = ENGINE.set(engine.clone());
+    *ENGINE.lock().unwrap() = Some(engine.clone());
     Ok(engine)
+}
+
+/// Drop the on-device transcriber. Returns true when something was actually
+/// released so live-mode off stays idempotent. The `Arc` is taken under the
+/// lock and dropped on a worker so ONNX teardown never stalls the UI thread.
+#[cfg(all(target_env = "msvc", feature = "voice-stt"))]
+pub fn release_engine() -> bool {
+    let taken = ENGINE.lock().map(|mut g| g.take()).unwrap_or(None);
+    if let Some(engine) = taken {
+        std::thread::spawn(move || drop(engine));
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(not(all(target_env = "msvc", feature = "voice-stt")))]
+pub fn release_engine() -> bool {
+    false
 }
 
 #[cfg(not(all(target_env = "msvc", feature = "voice-stt")))]
@@ -766,5 +787,12 @@ mod tests {
             Ok(_) => panic!("stub must not spawn"),
         };
         assert!(err.contains("MSVC"), "honest message, got: {err}");
+    }
+
+    #[test]
+    fn engine_release_is_idempotent_without_a_loaded_model() {
+        // Live-mode off must never fail when nothing was ever loaded.
+        assert!(!release_engine());
+        assert!(!release_engine());
     }
 }

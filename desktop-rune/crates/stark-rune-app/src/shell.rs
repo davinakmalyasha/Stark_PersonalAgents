@@ -2931,14 +2931,13 @@ pub fn run_shell_headless(extra_args: Vec<String>) {
             let app_handle = app.handle();
             let shared =
                 std::sync::Arc::new(crate::island::IslandShared::new(Some(app_handle.clone())));
-            let overlay = app.overlay(
+            // No live mode, no island: the overlay starts hidden and only
+            // appears while voice is live or a voice card is up.
+            let handle = app.overlay(
                 crate::island::island_spec(),
                 crate::island::IslandState::new(shared.clone()),
             );
-            if prefs.island {
-                overlay.show();
-            }
-            let link = crate::island::IslandLink::new(shared, overlay.clone());
+            let link = crate::island::IslandLink::new(shared, handle);
             let link_for_init = link.clone();
             let handle_for_init = app_handle.clone();
             let prefs_for_init = prefs.clone();

@@ -120,8 +120,14 @@ impl VoiceBus {
     /// Toggle capture. Returns true when a capture attempt started.
     /// Stopping always succeeds. Hardware failures (no device, OS error)
     /// arrive asynchronously as [`VoiceMsg::Error`] notes via [`VoiceBus::drain`].
+    ///
+    /// Live mode owns the speech models: turning it on warms the backend TTS
+    /// (and loads Moonshine on first `session.start`, locally on first
+    /// producer spawn); turning it off releases the on-device engine and
+    /// asks the backend to drop TTS/ASR again.
     pub fn set_live(&mut self, on: bool) -> bool {
         if !on {
+            let was_live = self.live || self.stop.is_some() || self.rx.is_some();
             if let Some(stop) = self.stop.take() {
                 stop.store(true, Ordering::Relaxed);
             }
@@ -131,6 +137,9 @@ impl VoiceBus {
             self.breathe_scale.set(1.0);
             self.breathe_opacity.set(1.0);
             self.live_text.clear();
+            if was_live {
+                Self::on_live_stopped();
+            }
             return false;
         }
         self.note = None;
@@ -183,6 +192,7 @@ impl VoiceBus {
             match started {
                 Ok(()) => {
                     self.note = None;
+                    Self::on_live_started();
                     std::thread::spawn(move || {
                         capture_loop(flag, tx, Some(pcm_tx));
                     });
@@ -210,6 +220,7 @@ impl VoiceBus {
                         // poll hook for draft staging.
                         self.pending_final = Some(text);
                         self.live_text.clear();
+                        let was_live = self.live;
                         self.live = false;
                         self.level = 0.0;
                         self.breathe_scale.set(1.0);
@@ -218,6 +229,9 @@ impl VoiceBus {
                             stop.store(true, Ordering::Relaxed);
                         }
                         self.rx = None;
+                        if was_live {
+                            Self::on_live_stopped();
+                        }
                     } else {
                         self.live_text = text;
                     }
@@ -229,11 +243,15 @@ impl VoiceBus {
                     changed = true;
                 }
                 VoiceMsg::Error(note) => {
+                    let was_live = self.live;
                     self.note = Some(note);
                     self.live = false;
                     self.level = 0.0;
                     self.breathe_scale.set(1.0);
                     self.breathe_opacity.set(1.0);
+                    if was_live {
+                        Self::on_live_stopped();
+                    }
                     changed = true;
                 }
             }
@@ -257,6 +275,52 @@ impl VoiceBus {
             self.final_seq = self.final_seq.wrapping_add(1);
         }
         final_text
+    }
+
+    /// Live-mode on: the backend TTS warms in the background while the first
+    /// utterance streams, so the first spoken reply does not pay model load.
+    /// Best effort: a missing bundle or unreachable server only surfaces when
+    /// TTS is actually used.
+    fn on_live_started() {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let host = crate::rune_transcript::DEFAULT_API_HOST.to_string();
+            let port = crate::rune_transcript::api_port();
+            std::thread::spawn(move || {
+                let _ = crate::transport::post_json_status(
+                    &host,
+                    port,
+                    "/api/voice/warm_tts",
+                    &serde_json::json!({}),
+                );
+            });
+        }
+    }
+
+    /// Live-mode off: drop the on-device engine and ask the backend to release
+    /// TTS/ASR, so an idle app holds no speech memory. Every call is
+    /// idempotent and best effort; release endpoints never fail a toggle.
+    fn on_live_stopped() {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            crate::stt::release_engine();
+            let host = crate::rune_transcript::DEFAULT_API_HOST.to_string();
+            let port = crate::rune_transcript::api_port();
+            std::thread::spawn(move || {
+                let _ = crate::transport::post_json_status(
+                    &host,
+                    port,
+                    "/api/voice/release_tts",
+                    &serde_json::json!({}),
+                );
+                let _ = crate::transport::post_json_status(
+                    &host,
+                    port,
+                    "/api/voice/release_asr",
+                    &serde_json::json!({}),
+                );
+            });
+        }
     }
 
     /// Meter plus the live breathing tracks, for the composer's voice dot.

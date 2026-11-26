@@ -1117,12 +1117,12 @@ pub fn settings_sheet<S: SettingsHost + 'static>(s: &SettingsState, width: f32, 
             crate::shell::icon_group(13.0, ink("#71717a")),
         ))
         .child(paragraph(
-            "A native notch at the top of the screen. It stays visible over every app, shrinks to a mark when idle, and opens into the agent cockpit on hover.",
+            "Live mode owns the speech models and the island. Press the mic (or Ctrl+Space) to load STT/TTS and show the island; toggle off to unload them and hide it.",
         ))
         .child(toggle_row::<S>(
             "settings-island-toggle",
-            "Show Stark Island",
-            "Always available, including while the main window is hidden.",
+            "Show Stark Island in live mode",
+            "Off keeps the island hidden even while listening.",
             s.live.island,
             |s: &mut S, _tx: &mut rune::Tx| {
                 let next = !s.settings().live.island;

@@ -42,14 +42,23 @@ The native app is also a background desktop surface:
 - **Stark Island** (`island.rs`) is a Rune overlay at the top-center of the
   primary display. It is transparent, topmost, non-activating and skipped from
   the taskbar; only the notch itself is an input region, so the rest of its
-  520×420 window is click-through. Idle it is a 104×24 mark + status dot; on
-  hover it expands into the agent cockpit with running rows, stop/open actions,
-  needs-you cards and a mic button. Listening replaces the cockpit with a live
-  waveform and interim transcript.
+  520×420 window is click-through. The island exists only in live mode: the
+  prompt-dock mic (or `Ctrl+Space`) loads STT/TTS and shows it, toggling off
+  unloads them and hides it. While live, idle it is a 104×24 mark + status
+  dot; hover expands the cockpit, and listening shows the live waveform and
+  interim transcript. A hidden island releases its GPU surface after 20s.
 - **Background lifetime** (`presence.rs`, `shell.rs`) uses `keep_running`:
-  closing the main window hides it, stops capture and leaves agents, the island
-  and the tray alive. `--background` starts windowless (tray + island only) and
+  closing the main window hides it, stops capture and leaves agents and the
+  tray alive. `--background` starts windowless (tray only) and
   the launcher forwards `STARK_BACKGROUND` across update restarts.
+- **Speech models are live-mode owned.** The backend loads Moonshine STT
+  lazily on first live use (`session.start`, file transcription, backend
+  capture) and `POST /api/voice/release_asr` drops it; TTS warms on live-mode
+  on (`POST /api/voice/warm_tts`) and releases on live-mode off
+  (`POST /api/voice/release_tts`). The UI's on-device engine loads on first
+  local dictation and releases when capture stops. An idle app holds no STT
+  memory in either process; the ~500 MB UI baseline is the Rune/GPU/fonts
+  working set, not speech.
 - **Tray** (`tray.rs`) owns a native status icon and menu: Open Stark, Listen,
   Show/Hide island, Auto-send voice, Start with Windows and Quit. A second
   launch signals the running UI through `Local\StarkRuneOpen` instead of

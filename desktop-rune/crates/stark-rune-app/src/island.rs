@@ -284,6 +284,9 @@ pub fn island_spec() -> impl Into<rune::ConfiguredOverlay<IslandState>> {
     })
     .poll(island_poll)
     .animate_reveal()
+    // Live mode is bursty: once the island hides after a draft/utterance,
+    // give the GPU surface back so an idle app holds no second surface.
+    .release_gpu_after(std::time::Duration::from_secs(20))
 }
 
 fn hover_handler(s: &mut IslandState, inside: bool, tx: &mut Tx) {
@@ -1163,5 +1166,37 @@ mod tests {
         assert!(rt.find("island-attention-title").is_some());
         assert!(rt.find("island-attention-action").is_some());
         assert!(rt.find("island-attention-body").is_some());
+    }
+
+    #[test]
+    fn dismissing_a_mic_error_queues_the_dismiss_command() {
+        let mut m = model(false, 0);
+        m.attention = Some(IslandAttention {
+            kind: IslandAttentionKind::Error,
+            title: "Microphone".to_string(),
+            body: "Microphone interrupted".to_string(),
+            target: m.target.clone(),
+            expires_ms: 0,
+        });
+        let shared = Arc::new(IslandShared::new(None));
+        *shared.model.lock().unwrap() = m;
+        let mut rt = Runtime::new(
+            IslandState::new(shared.clone()),
+            island_view,
+            (520.0, 420.0),
+            Env::new(true, 1.0),
+        );
+        rt.frame(0.0);
+        let (x, y) = rt.find("island-attention-action").expect("dismiss placed");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        let commands = shared.take_commands();
+        assert!(
+            commands
+                .iter()
+                .any(|cmd| *cmd == IslandCommand::DismissVoiceNote("chat:ws:c1".to_string())),
+            "dismiss press reaches the shell: {commands:?}"
+        );
     }
 }

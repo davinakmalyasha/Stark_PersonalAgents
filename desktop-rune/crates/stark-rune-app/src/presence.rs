@@ -311,6 +311,18 @@ fn voice_note(s: &ShellState) -> Option<IslandAttention> {
     None
 }
 
+/// Voice-owned attention: interim errors, drafts and voice-sent finals. Run
+/// completions, failures, questions and the close hint belong to the tray,
+/// never the island — live mode is the island's only trigger.
+fn is_voice_attention(attention: &IslandAttention) -> bool {
+    match attention.kind {
+        IslandAttentionKind::Draft => true,
+        IslandAttentionKind::Done => attention.title == "Voice sent",
+        IslandAttentionKind::Error => attention.title == "Microphone",
+        IslandAttentionKind::Question => false,
+    }
+}
+
 struct VoiceView {
     target: IslandTarget,
     live: bool,
@@ -370,7 +382,11 @@ fn snapshot(s: &ShellState, now_ms: u64) -> IslandModel {
     } else {
         voice.target
     };
-    let active = voice.live || !runs.is_empty();
+    // Live mode is the island's only trigger: the mic toggle loads STT/TTS
+    // and shows the island; toggling off unloads them and the island goes
+    // away. Agent runs and questions stay on the tray, never the island.
+    let voice_card = attention.as_ref().is_some_and(is_voice_attention);
+    let live_now = voice.live || voice_card;
     let tick_step = if voice.live { 80 } else { 1000 };
     IslandModel {
         runs,
@@ -381,9 +397,9 @@ fn snapshot(s: &ShellState, now_ms: u64) -> IslandModel {
         attention,
         auto_send_voice: s.settings.live.auto_send_voice,
         island_enabled: s.settings.live.island,
-        // Keep the waveform breathing while live and elapsed labels ticking
-        // while agents run, without a second timer in the overlay.
-        tick_ms: if active {
+        // Keep the waveform breathing while live and the draft card ticking
+        // while it is up, without a second timer in the overlay.
+        tick_ms: if live_now {
             now_ms / tick_step * tick_step
         } else {
             0
@@ -640,8 +656,16 @@ fn apply_requests(s: &mut ShellState) -> bool {
     changed
 }
 
+/// No live mode, no island: the overlay only exists while voice is live or
+/// a voice card (draft/error) is up. Agent runs and questions stay on the
+/// tray, never the island.
+fn island_desired(prefs_island: bool, model: &IslandModel) -> bool {
+    let live_now = model.listening || model.attention.as_ref().is_some_and(is_voice_attention);
+    prefs_island && live_now
+}
+
 fn publish(s: &mut ShellState, model: &IslandModel) {
-    let desired = s.settings.live.island;
+    let desired = island_desired(s.settings.live.island, model);
     if let Some(link) = s.presence.link.clone() {
         if s.presence.island_visible != Some(desired) {
             if desired {
@@ -682,15 +706,13 @@ pub fn tick(s: &mut ShellState, _clock: f64, tx: &mut Tx) -> bool {
 
     let model = snapshot(s, now_ms);
     publish(s, &model);
+    let island_up = model.listening || model.attention.as_ref().is_some_and(is_voice_attention);
     if model.listening {
         // Keep the mic bars alive even between level packets.
         tx.wake_after(Duration::from_millis(80));
     }
-    if !model.runs.is_empty() {
-        // Elapsed labels tick once a second while agents work.
-        tx.wake_after(Duration::from_secs(1));
-    }
-    if model.attention.is_some() {
+    if island_up && (!model.runs.is_empty() || model.attention.is_some()) {
+        // Elapsed labels and expiring voice cards tick while the island is up.
         tx.wake_after(Duration::from_secs(1));
     }
     changed
@@ -866,5 +888,85 @@ mod tests {
         assert!(model.runs[0].elapsed.starts_with("0:4"));
         assert!(model.auto_send_voice);
         assert_eq!(model.target.thread_key, "main");
+    }
+
+    #[test]
+    fn island_stays_hidden_for_agent_runs_and_shows_for_live_voice() {
+        use crate::island::{IslandAttention, IslandAttentionKind, IslandModel, IslandTarget};
+
+        let target = IslandTarget::default();
+        // Agent running, mic off: tray material only, island stays down.
+        let mut running = IslandModel::default();
+        running.runs.push(crate::island::IslandRun {
+            target: target.clone(),
+            activity: "Working".to_string(),
+            elapsed: "0:01".to_string(),
+            stoppable: true,
+        });
+        assert!(
+            !island_desired(true, &running),
+            "agent runs never raise the island"
+        );
+
+        // Mic live: island up even with no runs.
+        let listening = IslandModel {
+            listening: true,
+            level: 0.5,
+            ..IslandModel::default()
+        };
+        assert!(island_desired(true, &listening));
+
+        // Voice draft outlives capture: the card keeps the island up.
+        let draft = IslandModel {
+            attention: Some(IslandAttention {
+                kind: IslandAttentionKind::Draft,
+                title: "Voice draft ready".to_string(),
+                body: "Open main to review".to_string(),
+                target: target.clone(),
+                expires_ms: crate::clock::now_millis() + 4_000,
+            }),
+            ..IslandModel::default()
+        };
+        assert!(island_desired(true, &draft));
+
+        // Run completions and questions stay on the tray.
+        for (kind, title) in [
+            (IslandAttentionKind::Done, "Done"),
+            (IslandAttentionKind::Error, "Run failed"),
+            (IslandAttentionKind::Question, "Needs you"),
+        ] {
+            let other = IslandModel {
+                attention: Some(IslandAttention {
+                    kind,
+                    title: title.to_string(),
+                    body: "open to review".to_string(),
+                    target: target.clone(),
+                    expires_ms: 0,
+                }),
+                ..IslandModel::default()
+            };
+            assert!(
+                !island_desired(true, &other),
+                "only voice cards raise the island"
+            );
+        }
+
+        // Master switch still gates everything.
+        assert!(!island_desired(false, &listening));
+    }
+
+    #[test]
+    fn snapshot_ticks_only_while_live_voice_or_voice_cards() {
+        let mut s = shell();
+        // Agent run alone: collected for the tray, but no island tick.
+        s.transcript.live = true;
+        let idle_tick = snapshot(&s, 10_000).tick_ms;
+        assert_eq!(idle_tick, 0, "runs alone must not animate the island");
+
+        // Mic live: the waveform clock runs.
+        s.transcript.live = false;
+        s.transcript.voice.live = true;
+        let live_tick = snapshot(&s, 10_000).tick_ms;
+        assert_eq!(live_tick, 10_000);
     }
 }

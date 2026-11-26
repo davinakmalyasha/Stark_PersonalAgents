@@ -59,6 +59,9 @@ pub struct VoiceBus {
     /// A finished utterance waiting for the poll hook to stage it into the
     /// composer draft (`take_final` consumes it once).
     pending_final: Option<String>,
+    /// Monotonic count of finished utterances consumed by the transcript
+    /// poll. The shell watches it to optionally auto-send the staged draft.
+    pub final_seq: u64,
     pub stop: Option<Arc<AtomicBool>>,
     pub rx: Option<std::sync::mpsc::Receiver<VoiceMsg>>,
 }
@@ -71,6 +74,7 @@ impl std::fmt::Debug for VoiceBus {
             .field("note", &self.note)
             .field("live_text", &self.live_text)
             .field("pending_final", &self.pending_final.is_some())
+            .field("final_seq", &self.final_seq)
             .field("capturing", &self.stop.is_some())
             .finish()
     }
@@ -87,6 +91,7 @@ impl Clone for VoiceBus {
             note: self.note.clone(),
             live_text: self.live_text.clone(),
             pending_final: self.pending_final.clone(),
+            final_seq: self.final_seq,
             stop: None,
             rx: None,
         }
@@ -104,6 +109,7 @@ impl Default for VoiceBus {
             note: None,
             live_text: String::new(),
             pending_final: None,
+            final_seq: 0,
             stop: None,
             rx: None,
         }
@@ -246,7 +252,11 @@ impl VoiceBus {
     /// Consume a finished utterance once (the poll hook stages it into the
     /// composer draft, like the reference UI's `voiceInputText` dock effect).
     pub fn take_final(&mut self) -> Option<String> {
-        self.pending_final.take()
+        let final_text = self.pending_final.take();
+        if final_text.is_some() {
+            self.final_seq = self.final_seq.wrapping_add(1);
+        }
+        final_text
     }
 
     /// Meter plus the live breathing tracks, for the composer's voice dot.
@@ -310,6 +320,7 @@ pub fn decay_level(current: f32, peak: f32, dt: f32) -> f32 {
 }
 
 /// How many of the 5 meter bars a level lights.
+#[cfg(any(target_arch = "wasm32", test))]
 pub fn lit_bars(level: f32) -> usize {
     if level <= 0.0 {
         return 0;

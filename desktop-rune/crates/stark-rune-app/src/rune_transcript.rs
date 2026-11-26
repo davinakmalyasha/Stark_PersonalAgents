@@ -1352,10 +1352,10 @@ pub const MAX_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
 /// Attachments count as content, so an attachment-only send is allowed; the
 /// text is only cleared once staging succeeded (the reference UI's guard keeps a live
 /// run's draft in place).
-pub fn stage_send(s: &mut RuneTranscriptState) {
+pub fn stage_send(s: &mut RuneTranscriptState) -> bool {
     let prompt = s.edit.text.trim().to_string();
     if (prompt.is_empty() && s.draft_attachments.is_empty()) || s.live || s.aborting {
-        return;
+        return false;
     }
     let attachments = s.draft_attachments.clone();
     if stage_send_prompt_with_attachments(s, prompt, attachments) {
@@ -1365,6 +1365,9 @@ pub fn stage_send(s: &mut RuneTranscriptState) {
         // The reference UI's PromptDock clears both dock lists after `handleSend`.
         s.draft_attachments.clear();
         s.attachments_error = None;
+        true
+    } else {
+        false
     }
 }
 
@@ -5763,7 +5766,9 @@ fn thread_composer<S: TranscriptHost + crate::settings::SettingsHost + 'static>(
                 let open = s.thread_mut(which).usage_open;
                 s.thread_mut(which).usage_open = !open;
             }),
-            send: std::rc::Rc::new(move |s: &mut S| stage_send(s.thread_mut(which))),
+            send: std::rc::Rc::new(move |s: &mut S| {
+                stage_send(s.thread_mut(which));
+            }),
             model_menu: std::rc::Rc::new(move |s: &mut S| {
                 let open = s.thread_mut(which).model_open;
                 s.thread_mut(which).model_open = !open;
@@ -6296,8 +6301,9 @@ fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'sta
             ));
         }
     }
-    // Voice overlay floats above every sheet (own `dialog`-style layer):
-    // live meter while capturing, or the mic note when capture failed.
+    // Native live voice lives in the Stark Island overlay. The browser has
+    // no native surface, so it keeps the in-page dialog.
+    #[cfg(target_arch = "wasm32")]
     if s.voice.live || s.voice.note.is_some() {
         root = root.child(voice_overlay::<S>(s, which));
     }
@@ -6363,6 +6369,7 @@ fn voice_live_bubble<S: TranscriptHost + 'static>(
 /// centered panel, backdrop/Esc dismiss via `modal`, no height animation.
 /// The card carries the live meter (5 bars from `lit_bars`), the interim
 /// words or the note, and Stop/Close.
+#[cfg(any(target_arch = "wasm32", test))]
 pub fn voice_overlay<S: TranscriptHost + 'static>(s: &RuneTranscriptState, which: Thread) -> El {
     let ink = |hex: &'static str| rune::color::hex(hex).unwrap_or(rune::Color::BLACK);
     let live = s.voice.live;
@@ -8043,13 +8050,35 @@ mod tests {
         );
     }
 
+    fn overlay_view(s: &RuneTranscriptState, _cx: &mut rune::Cx<RuneTranscriptState>) -> El {
+        if s.voice.live || s.voice.note.is_some() {
+            voice_overlay::<RuneTranscriptState>(s, Thread::Main)
+        } else {
+            rune::el().key("voice-overlay-gone")
+        }
+    }
+
     #[test]
-    fn voice_overlay_stops_capture() {
+    fn native_voice_has_no_in_app_modal() {
         let mut s = RuneTranscriptState::screenshot();
         s.voice.live = true;
         s.voice.level = 0.6;
         let env = Env::new(true, 2.0);
         let mut rt = Runtime::new(s, transcript_view, (468.0, 720.0), env);
+        rt.frame(0.0);
+        assert!(
+            rt.find("voice-overlay").is_none(),
+            "native live voice belongs to the Stark Island"
+        );
+    }
+
+    #[test]
+    fn browser_voice_overlay_stops_capture() {
+        let mut s = RuneTranscriptState::screenshot();
+        s.voice.live = true;
+        s.voice.level = 0.6;
+        let env = Env::new(true, 2.0);
+        let mut rt = Runtime::new(s, overlay_view, (468.0, 720.0), env);
         rt.frame(0.0);
         assert!(rt.find("voice-overlay").is_some(), "overlay mounted");
         assert!(rt.find("voice-bars").is_some(), "meter renders");
@@ -8057,24 +8086,28 @@ mod tests {
         let (x, y) = rt.find("voice-stop").expect("stop placed");
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
-        rt.frame(1.0 / 60.0);
+        for _ in 0..30 {
+            rt.frame(1.0 / 60.0);
+        }
         assert!(!rt.state.voice.live, "stop ends capture");
         assert!(rt.find("voice-overlay").is_none(), "overlay leaves");
     }
 
     #[test]
-    fn voice_note_overlay_closes_and_clears() {
+    fn browser_voice_note_overlay_closes_and_clears() {
         let mut s = RuneTranscriptState::screenshot();
         s.voice.note = Some("no microphone found".to_string());
         let env = Env::new(true, 2.0);
-        let mut rt = Runtime::new(s, transcript_view, (468.0, 720.0), env);
+        let mut rt = Runtime::new(s, overlay_view, (468.0, 720.0), env);
         rt.frame(0.0);
         assert!(rt.find("voice-overlay").is_some(), "note surfaces");
         assert!(rt.find("voice-text").is_some(), "note copy placed");
         let (x, y) = rt.find("voice-stop").expect("close placed");
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
-        rt.frame(1.0 / 60.0);
+        for _ in 0..30 {
+            rt.frame(1.0 / 60.0);
+        }
         assert!(rt.state.voice.note.is_none(), "close clears note");
         assert!(rt.find("voice-overlay").is_none(), "overlay leaves");
     }
@@ -8128,6 +8161,11 @@ mod tests {
             "settings-backdrop",
             "settings-title",
             "settings-close",
+            "settings-section-live",
+            "settings-island-toggle",
+            "settings-auto-send",
+            "settings-capture-exclusion",
+            "settings-start-with-windows",
             "settings-section-updates",
             "settings-section-backup",
             "settings-section-migration",

@@ -35,6 +35,34 @@ keeps the symbols readable on the dark fill. Canvas cards are small chat
 surfaces with their own drafts and sends. Overlays mount at the shell or modal
 root so they escape clipping.
 
+### Desktop presence
+
+The native app is also a background desktop surface:
+
+- **Stark Island** (`island.rs`) is a Rune overlay at the top-center of the
+  primary display. It is transparent, topmost, non-activating and skipped from
+  the taskbar; only the notch itself is an input region, so the rest of its
+  520×420 window is click-through. Idle it is a 104×24 mark + status dot; on
+  hover it expands into the agent cockpit with running rows, stop/open actions,
+  needs-you cards and a mic button. Listening replaces the cockpit with a live
+  waveform and interim transcript.
+- **Background lifetime** (`presence.rs`, `shell.rs`) uses `keep_running`:
+  closing the main window hides it, stops capture and leaves agents, the island
+  and the tray alive. `--background` starts windowless (tray + island only) and
+  the launcher forwards `STARK_BACKGROUND` across update restarts.
+- **Tray** (`tray.rs`) owns a native status icon and menu: Open Stark, Listen,
+  Show/Hide island, Auto-send voice, Start with Windows and Quit. A second
+  launch signals the running UI through `Local\StarkRuneOpen` instead of
+  showing an "already running" dialog.
+- **Shortcuts** are OS-global: `Ctrl+Space` toggles listening and `Ctrl+Alt+S`
+  opens Stark. Voice finals either stage a reviewable composer draft or send
+  immediately, depending on the local **Auto-send voice** preference.
+- **Preferences** (`prefs.rs`) live in `.deep_agents/desktop.json`: island
+  visibility, auto-send, capture exclusion and Start with Windows. The file is
+  local and is not part of chat exports.
+- The browser build keeps the in-page voice dialog; native-only overlays, tray
+  and global shortcuts are compiled out on wasm.
+
 State is plain Rust. Host traits (`TranscriptHost`, `CanvasHost`,
 `ProjectsHost`, `SettingsHost`, and related traits) let shared views resolve the
 active thread or panel without borrowing the whole app. Handlers capture stable

@@ -119,7 +119,7 @@ fn icon_home(size: f32, color: rune::Color) -> Shape {
     icon_shape(p, size, color)
 }
 
-fn icon_group(size: f32, color: rune::Color) -> Shape {
+pub(crate) fn icon_group(size: f32, color: rune::Color) -> Shape {
     // Two bots side by side, same rounded-head shape as the empty Projects
     // mark: antenna, ears, eyes. The rail reads as "agents", not "people".
     let mut p = Path::new();
@@ -329,6 +329,8 @@ pub struct ShellState {
     pub audio_owner: String,
     /// Last audio-engine revision, so a load failure/end repaints once.
     pub audio_rev: u64,
+    /// Native Stark Island, tray, shortcuts and background presence.
+    pub presence: crate::presence::PresenceState,
 }
 
 impl Default for ShellState {
@@ -357,6 +359,7 @@ impl Default for ShellState {
             home_controls: HomeControls(rune::Live::new(0.0)),
             audio_owner: "main".to_string(),
             audio_rev: 0,
+            presence: crate::presence::PresenceState::default(),
         }
     }
 }
@@ -1586,6 +1589,17 @@ fn update_restart_safe(s: &ShellState) -> bool {
     if s.transcript.live || s.personal.live {
         return false;
     }
+    if s.transcript.voice.live
+        || s.personal.voice.live
+        || s.canvas.voice.live
+        || s.canvas
+            .sessions
+            .threads
+            .values()
+            .any(|thread| thread.voice.live)
+    {
+        return false;
+    }
     if s.canvas.sessions.threads.values().any(|thread| thread.live) {
         return false;
     }
@@ -2107,6 +2121,11 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
     if let Some(at) = s.chats.ui_dirty_at {
         let left = (0.4 - (clock - at)).max(0.01);
         tx.wake_after(std::time::Duration::from_secs_f64(left));
+    }
+    // Native presence publishes the island snapshot only after every inbox
+    // has landed, so a finishing run and its toast land on the same frame.
+    if crate::presence::tick(s, clock, tx) {
+        changed = true;
     }
     changed
 }
@@ -2674,6 +2693,11 @@ fn init_shell() -> ShellState {
     // The real app entry (native window and browser) loads live chats; unit
     // tests construct `ShellState::default()` and stay offline.
     let mut shell = ShellState::default();
+    shell.settings.live = crate::prefs::load();
+    #[cfg(windows)]
+    {
+        shell.settings.live.start_with_windows = crate::startup::enabled();
+    }
     shell.canvas.projects.host = crate::rune_transcript::DEFAULT_API_HOST.to_string();
     shell.canvas.projects.port = crate::rune_transcript::api_port();
     shell.canvas.projects.group.host = crate::rune_transcript::DEFAULT_API_HOST.to_string();
@@ -2880,6 +2904,56 @@ pub fn run_shell_headless(extra_args: Vec<String>) {
             _ => rune::FontSmoothing::DirectWrite,
         });
     }
+
+    // Native presence is for the real app, not `--snap`/`--headless` runs:
+    // those need a deterministic tree and must not register a tray icon.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let headless = extra_args
+            .iter()
+            .any(|arg| arg == "--snap" || arg == "--headless");
+        if !headless {
+            let background = std::env::var("STARK_BACKGROUND")
+                .ok()
+                .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+            let prefs = crate::prefs::load();
+            app = app
+                .keep_running()
+                .on_close(crate::presence::on_close)
+                .on_quit(crate::presence::on_quit)
+                .global_shortcut("ctrl+space", crate::presence::shortcut_listen)
+                .global_shortcut("ctrl+alt+s", crate::presence::shortcut_open);
+            if background {
+                // Tray + island only. The first Open creates the main window.
+                app = app.windowless();
+            }
+
+            let app_handle = app.handle();
+            let shared =
+                std::sync::Arc::new(crate::island::IslandShared::new(Some(app_handle.clone())));
+            let overlay = app.overlay(
+                crate::island::island_spec(),
+                crate::island::IslandState::new(shared.clone()),
+            );
+            if prefs.island {
+                overlay.show();
+            }
+            let link = crate::island::IslandLink::new(shared, overlay.clone());
+            let link_for_init = link.clone();
+            let handle_for_init = app_handle.clone();
+            let prefs_for_init = prefs.clone();
+            app = app.init(move || {
+                let mut state = init_shell();
+                state.settings.live = prefs_for_init.clone();
+                state.presence.link = Some(link_for_init.clone());
+                state.presence.app = Some(handle_for_init.clone());
+                state
+            });
+            crate::tray::install(app_handle.clone());
+            crate::presence::install_reopen_listener(app_handle);
+        }
+    }
+
     app.args(extra_args).run();
 }
 

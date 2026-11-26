@@ -27,6 +27,7 @@ rodio = { version = "0.23", default-features = false, features = ["playback", "m
 # Backend-assisted dictation: stream captured PCM to `stark-server`'s
 # `/api/voice/ws` (the pre-rewrite split). Pure Rust, works on GNU + MSVC.
 tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "=0.2.129"
@@ -96,7 +97,7 @@ optional = true
 moonshine-rs = { version = "0.2.6", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_UI_Shell"] }
+windows-sys = { version = "0.59", features = ["Win32_UI_Shell", "Win32_System_Threading", "Win32_System_Registry"] }
 
 [build-dependencies]
 embed-resource = "3.0"

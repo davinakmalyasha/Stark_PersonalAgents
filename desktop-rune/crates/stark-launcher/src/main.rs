@@ -65,17 +65,26 @@ fn main() {
         return;
     }
     let root = install_root();
+    let background = args.iter().any(|arg| arg == "--background");
     let _ = std::fs::create_dir_all(root.join("runtime"));
     #[cfg(windows)]
     let _guard = match single_instance() {
         Some(guard) => guard,
         None => {
-            log(&root, "another launcher is already running");
-            fatal_dialog("Stark Rune is already running.");
+            log(
+                &root,
+                "another launcher is already running; asking it to open",
+            );
+            if signal_open() {
+                return;
+            }
+            fatal_dialog(
+                "Stark Rune is already running. Use the Stark icon in the system tray to open it.",
+            );
             return;
         }
     };
-    if let Err(error) = supervise(&root) {
+    if let Err(error) = supervise(&root, background) {
         log(&root, &format!("fatal: {error}"));
         fatal_dialog(&format!(
             "Stark Rune could not start.
@@ -99,7 +108,7 @@ fn install_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn supervise(root: &Path) -> Result<(), String> {
+fn supervise(root: &Path, background: bool) -> Result<(), String> {
     // A pending update left by a previous run is applied before any UI starts.
     // The pending marker is consumed here so a normal exit cannot later write
     // the running version as its own rollback target.
@@ -132,7 +141,7 @@ fn supervise(root: &Path) -> Result<(), String> {
         log(root, &format!("starting {}", current.version));
 
         let mut server = start_server(root, &version_dir, &current.version)?;
-        let mut ui = start_ui(root, &version_dir)?;
+        let mut ui = start_ui(root, &version_dir, background)?;
         let started = Instant::now();
         let status = ui.wait().map_err(|error| format!("wait for UI: {error}"))?;
         stop_server(&mut server);
@@ -279,7 +288,7 @@ fn validate_version(dir: &Path, version: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn start_ui(root: &Path, version_dir: &Path) -> Result<Child, String> {
+fn start_ui(root: &Path, version_dir: &Path, background: bool) -> Result<Child, String> {
     let exe = version_dir.join("stark-rune.exe");
     let data = data_root(root);
     let mut command = Command::new(&exe);
@@ -289,6 +298,7 @@ fn start_ui(root: &Path, version_dir: &Path) -> Result<Child, String> {
         .env("STARK_PORT", DEFAULT_PORT.to_string())
         .env("STARK_API_PORT", DEFAULT_PORT.to_string())
         .env("STARK_HARNESS_ROOT", &data)
+        .env("STARK_BACKGROUND", if background { "1" } else { "0" })
         .env("STARK_LAUNCHER_PID", std::process::id().to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -531,7 +541,30 @@ impl Drop for InstanceGuard {
     }
 }
 
+/// Wake the running UI's reopen listener. The UI owns window visibility, so
+/// this is a named event instead of an external `ShowWindow`.
 #[cfg(windows)]
+fn signal_open() -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenEventW, SetEvent, EVENT_MODIFY_STATE};
+    let name: Vec<u16> = r"Local\StarkRuneOpen"
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    for _ in 0..20 {
+        let event = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr()) };
+        if !event.is_null() {
+            let signaled = unsafe { SetEvent(event) } != 0;
+            unsafe { CloseHandle(event) };
+            if signaled {
+                return true;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
 fn single_instance() -> Option<InstanceGuard> {
     use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
     use windows_sys::Win32::System::Threading::CreateMutexW;

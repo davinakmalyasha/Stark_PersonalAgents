@@ -35,6 +35,9 @@ pub mod icons;
 #[cfg(feature = "rune-real")]
 #[path = "image_cache.rs"]
 pub mod image_cache;
+#[cfg(all(feature = "rune-real", not(target_arch = "wasm32")))]
+#[path = "island.rs"]
+pub mod island;
 #[cfg(feature = "rune-real")]
 #[path = "keys.rs"]
 pub mod keys;
@@ -44,6 +47,15 @@ pub mod motion;
 #[cfg(feature = "rune-real")]
 #[path = "notes.rs"]
 pub mod notes;
+#[cfg(feature = "rune-real")]
+#[path = "prefs.rs"]
+pub mod prefs;
+#[cfg(all(feature = "rune-real", not(target_arch = "wasm32")))]
+#[path = "presence.rs"]
+pub mod presence;
+#[cfg(all(feature = "rune-real", target_arch = "wasm32"))]
+#[path = "presence_web.rs"]
+pub mod presence;
 #[cfg(feature = "rune-real")]
 #[path = "projects.rs"]
 pub mod projects;
@@ -66,6 +78,9 @@ pub mod settings;
 #[path = "shell.rs"]
 pub mod shell;
 #[cfg(feature = "rune-real")]
+#[path = "startup.rs"]
+pub mod startup;
+#[cfg(feature = "rune-real")]
 #[path = "stream.rs"]
 pub mod stream;
 #[cfg(feature = "rune-real")]
@@ -86,6 +101,9 @@ pub mod tool_labels;
 #[cfg(feature = "rune-real")]
 #[path = "transport.rs"]
 pub mod transport;
+#[cfg(all(feature = "rune-real", not(target_arch = "wasm32")))]
+#[path = "tray.rs"]
+pub mod tray;
 #[cfg(feature = "rune-real")]
 #[path = "updater.rs"]
 pub mod updater;

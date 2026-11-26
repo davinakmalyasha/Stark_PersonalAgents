@@ -3229,6 +3229,7 @@ version = "2.7.0"
 dependencies = [
  "cpal",
  "embed-resource",
+ "image",
  "js-sys",
  "minisign-verify",
  "moonshine-rs",

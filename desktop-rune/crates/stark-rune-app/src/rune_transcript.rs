@@ -7423,7 +7423,14 @@ mod tests {
             "arming never captures: {:?}",
             rt.state.voice
         );
-        assert!(rt.find("composer-voice-arc").is_some(), "orbit renders");
+        assert!(
+            rt.find("composer-voice-bars").is_some(),
+            "armed bars render"
+        );
+        assert!(
+            rt.find("composer-voice-run-0").is_some(),
+            "armed edge chase renders"
+        );
         let (x2, y2) = rt.find("composer-voice").unwrap();
         rt.pointer_down(x2, y2);
         rt.pointer_up(x2, y2);
@@ -7433,8 +7440,12 @@ mod tests {
         assert!(!rt.state.voice.armed);
         assert!(!rt.state.voice.live);
         assert!(
-            rt.find("composer-voice-arc").is_none(),
-            "orbit leaves with live mode"
+            rt.find("composer-voice-bars").is_none(),
+            "armed bars leave with live mode"
+        );
+        assert!(
+            rt.find("composer-voice-run-0").is_none(),
+            "edge chase leaves with live mode"
         );
     }
 

@@ -242,25 +242,16 @@ fn voice_icon(color: rune::Color) -> rune::Shape {
         .view_box(24.0, 24.0)
 }
 
-/// Orbit arc for the armed live-mode button: a ~100° white arc on the 38pt
-/// orbit circle, spun by a rotation loop. Same tessellation trick as the
-/// usage orb's progress arc.
-fn orbit_arc(cx: f32, cy: f32, r: f32) -> Vec<[f32; 2]> {
-    let steps = 20usize;
-    let sweep = 100.0_f32.to_radians();
-    let start = -std::f32::consts::FRAC_PI_2;
-    (0..=steps)
-        .map(|i| {
-            let a = start + sweep * i as f32 / steps as f32;
-            [cx + r * a.cos(), cy + r * a.sin()]
-        })
-        .collect()
-}
-
-/// Live-mode toggle. The dock only arms: white disc + black icon + a moving
-/// orbit ring while armed, calm grey while off. Capture itself starts only
-/// from the island's mic (or Ctrl+Space while armed). `S` is the owning
-/// view's state type.
+/// Live-mode toggle. The dock only arms: white disc + black equalizer bars
+/// while armed, calm grey while off. Capture itself starts only from the
+/// island's mic (or Ctrl+Space while armed). `S` is the owning view's state
+/// type.
+///
+/// While armed, four dots chase each other around the button's edge (each a
+/// staggered `LoopSpec::opacity`) and the bars shimmer. Both are paint-only
+/// loops: no shell wake, no rebuild. A `LoopSpec::rotation` would not work
+/// here — it only turns icon images, never shapes — and `border_sweep`'s
+/// gradient band is sized to the box, so it washes out at 32 pt.
 fn voice_button<S: 'static>(
     voice: &crate::voice::VoiceMeter,
     on_voice: impl Fn(&mut S) + 'static,
@@ -281,45 +272,51 @@ fn voice_button<S: 'static>(
         .on_press_enter(on_voice)
         .press_scale(0.96);
     if active {
-        // Armed: white disc, black AudioLines. The orbit carries the "on"
-        // signal so the mark itself stays calm and readable. The ring layers
-        // ride inside the button (like the usage orb) so the toolbar path
-        // never changes and the press target stays put; they overflow the
-        // 32pt disc by 3pt a side and draw over the toolbar padding.
+        // Five bars on staggered opacity loops, so the mark itself reads as
+        // live audio instead of a static glyph.
+        let mut bars = rune::row()
+            .key("composer-voice-bars")
+            .h(16.0)
+            .items_center()
+            .justify_center()
+            .gap(2.0)
+            .inert();
+        const BAR_H: [f32; 5] = [6.0, 11.0, 16.0, 9.0, 13.0];
+        for (i, h) in BAR_H.iter().enumerate() {
+            bars = bars.child(
+                rune::el()
+                    .key(format!("composer-voice-bar-{i}"))
+                    .w(2.0)
+                    .h(*h)
+                    .radius(1.0)
+                    .fill(ink("#111113"))
+                    .looping(rune::LoopSpec::opacity(1.2, i as f64 * 0.13, 0.35, 1.0))
+                    .inert(),
+            );
+        }
+        // Four dots ride the button's edge in a chase, one quarter-period
+        // apart: the border itself reads as circling. `border_sweep` was too
+        // faint at 32 pt (its gradient band scales with the box), and a
+        // rotation loop only turns icon images, never shapes.
+        const DOTS: [(f32, f32); 4] = [(14.5, 0.5), (28.5, 14.5), (14.5, 28.5), (0.5, 14.5)];
+        for (i, (x, y)) in DOTS.iter().enumerate() {
+            button = button.child(
+                rune::el()
+                    .key(format!("composer-voice-run-{i}"))
+                    .absolute(*x, *y)
+                    .size(3.0, 3.0)
+                    .radius(1.5)
+                    .fill(ink("#111113"))
+                    .looping(rune::LoopSpec::opacity(1.2, i as f64 * 0.3, 0.10, 1.0))
+                    .inert(),
+            );
+        }
         button = button
             .fill(ink("#ffffff"))
-            .child(
-                rune::el()
-                    .key("composer-voice-track")
-                    .absolute(-3.0, -3.0)
-                    .size(38.0, 38.0)
-                    .inert()
-                    .shape(
-                        rune::Shape::new()
-                            .fill(ring_fill(19.0, 19.0, 17.0, 18.4), ink("#ffffff24")),
-                    ),
-            )
-            .child(
-                rune::el()
-                    .key("composer-voice-arc")
-                    .absolute(-3.0, -3.0)
-                    .size(38.0, 38.0)
-                    .inert()
-                    .shape(rune::Shape::new().stroke_with(
-                        orbit_arc(19.0, 19.0, 17.7),
-                        false,
-                        2.0,
-                        rune::LineCap::Round,
-                        ink("#ffffff"),
-                    ))
-                    .looping(rune::LoopSpec::rotation(1.2)),
-            )
-            .child(
-                rune::el()
-                    .size(16.0, 16.0)
-                    .inert()
-                    .shape(voice_icon(ink("#111113"))),
-            );
+            // A hairline track for the chase to ride; the border itself
+            // follows the button's 11 pt radii.
+            .border(1.0, ink("#e4e4e7"))
+            .child(bars);
     } else {
         button = button
             .fill(ink("#303035"))

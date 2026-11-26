@@ -42,16 +42,18 @@ pub enum VoiceMsg {
 /// All voice runtime state in one bus so every view (transcript, canvas,
 /// personal) shares toggle/drain logic. `stop`/`rx` reset on clone: a copied
 /// state never inherits a live microphone.
+///
+/// Live mode is armed per thread: the prompt-dock mic arms (warms the speech
+/// models, shows the island idle) but never captures. Only the island's mic
+/// (or Ctrl+Space while armed) starts capture. Stopping capture keeps the
+/// models warm while any bus stays armed; the shell releases them once no
+/// bus is armed or live.
 pub struct VoiceBus {
+    /// Live-mode armed: models warming/warm, island up, mic still off.
+    /// Runtime-only, never persisted; the app always starts disarmed.
+    pub armed: bool,
     pub live: bool,
     pub level: f32,
-    /// `voice-breathe` tracks: scale `.88 -> 1.08` and opacity `.65 -> 1`
-    /// over 1.2 s. Rune has no infinite scale loop, so the shell samples the
-    /// keyframe clock into these `Live` values while the dot is mounted.
-    pub breathe_scale: rune::Live<f32>,
-    pub breathe_opacity: rune::Live<f32>,
-    /// Wall-clock start of the current live session (ms).
-    pub breathe_start_ms: u64,
     pub note: Option<String>,
     /// Latest interim dictation (`transcript` events overwrite it in place,
     /// like the reference UI's `voice-live-input` bubble content).
@@ -70,6 +72,7 @@ impl std::fmt::Debug for VoiceBus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VoiceBus")
             .field("live", &self.live)
+            .field("armed", &self.armed)
             .field("level", &self.level)
             .field("note", &self.note)
             .field("live_text", &self.live_text)
@@ -83,11 +86,9 @@ impl std::fmt::Debug for VoiceBus {
 impl Clone for VoiceBus {
     fn clone(&self) -> Self {
         Self {
+            armed: self.armed,
             live: self.live,
             level: self.level,
-            breathe_scale: self.breathe_scale.clone(),
-            breathe_opacity: self.breathe_opacity.clone(),
-            breathe_start_ms: self.breathe_start_ms,
             note: self.note.clone(),
             live_text: self.live_text.clone(),
             pending_final: self.pending_final.clone(),
@@ -101,11 +102,9 @@ impl Clone for VoiceBus {
 impl Default for VoiceBus {
     fn default() -> Self {
         Self {
+            armed: false,
             live: false,
             level: 0.0,
-            breathe_scale: rune::Live::new(1.0),
-            breathe_opacity: rune::Live::new(1.0),
-            breathe_start_ms: 0,
             note: None,
             live_text: String::new(),
             pending_final: None,
@@ -117,36 +116,28 @@ impl Default for VoiceBus {
 }
 
 impl VoiceBus {
-    /// Toggle capture. Returns true when a capture attempt started.
-    /// Stopping always succeeds. Hardware failures (no device, OS error)
-    /// arrive asynchronously as [`VoiceMsg::Error`] notes via [`VoiceBus::drain`].
-    ///
-    /// Live mode owns the speech models: turning it on warms the backend TTS
-    /// (and loads Moonshine on first `session.start`, locally on first
-    /// producer spawn); turning it off releases the on-device engine and
-    /// asks the backend to drop TTS/ASR again.
-    pub fn set_live(&mut self, on: bool) -> bool {
-        if !on {
-            let was_live = self.live || self.stop.is_some() || self.rx.is_some();
-            if let Some(stop) = self.stop.take() {
-                stop.store(true, Ordering::Relaxed);
-            }
-            self.rx = None;
-            self.live = false;
-            self.level = 0.0;
-            self.breathe_scale.set(1.0);
-            self.breathe_opacity.set(1.0);
-            self.live_text.clear();
-            if was_live {
-                Self::on_live_stopped();
-            }
-            return false;
+    /// Arm or disarm live mode. Arming warms the backend TTS (idempotent,
+    /// best effort) and never touches the microphone; disarming stops a
+    /// running capture but leaves model release to the shell, which releases
+    /// only once no bus is armed or live.
+    pub fn set_armed(&mut self, on: bool) {
+        if on {
+            self.armed = true;
+            self.note = None;
+            Self::ensure_warmed();
+            return;
         }
+        self.stop_capture();
+        self.armed = false;
+    }
+
+    /// Start the microphone. Returns true when a capture attempt started.
+    /// Capture never warms or releases models — arming owns that.
+    /// Hardware failures (no device, OS error) arrive asynchronously as
+    /// [`VoiceMsg::Error`] notes via [`VoiceBus::drain`].
+    pub fn start_capture(&mut self) -> bool {
         self.note = None;
         self.level = 0.0;
-        self.breathe_start_ms = crate::clock::now_millis();
-        self.breathe_scale.set(0.88);
-        self.breathe_opacity.set(0.65);
         self.live_text.clear();
         self.pending_final = None;
         #[cfg(target_arch = "wasm32")]
@@ -192,7 +183,6 @@ impl VoiceBus {
             match started {
                 Ok(()) => {
                     self.note = None;
-                    Self::on_live_started();
                     std::thread::spawn(move || {
                         capture_loop(flag, tx, Some(pcm_tx));
                     });
@@ -204,6 +194,19 @@ impl VoiceBus {
             }
             true
         }
+    }
+
+    /// Stop the microphone. Always succeeds; models stay warm while armed.
+    /// Dropping back to armed-idle never releases — only disarming every bus
+    /// (via the shell) releases.
+    pub fn stop_capture(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        self.rx = None;
+        self.live = false;
+        self.level = 0.0;
+        self.live_text.clear();
     }
     pub fn drain(&mut self, dt: f32) -> bool {
         let mut changed = false;
@@ -217,21 +220,16 @@ impl VoiceBus {
                     if is_final {
                         // Session end (`pipeline-start`): drop the live bubble,
                         // stop capture, and hand the canonical prompt to the
-                        // poll hook for draft staging.
+                        // poll hook for draft staging. Models stay warm: the
+                        // bus is still armed, back to idle.
                         self.pending_final = Some(text);
                         self.live_text.clear();
-                        let was_live = self.live;
                         self.live = false;
                         self.level = 0.0;
-                        self.breathe_scale.set(1.0);
-                        self.breathe_opacity.set(1.0);
                         if let Some(stop) = self.stop.take() {
                             stop.store(true, Ordering::Relaxed);
                         }
                         self.rx = None;
-                        if was_live {
-                            Self::on_live_stopped();
-                        }
                     } else {
                         self.live_text = text;
                     }
@@ -243,15 +241,11 @@ impl VoiceBus {
                     changed = true;
                 }
                 VoiceMsg::Error(note) => {
-                    let was_live = self.live;
+                    // Capture failed honestly; the bus stays armed so the
+                    // island (and its retry) stay up. Models stay warm.
                     self.note = Some(note);
                     self.live = false;
                     self.level = 0.0;
-                    self.breathe_scale.set(1.0);
-                    self.breathe_opacity.set(1.0);
-                    if was_live {
-                        Self::on_live_stopped();
-                    }
                     changed = true;
                 }
             }
@@ -277,11 +271,13 @@ impl VoiceBus {
         final_text
     }
 
-    /// Live-mode on: the backend TTS warms in the background while the first
-    /// utterance streams, so the first spoken reply does not pay model load.
-    /// Best effort: a missing bundle or unreachable server only surfaces when
-    /// TTS is actually used.
-    fn on_live_started() {
+    /// Arming live mode warms the backend TTS in the background, so the first
+    /// spoken reply does not pay model load. (Moonshine loads on first
+    /// `session.start`, locally on first producer spawn.) Best effort: a
+    /// missing bundle or unreachable server only surfaces when TTS is used.
+    /// Idempotent — arm every bus freely; one warm call is enough but repeats
+    /// are harmless.
+    pub fn ensure_warmed() {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let host = crate::rune_transcript::DEFAULT_API_HOST.to_string();
@@ -297,10 +293,11 @@ impl VoiceBus {
         }
     }
 
-    /// Live-mode off: drop the on-device engine and ask the backend to release
-    /// TTS/ASR, so an idle app holds no speech memory. Every call is
-    /// idempotent and best effort; release endpoints never fail a toggle.
-    fn on_live_stopped() {
+    /// Disarming the last bus releases the models: drop the on-device engine
+    /// and ask the backend to release TTS/ASR, so an idle app holds no speech
+    /// memory. The shell calls this only once no bus is armed or live. Every
+    /// call is idempotent and best effort; release endpoints never fail.
+    pub fn release_models() {
         #[cfg(not(target_arch = "wasm32"))]
         {
             crate::stt::release_engine();
@@ -323,46 +320,20 @@ impl VoiceBus {
         }
     }
 
-    /// Meter plus the live breathing tracks, for the composer's voice dot.
-    pub fn meter(&self) -> VoiceMeter<'_> {
+    /// Meter for the composer's live-mode button.
+    pub fn meter(&self) -> VoiceMeter {
         VoiceMeter {
             live: self.live,
-            breathe_scale: &self.breathe_scale,
-            breathe_opacity: &self.breathe_opacity,
+            armed: self.armed,
         }
-    }
-
-    /// Publish one frame of the 1.2 s `voice-breathe` keyframe. The shell
-    /// calls this from its poll, which wakes at ~60 Hz while the mic is live.
-    pub fn tick_breathe(&self, now_ms: u64) -> bool {
-        if !self.live {
-            return false;
-        }
-        let (scale, opacity) = breathe_pose(now_ms.saturating_sub(self.breathe_start_ms));
-        self.breathe_scale.set(scale);
-        self.breathe_opacity.set(opacity);
-        true
     }
 }
 
-/// Read-only composer view of the voice bus.
-pub struct VoiceMeter<'a> {
+/// Read-only composer view of the voice bus. `armed` is live-mode (models
+/// warm, island up, mic off); `live` is an active capture.
+pub struct VoiceMeter {
     pub live: bool,
-    pub breathe_scale: &'a rune::Live<f32>,
-    pub breathe_opacity: &'a rune::Live<f32>,
-}
-
-/// `voice-breathe`: scale `.88 -> 1.08` and opacity `.65 -> 1` over 1.2 s,
-/// `ease-in-out` on each half. The keyframe repeats from the session start.
-pub fn breathe_pose(elapsed_ms: u64) -> (f32, f32) {
-    let phase = (elapsed_ms % 1200) as f32 / 1200.0;
-    let half = if phase < 0.5 {
-        phase * 2.0
-    } else {
-        (1.0 - phase) * 2.0
-    };
-    let eased = rune::Easing::EASE_IN_OUT.eval(half);
-    (0.88 + 0.20 * eased, 0.65 + 0.35 * eased)
+    pub armed: bool,
 }
 
 /// RMS loudness in 0..1 of an f32 sample block.
@@ -813,29 +784,34 @@ mod tests {
     }
 
     #[test]
-    fn breathe_matches_the_1200ms_keyframe() {
-        let (s0, o0) = breathe_pose(0);
-        assert!((s0 - 0.88).abs() < 1e-6 && (o0 - 0.65).abs() < 1e-6);
-        let (sh, oh) = breathe_pose(300);
-        assert!((sh - 0.98).abs() < 1e-4, "halfway up: {sh}");
-        assert!((oh - 0.825).abs() < 1e-4, "halfway up: {oh}");
-        let (s1, o1) = breathe_pose(600);
-        assert!((s1 - 1.08).abs() < 1e-4 && (o1 - 1.0).abs() < 1e-4);
-        let (sh2, _) = breathe_pose(900);
-        assert!((sh2 - 0.98).abs() < 1e-4, "halfway down: {sh2}");
-        let (s2, o2) = breathe_pose(1200);
-        assert!((s2 - 0.88).abs() < 1e-6 && (o2 - 0.65).abs() < 1e-6);
+    fn arming_warms_without_capturing() {
+        let mut bus = VoiceBus::default();
+        bus.set_armed(true);
+        assert!(bus.armed, "the dock arms live mode");
+        assert!(!bus.live, "arming never opens the mic");
+        assert!(
+            bus.stop.is_none() && bus.rx.is_none(),
+            "no capture thread while idle"
+        );
     }
 
     #[test]
-    fn tick_breathe_publishes_only_while_live() {
+    fn capture_stop_keeps_armed() {
         let mut bus = VoiceBus::default();
-        assert!(!bus.tick_breathe(600), "idle bus does not publish");
+        bus.set_armed(true);
         bus.live = true;
-        bus.breathe_start_ms = 0;
-        assert!(bus.tick_breathe(600));
-        assert!((bus.breathe_scale.get() - 1.08).abs() < 1e-4);
-        assert!((bus.breathe_opacity.get() - 1.0).abs() < 1e-4);
+        bus.stop_capture();
+        assert!(!bus.live);
+        assert!(bus.armed, "dropping back to idle keeps the models warm");
+    }
+
+    #[test]
+    fn disarm_stops_capture_and_clears_armed() {
+        let mut bus = VoiceBus::default();
+        bus.set_armed(true);
+        bus.live = true;
+        bus.set_armed(false);
+        assert!(!bus.live && !bus.armed);
     }
 
     #[test]

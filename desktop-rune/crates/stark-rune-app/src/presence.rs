@@ -36,6 +36,10 @@ pub struct PresenceState {
     island_visible: Option<bool>,
     capture_excluded: Option<bool>,
     close_hint_shown: bool,
+    /// Whether the speech models are currently warm. Flipped by the
+    /// reconcile step so one warm/release pair covers any number of arm
+    /// toggles across threads.
+    models_warm: bool,
 }
 
 impl std::fmt::Debug for PresenceState {
@@ -311,6 +315,20 @@ fn voice_note(s: &ShellState) -> Option<IslandAttention> {
     None
 }
 
+/// Whether any thread has live mode armed (models warm, island up, mic off).
+fn any_armed(s: &ShellState) -> bool {
+    thread_keys(s)
+        .iter()
+        .any(|key| thread_ref(s, key).is_some_and(|thread| thread.voice.armed || thread.voice.live))
+}
+
+/// Whether any thread is actively capturing audio right now.
+fn any_live_voice(s: &ShellState) -> bool {
+    thread_keys(s)
+        .iter()
+        .any(|key| thread_ref(s, key).is_some_and(|thread| thread.voice.live))
+}
+
 /// Voice-owned attention: interim errors, drafts and voice-sent finals. Run
 /// completions, failures, questions and the close hint belong to the tray,
 /// never the island — live mode is the island's only trigger.
@@ -382,15 +400,18 @@ fn snapshot(s: &ShellState, now_ms: u64) -> IslandModel {
     } else {
         voice.target
     };
-    // Live mode is the island's only trigger: the mic toggle loads STT/TTS
-    // and shows the island; toggling off unloads them and the island goes
-    // away. Agent runs and questions stay on the tray, never the island.
+    // Live mode is the island's only trigger, and arming alone raises it:
+    // the dock arms (warms models, shows the island idle) while only the
+    // island's mic — or Ctrl+Space while armed — starts capture. Agent runs
+    // and questions stay on the tray, never the island.
     let voice_card = attention.as_ref().is_some_and(is_voice_attention);
-    let live_now = voice.live || voice_card;
+    let armed = any_armed(s);
+    let live_now = voice.live || voice_card || armed;
     let tick_step = if voice.live { 80 } else { 1000 };
     IslandModel {
         runs,
         listening: voice.live,
+        armed,
         level: voice.level,
         voice_text: voice.text,
         target,
@@ -433,23 +454,26 @@ fn open_target(s: &mut ShellState, target: &IslandTarget) {
 }
 
 fn stop_all_voice(s: &mut ShellState) {
+    // Emergency stop: every capture ends, but arming survives — the models
+    // stay warm and the island drops back to idle, not away.
     for key in thread_keys(s) {
         if let Some(thread) = thread_mut(s, &key) {
             if thread.voice.live {
-                thread.voice.set_live(false);
+                thread.voice.stop_capture();
             }
         }
     }
 }
 
-fn toggle_voice(s: &mut ShellState) {
-    // If any bus is live, one press stops the live bus (the island never
-    // leaves a hot microphone behind).
+/// Capture toggle for the island's mic (and Ctrl+Space while armed). If any
+/// bus is live, one press stops it — the island never leaves a hot
+/// microphone behind. Otherwise the active thread starts capturing.
+fn toggle_capture(s: &mut ShellState) {
     for key in thread_keys(s) {
         let live = thread_ref(s, &key).is_some_and(|thread| thread.voice.live);
         if live {
             if let Some(thread) = thread_mut(s, &key) {
-                thread.voice.set_live(false);
+                thread.voice.stop_capture();
                 thread.voice.note = None;
             }
             return;
@@ -458,7 +482,43 @@ fn toggle_voice(s: &mut ShellState) {
     let key = active_key(s);
     if let Some(thread) = thread_mut(s, &key) {
         thread.voice.note = None;
-        thread.voice.set_live(true);
+        thread.voice.start_capture();
+    }
+}
+
+/// Arm live mode on the active thread: models warm, island rises idle, mic
+/// stays off. Ctrl+Space lands here while disarmed (arm-only by design).
+fn arm_active(s: &mut ShellState) {
+    let key = active_key(s);
+    if let Some(thread) = thread_mut(s, &key) {
+        thread.voice.note = None;
+        thread.voice.set_armed(true);
+    }
+}
+
+/// Disarm every bus and release the models. Only quit (and the dock's own
+/// off press, per thread) goes here — closing the window keeps live mode.
+fn disarm_all(s: &mut ShellState) {
+    for key in thread_keys(s) {
+        if let Some(thread) = thread_mut(s, &key) {
+            thread.voice.set_armed(false);
+        }
+    }
+    crate::voice::VoiceBus::release_models();
+    s.presence.models_warm = false;
+}
+
+/// One warm/release pair for any number of armed buses. Arming warms
+/// eagerly per bus (idempotent POSTs); this flag keeps the release side to
+/// the single moment the last bus goes quiet.
+fn reconcile_models(s: &mut ShellState) {
+    let need = any_armed(s) || any_live_voice(s);
+    if need && !s.presence.models_warm {
+        crate::voice::VoiceBus::ensure_warmed();
+        s.presence.models_warm = true;
+    } else if !need && s.presence.models_warm {
+        crate::voice::VoiceBus::release_models();
+        s.presence.models_warm = false;
     }
 }
 
@@ -532,7 +592,7 @@ fn handle_commands(s: &mut ShellState) -> bool {
     }
     for command in commands {
         match command {
-            IslandCommand::ToggleListen => toggle_voice(s),
+            IslandCommand::ToggleListen => toggle_capture(s),
             IslandCommand::StopListen => stop_all_voice(s),
             IslandCommand::OpenMain => open_main(s),
             IslandCommand::OpenChat(target) => open_target(s, &target),
@@ -644,7 +704,13 @@ fn apply_requests(s: &mut ShellState) -> bool {
     let mut changed = false;
     if s.presence.listen_requested {
         s.presence.listen_requested = false;
-        toggle_voice(s);
+        // Arm-only while disarmed: the shortcut raises the idle island and
+        // warms the models. A second press (or the island mic) captures.
+        if any_armed(s) || any_live_voice(s) {
+            toggle_capture(s);
+        } else {
+            arm_active(s);
+        }
         changed = true;
     }
     if s.presence.open_requested {
@@ -656,11 +722,12 @@ fn apply_requests(s: &mut ShellState) -> bool {
     changed
 }
 
-/// No live mode, no island: the overlay only exists while voice is live or
-/// a voice card (draft/error) is up. Agent runs and questions stay on the
-/// tray, never the island.
+/// Arming alone raises the island: the overlay exists while any bus is
+/// armed, while voice is live, or while a voice card (draft/error) is up.
+/// Agent runs and questions stay on the tray, never the island.
 fn island_desired(prefs_island: bool, model: &IslandModel) -> bool {
-    let live_now = model.listening || model.attention.as_ref().is_some_and(is_voice_attention);
+    let live_now =
+        model.armed || model.listening || model.attention.as_ref().is_some_and(is_voice_attention);
     prefs_island && live_now
 }
 
@@ -694,6 +761,7 @@ pub fn tick(s: &mut ShellState, _clock: f64, tx: &mut Tx) -> bool {
     changed |= apply_finals(s, now_ms, auto_send);
     changed |= apply_ended_runs(s, now_ms);
     update_live_tracking(s);
+    reconcile_models(s);
 
     if s.presence
         .toast
@@ -706,19 +774,23 @@ pub fn tick(s: &mut ShellState, _clock: f64, tx: &mut Tx) -> bool {
 
     let model = snapshot(s, now_ms);
     publish(s, &model);
-    let island_up = model.listening || model.attention.as_ref().is_some_and(is_voice_attention);
+    let island_up =
+        model.armed || model.listening || model.attention.as_ref().is_some_and(is_voice_attention);
     if model.listening {
         // Keep the mic bars alive even between level packets.
         tx.wake_after(Duration::from_millis(80));
     }
-    if island_up && (!model.runs.is_empty() || model.attention.is_some()) {
-        // Elapsed labels and expiring voice cards tick while the island is up.
+    if island_up && (!model.runs.is_empty() || model.attention.is_some() || model.armed) {
+        // Elapsed labels, expiring voice cards and the idle island tick
+        // while the island is up.
         tx.wake_after(Duration::from_secs(1));
     }
     changed
 }
 
-/// Stop capture and persist prefs when the window is hidden/closed.
+/// Stop capture when the window is hidden/closed, but keep live mode armed:
+/// the island is the live surface even with no chat window open, and the
+/// models stay warm. Quitting disarms (see `on_quit`).
 pub fn on_close(s: &mut ShellState, tx: &mut Tx) {
     stop_all_voice(s);
     // Close hides; agents keep working. Tell the user once per session where
@@ -739,10 +811,11 @@ pub fn on_close(s: &mut ShellState, tx: &mut Tx) {
     tx.wake_after(Duration::from_millis(40));
 }
 
-/// Quitting is the only action that ends background agents. Stop the mic and
-/// persist the island choices, but leave run state to the server's shutdown.
+/// Quitting is the only action that ends background agents. Disarm every
+/// bus and release the models, then persist the island choices — an idle
+/// app holds no speech memory. Run state is left to the server's shutdown.
 pub fn on_quit(s: &mut ShellState, _tx: &mut Tx) {
-    stop_all_voice(s);
+    disarm_all(s);
     crate::prefs::save(&s.settings.live);
 }
 
@@ -895,7 +968,7 @@ mod tests {
         use crate::island::{IslandAttention, IslandAttentionKind, IslandModel, IslandTarget};
 
         let target = IslandTarget::default();
-        // Agent running, mic off: tray material only, island stays down.
+        // Agent running, mic off, disarmed: tray material only, island stays down.
         let mut running = IslandModel::default();
         running.runs.push(crate::island::IslandRun {
             target: target.clone(),
@@ -906,6 +979,16 @@ mod tests {
         assert!(
             !island_desired(true, &running),
             "agent runs never raise the island"
+        );
+
+        // Armed but idle: the island is up with no capture and no runs.
+        let armed = IslandModel {
+            armed: true,
+            ..IslandModel::default()
+        };
+        assert!(
+            island_desired(true, &armed),
+            "arming raises the idle island"
         );
 
         // Mic live: island up even with no runs.
@@ -953,6 +1036,46 @@ mod tests {
 
         // Master switch still gates everything.
         assert!(!island_desired(false, &listening));
+        assert!(!island_desired(false, &armed));
+    }
+
+    #[test]
+    fn shortcut_arms_only_then_captures() {
+        let mut s = shell();
+        // First press while disarmed: arm only, mic stays shut.
+        s.presence.listen_requested = true;
+        apply_requests(&mut s);
+        assert!(s.transcript.voice.armed, "shortcut arms live mode");
+        assert!(
+            !s.transcript.voice.live,
+            "arming never opens the mic: {:?}",
+            s.transcript.voice
+        );
+        // Second press while armed: the island mic path — toggles capture.
+        s.presence.listen_requested = true;
+        apply_requests(&mut s);
+        // No microphone on CI: capture fails fast with an honest note, but
+        // the bus stays armed so the island (and its retry) stay up.
+        assert!(
+            s.transcript.voice.armed,
+            "capture never disarms: {:?}",
+            s.transcript.voice
+        );
+    }
+
+    #[test]
+    fn capture_stop_keeps_the_island_up_while_armed() {
+        let mut s = shell();
+        s.transcript.voice.set_armed(true);
+        s.transcript.voice.live = true;
+        stop_all_voice(&mut s);
+        assert!(!s.transcript.voice.live);
+        let model = snapshot(&s, crate::clock::now_millis());
+        assert!(model.armed);
+        assert!(
+            island_desired(true, &model),
+            "dropping to idle keeps the island, not hides it"
+        );
     }
 
     #[test]
@@ -968,5 +1091,13 @@ mod tests {
         s.transcript.voice.live = true;
         let live_tick = snapshot(&s, 10_000).tick_ms;
         assert_eq!(live_tick, 10_000);
+
+        // Armed idle: the island ticks (cockpit hover clock) without capture.
+        s.transcript.voice.live = false;
+        s.transcript.voice.armed = true;
+        let model = snapshot(&s, 10_000);
+        assert!(model.armed);
+        assert_eq!(model.tick_ms, 10_000);
+        assert!(!model.listening);
     }
 }

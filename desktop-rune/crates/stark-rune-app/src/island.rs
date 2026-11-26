@@ -25,7 +25,6 @@ pub const ISLAND_WINDOW: (f32, f32) = (520.0, 420.0);
 const HAIRLINE: &str = "#ffffff14";
 const TEXT: &str = "#f4f4f5";
 const MUTED: &str = "#8a8a93";
-const GREEN: &str = "#3ddc97";
 const RED: &str = "#f87171";
 const SPRING: rune::Spring = rune::Spring::new(0.36, 0.16);
 
@@ -93,6 +92,9 @@ pub struct IslandAttention {
 pub struct IslandModel {
     pub runs: Vec<IslandRun>,
     pub listening: bool,
+    /// Live mode armed: models warm, island up, mic off. Arming alone
+    /// raises the island — capture is a separate, later step.
+    pub armed: bool,
     pub level: f32,
     pub voice_text: String,
     pub target: IslandTarget,
@@ -109,6 +111,7 @@ impl Default for IslandModel {
         Self {
             runs: Vec::new(),
             listening: false,
+            armed: false,
             level: 0.0,
             voice_text: String::new(),
             target: IslandTarget::default(),
@@ -409,11 +412,11 @@ fn chevron_glyph(size: f32, color: rune::Color) -> El {
         .shape(crate::icons::lucide(&["m6 9 6 6 6-6"], size, 2.0, color))
 }
 
-fn bot_mark(color: rune::Color) -> El {
+fn live_mark(color: rune::Color) -> El {
     el().key("island-mark")
         .size(19.0, 19.0)
         .inert()
-        .shape(crate::shell::icon_group(19.0, color))
+        .shape(crate::shell::icon_live(19.0, color))
 }
 
 fn pulse_dot(size: f32, color: rune::Color, animate: bool) -> El {
@@ -459,7 +462,7 @@ fn waveform(model: &IslandModel, width: f32, height: f32) -> El {
             el().key(format!("island-wave-bar-{i}"))
                 .size(3.0, bar_h)
                 .radius(1.5)
-                .fill(ink(GREEN).alpha(dim))
+                .fill(ink(TEXT).alpha(dim))
                 .looping(rune::LoopSpec::opacity(
                     1.15 + i as f64 * 0.06,
                     i as f64 * 0.11,
@@ -482,8 +485,8 @@ fn status_copy(model: &IslandModel) -> String {
 
 fn attention_icon(kind: IslandAttentionKind) -> El {
     match kind {
-        IslandAttentionKind::Done => check_glyph(14.0, ink(GREEN)),
-        IslandAttentionKind::Draft => mic_glyph(14.0, ink(GREEN)),
+        IslandAttentionKind::Done => check_glyph(14.0, ink(TEXT)),
+        IslandAttentionKind::Draft => mic_glyph(14.0, ink(TEXT)),
         IslandAttentionKind::Error => alert_glyph(14.0, ink(RED)),
         IslandAttentionKind::Question => help_glyph(14.0, ink(TEXT)),
     }
@@ -611,7 +614,7 @@ fn header(
         }
     }
 
-    head = head.child(bot_mark(if cockpit { ink(TEXT) } else { ink("#c7c7cf") }));
+    head = head.child(live_mark(if cockpit { ink(TEXT) } else { ink("#c7c7cf") }));
     if cockpit {
         head = head
             .child(tiny_label("island-brand", "Stark", 12.5, 600.0, ink(TEXT)))
@@ -624,7 +627,7 @@ fn header(
                         if model.runs.is_empty() {
                             ink("#5a5a62")
                         } else {
-                            ink(GREEN)
+                            ink(TEXT)
                         },
                         !model.runs.is_empty(),
                     ))
@@ -651,7 +654,7 @@ fn header(
                 .max_w(130.0),
             )
             .child(rune::el().grow(1.0))
-            .child(pulse_dot(6.0, ink(GREEN), true));
+            .child(pulse_dot(6.0, ink(TEXT), true));
     } else {
         head = head
             .child(rune::el().grow(1.0))
@@ -688,11 +691,11 @@ fn run_row(run: &IslandRun) -> El {
         .gap(8.0)
         .hover(rgba(1.0, 1.0, 1.0, 0.045))
         .on_press(move |s: &mut IslandState| s.shared.push(open_cmd(&target)))
-        .child(pulse_dot(6.0, ink(GREEN), true))
+        .child(pulse_dot(6.0, ink(TEXT), true))
         .child(
             el().size(15.0, 15.0)
                 .inert()
-                .shape(crate::shell::icon_group(15.0, ink("#b9b9c2"))),
+                .shape(crate::shell::icon_live(15.0, ink("#b9b9c2"))),
         )
         .child(
             col()
@@ -965,13 +968,9 @@ pub fn island_view(s: &IslandState, _cx: &mut Cx<IslandState>) -> El {
         (104.0, 24.0)
     };
 
-    let border = if listening {
-        ink(GREEN).alpha(0.42)
-    } else if runs > 0 {
-        ink(GREEN).alpha(0.22)
-    } else {
-        ink(HAIRLINE)
-    };
+    // One neutral hairline in every state — no green borders, no glow. The
+    // waveform and status dots carry the live signal in white.
+    let border = ink(HAIRLINE);
 
     let mut notch = col()
         .key("stark-island")
@@ -994,16 +993,6 @@ pub fn island_view(s: &IslandState, _cx: &mut Cx<IslandState>) -> El {
             color: rgba(0.0, 0.0, 0.0, 0.58),
             inset: false,
         });
-    if listening {
-        notch = notch.box_shadow(rune::Shadow {
-            x: 0.0,
-            y: 0.0,
-            blur: 28.0,
-            spread: 0.0,
-            color: ink(GREEN).alpha(0.18),
-            inset: false,
-        });
-    }
 
     let header_h = if cockpit_open {
         44.0
@@ -1063,6 +1052,7 @@ mod tests {
                 })
                 .collect(),
             listening,
+            armed: false,
             level: 0.7,
             voice_text: "refactor the provider panel".to_string(),
             target,

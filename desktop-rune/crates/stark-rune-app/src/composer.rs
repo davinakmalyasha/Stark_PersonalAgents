@@ -242,54 +242,83 @@ fn voice_icon(color: rune::Color) -> rune::Shape {
         .view_box(24.0, 24.0)
 }
 
-/// Voice toggle button. `S` is the owning view's state type.
+/// Orbit arc for the armed live-mode button: a ~100° white arc on the 38pt
+/// orbit circle, spun by a rotation loop. Same tessellation trick as the
+/// usage orb's progress arc.
+fn orbit_arc(cx: f32, cy: f32, r: f32) -> Vec<[f32; 2]> {
+    let steps = 20usize;
+    let sweep = 100.0_f32.to_radians();
+    let start = -std::f32::consts::FRAC_PI_2;
+    (0..=steps)
+        .map(|i| {
+            let a = start + sweep * i as f32 / steps as f32;
+            [cx + r * a.cos(), cy + r * a.sin()]
+        })
+        .collect()
+}
+
+/// Live-mode toggle. The dock only arms: white disc + black icon + a moving
+/// orbit ring while armed, calm grey while off. Capture itself starts only
+/// from the island's mic (or Ctrl+Space while armed). `S` is the owning
+/// view's state type.
 fn voice_button<S: 'static>(
-    voice: &crate::voice::VoiceMeter<'_>,
+    voice: &crate::voice::VoiceMeter,
     on_voice: impl Fn(&mut S) + 'static,
 ) -> El {
-    let live = voice.live;
+    let active = voice.armed || voice.live;
     let mut button = rune::el()
         .key("composer-voice")
         .role("button")
         .focusable(true)
-        .label(if live {
-            "Stop voice input"
+        .label(if active {
+            "Live mode on — press to turn off"
         } else {
-            "Start voice input"
+            "Turn live mode on"
         })
         .size(32.0, 32.0)
         .radius(11.0)
         .center()
-        .on_press_enter(on_voice);
-    if live {
-        // `.voice-live-dot`: a 5 pt white dot with a 2 pt `#a1a1aa` ring,
-        // top-right. `voice-breathe` scales and fades both over 1.2 s; the
-        // shell publishes the two Live tracks from the keyframe clock.
-        let scale = voice.breathe_scale;
-        let opacity = voice.breathe_opacity;
+        .on_press_enter(on_voice)
+        .press_scale(0.96);
+    if active {
+        // Armed: white disc, black AudioLines. The orbit carries the "on"
+        // signal so the mark itself stays calm and readable. The ring layers
+        // ride inside the button (like the usage orb) so the toolbar path
+        // never changes and the press target stays put; they overflow the
+        // 32pt disc by 3pt a side and draw over the toolbar padding.
         button = button
-            .linear_gradient(
-                135.0 * std::f32::consts::PI / 180.0,
-                [(0.0, ink("#a1a1aa")), (1.0, ink("#e4e4e7"))],
+            .fill(ink("#ffffff"))
+            .child(
+                rune::el()
+                    .key("composer-voice-track")
+                    .absolute(-3.0, -3.0)
+                    .size(38.0, 38.0)
+                    .inert()
+                    .shape(
+                        rune::Shape::new()
+                            .fill(ring_fill(19.0, 19.0, 17.0, 18.4), ink("#ffffff24")),
+                    ),
             )
             .child(
                 rune::el()
-                    .key("composer-voice-dot")
-                    .pin(None, Some(2.0), Some(2.0), None)
-                    .size(9.0, 9.0)
-                    .radius(4.5)
-                    .fill(ink("#a1a1aa"))
-                    .live_scale(scale)
-                    .live_opacity(opacity)
-                    .center()
+                    .key("composer-voice-arc")
+                    .absolute(-3.0, -3.0)
+                    .size(38.0, 38.0)
                     .inert()
-                    .child(
-                        rune::el()
-                            .size(5.0, 5.0)
-                            .radius(2.5)
-                            .fill(ink("#ffffff"))
-                            .inert(),
-                    ),
+                    .shape(rune::Shape::new().stroke_with(
+                        orbit_arc(19.0, 19.0, 17.7),
+                        false,
+                        2.0,
+                        rune::LineCap::Round,
+                        ink("#ffffff"),
+                    ))
+                    .looping(rune::LoopSpec::rotation(1.2)),
+            )
+            .child(
+                rune::el()
+                    .size(16.0, 16.0)
+                    .inert()
+                    .shape(voice_icon(ink("#111113"))),
             );
     } else {
         button = button
@@ -921,12 +950,13 @@ pub struct ComposerButtons<S: 'static> {
 pub fn composer_card<S: 'static>(
     edit: &TextEdit,
     edit_of: std::rc::Rc<dyn for<'a> Fn(&'a mut S) -> &'a mut TextEdit>,
-    voice: crate::voice::VoiceMeter<'_>,
+    voice: crate::voice::VoiceMeter,
     running: bool,
     meta: ComposerMeta<'_>,
     buttons: ComposerButtons<S>,
 ) -> El {
     let voice_live = voice.live;
+    let voice_armed = voice.armed;
     let submit = {
         let on_send = buttons.send.clone();
         move |s: &mut S, _tx: &mut Tx| on_send(s)
@@ -946,6 +976,8 @@ pub fn composer_card<S: 'static>(
     .placeholder(
         if voice_live {
             "Listening…"
+        } else if voice_armed {
+            "Live mode on — talk from the island"
         } else if !meta.attachments.is_empty() {
             // PromptDock's deck note; the deck clears it after send.
             "Add a note about these files…"

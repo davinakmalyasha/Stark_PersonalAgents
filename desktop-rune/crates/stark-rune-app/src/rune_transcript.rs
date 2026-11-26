@@ -5752,8 +5752,24 @@ fn thread_composer<S: TranscriptHost + crate::settings::SettingsHost + 'static>(
         },
         super::composer::ComposerButtons {
             voice: std::rc::Rc::new(move |s: &mut S| {
-                let on = !s.thread_mut(which).voice.live;
-                s.thread_mut(which).voice.set_live(on);
+                // The dock only arms live mode (warms models, shows the
+                // island idle). Capture starts from the island's mic, or
+                // from Ctrl+Space while armed — never here. Web has no
+                // island, so its dock keeps the direct capture toggle.
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let bus = &mut s.thread_mut(which).voice;
+                    if bus.live {
+                        bus.stop_capture();
+                    } else {
+                        bus.start_capture();
+                    }
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let bus = &mut s.thread_mut(which).voice;
+                    bus.set_armed(!bus.armed && !bus.live);
+                }
             }),
             cancel: std::rc::Rc::new(move |s: &mut S| stage_abort(s.thread_mut(which))),
             local: std::rc::Rc::new(move |s: &mut S| {
@@ -6418,7 +6434,7 @@ pub fn voice_overlay<S: TranscriptHost + 'static>(s: &RuneTranscriptState, which
         .center()
         .modal(true, move |s: &mut S| {
             let t = s.thread_mut(which);
-            t.voice.set_live(false);
+            t.voice.stop_capture();
             t.voice.note = None;
         })
         .child(
@@ -6458,7 +6474,7 @@ pub fn voice_overlay<S: TranscriptHost + 'static>(s: &RuneTranscriptState, which
                                 .shape(crate::lucide_x(16.0, 2.0, ink("#8a8a93")))
                                 .on_press_enter(move |s: &mut S| {
                                     let t = s.thread_mut(which);
-                                    t.voice.set_live(false);
+                                    t.voice.stop_capture();
                                     t.voice.note = None;
                                 }),
                         ),
@@ -6494,7 +6510,7 @@ pub fn voice_overlay<S: TranscriptHost + 'static>(s: &RuneTranscriptState, which
                     .fill(ink("#ffffff"))
                     .on_press_enter(move |s: &mut S| {
                         let t = s.thread_mut(which);
-                        t.voice.set_live(false);
+                        t.voice.stop_capture();
                         t.voice.note = None;
                     }),
                 ),
@@ -7384,7 +7400,7 @@ mod tests {
     }
 
     #[test]
-    fn voice_toggle_flips_live_dot() {
+    fn voice_toggle_arms_without_capturing() {
         let env = Env::new(true, 2.0);
         let mut rt = Runtime::new(
             RuneTranscriptState::screenshot(),
@@ -7394,25 +7410,32 @@ mod tests {
         );
         rt.frame(0.0);
         assert!(!rt.state.voice.live);
+        assert!(!rt.state.voice.armed);
         let (x, y) = rt.find("composer-voice").unwrap();
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
         rt.frame(0.0);
-        // Outcome depends on hardware (mic vs none), so assert the invariant:
-        // either live capture staged, or an honest note explains why not.
-        // (No poll in `Runtime::new`, so nothing races the assertion.)
+        // The dock arms live mode deterministically on any hardware: models
+        // warm and the orbit renders, but the mic never opens here.
+        assert!(rt.state.voice.armed, "voice state: {:?}", rt.state.voice);
         assert!(
-            rt.state.voice.live || rt.state.voice.note.is_some(),
-            "voice state: {:?}",
+            !rt.state.voice.live,
+            "arming never captures: {:?}",
             rt.state.voice
         );
-        assert!(rt.find("composer-voice-dot").is_some());
-        let (x, y) = rt.find("composer-voice").unwrap();
-        rt.pointer_down(x, y);
-        rt.pointer_up(x, y);
-        rt.frame(0.0);
+        assert!(rt.find("composer-voice-arc").is_some(), "orbit renders");
+        let (x2, y2) = rt.find("composer-voice").unwrap();
+        rt.pointer_down(x2, y2);
+        rt.pointer_up(x2, y2);
+        for _ in 0..5 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(!rt.state.voice.armed);
         assert!(!rt.state.voice.live);
-        assert!(rt.state.voice.stop.is_none());
+        assert!(
+            rt.find("composer-voice-arc").is_none(),
+            "orbit leaves with live mode"
+        );
     }
 
     #[test]

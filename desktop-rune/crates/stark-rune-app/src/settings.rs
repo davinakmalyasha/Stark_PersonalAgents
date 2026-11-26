@@ -1114,15 +1114,15 @@ pub fn settings_sheet<S: SettingsHost + 'static>(s: &SettingsState, width: f32, 
     let mut live = section("settings-section-live")
         .child(section_head(
             "Stark Island",
-            crate::shell::icon_group(13.0, ink("#71717a")),
+            crate::shell::icon_live(13.0, ink("#71717a")),
         ))
         .child(paragraph(
-            "Live mode owns the speech models and the island. Press the mic (or Ctrl+Space) to load STT/TTS and show the island; toggle off to unload them and hide it.",
+            "Live mode warms the speech models and shows the island. The dock mic arms live mode; the mic in the island (or Ctrl+Space while armed) starts listening. Turning the dock off unloads the models and hides the island.",
         ))
         .child(toggle_row::<S>(
             "settings-island-toggle",
             "Show Stark Island in live mode",
-            "Off keeps the island hidden even while listening.",
+            "Off keeps the island hidden even while armed.",
             s.live.island,
             |s: &mut S, _tx: &mut rune::Tx| {
                 let next = !s.settings().live.island;
@@ -1150,7 +1150,7 @@ pub fn settings_sheet<S: SettingsHost + 'static>(s: &SettingsState, width: f32, 
             },
         ))
         .child(
-            text("Ctrl+Space toggles listening anywhere. Ctrl+Alt+S opens Stark.".to_string())
+            text("Ctrl+Space arms live mode, then toggles listening. Ctrl+Alt+S opens Stark.".to_string())
                 .w_full()
                 .wrap()
                 .font(text_style(10.5, 400.0))

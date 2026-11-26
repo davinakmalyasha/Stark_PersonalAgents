@@ -119,45 +119,27 @@ fn icon_home(size: f32, color: rune::Color) -> Shape {
     icon_shape(p, size, color)
 }
 
-pub(crate) fn icon_group(size: f32, color: rune::Color) -> Shape {
-    // Two bots side by side, same rounded-head shape as the empty Projects
-    // mark: antenna, ears, eyes. The rail reads as "agents", not "people".
-    let mut p = Path::new();
-    let head = |mut p: Path, x0: f32, y0: f32, x1: f32, y1: f32, r: f32| {
-        p = p.move_to([x0 + r, y0]);
-        p = p.line_to([x1 - r, y0]);
-        p = p.cubic_to([x1, y0], [x1, y0], [x1, y0 + r]);
-        p = p.line_to([x1, y1 - r]);
-        p = p.cubic_to([x1, y1], [x1, y1], [x1 - r, y1]);
-        p = p.line_to([x0 + r, y1]);
-        p = p.cubic_to([x0, y1], [x0, y1], [x0, y1 - r]);
-        p = p.line_to([x0, y0 + r]);
-        p = p.cubic_to([x0, y0], [x0, y0], [x0 + r, y0]);
-        p.close()
-    };
-
-    // Left bot.
-    p = p
-        .move_to([6.0, 8.6])
-        .line_to([6.0, 6.0])
-        .line_to([9.0, 6.0]);
-    p = head(p, 1.2, 8.6, 10.8, 18.6, 2.0);
-    p = p.move_to([2.4, 12.6]).line_to([1.0, 12.6]);
-    p = p.move_to([9.6, 12.6]).line_to([11.0, 12.6]);
-    p = p.move_to([4.2, 12.4]).line_to([4.2, 13.8]);
-    p = p.move_to([7.8, 12.4]).line_to([7.8, 13.8]);
-
-    // Right bot, mirrored.
-    p = p
-        .move_to([18.0, 8.6])
-        .line_to([18.0, 6.0])
-        .line_to([15.0, 6.0]);
-    p = head(p, 13.2, 8.6, 22.8, 18.6, 2.0);
-    p = p.move_to([14.4, 12.6]).line_to([13.0, 12.6]);
-    p = p.move_to([21.6, 12.6]).line_to([23.0, 12.6]);
-    p = p.move_to([16.2, 12.4]).line_to([16.2, 13.8]);
-    p = p.move_to([19.8, 12.4]).line_to([19.8, 13.8]);
-
+pub(crate) fn icon_live(size: f32, color: rune::Color) -> Shape {
+    // Live mark: three voice bars inside a rounded-square notch. One clean,
+    // modern glyph for the rail, the island and settings — no robot faces.
+    // Bars echo the island waveform, so dock → island → rail all rhyme.
+    let p = Path::new()
+        .move_to([8.0, 3.0])
+        .line_to([16.0, 3.0])
+        .cubic_to([19.3, 3.0], [21.0, 4.7], [21.0, 8.0])
+        .line_to([21.0, 16.0])
+        .cubic_to([21.0, 19.3], [19.3, 21.0], [16.0, 21.0])
+        .line_to([8.0, 21.0])
+        .cubic_to([4.7, 21.0], [3.0, 19.3], [3.0, 16.0])
+        .line_to([3.0, 8.0])
+        .cubic_to([3.0, 4.7], [4.7, 3.0], [8.0, 3.0])
+        .close()
+        .move_to([9.0, 10.0])
+        .line_to([9.0, 14.0])
+        .move_to([12.0, 7.5])
+        .line_to([12.0, 16.5])
+        .move_to([15.0, 10.0])
+        .line_to([15.0, 14.0]);
     icon_shape(p, size, color)
 }
 
@@ -230,7 +212,7 @@ fn icon_settings(size: f32, color: rune::Color) -> Shape {
 fn rail_icon(tab: RailTab, size: f32, color: rune::Color) -> Shape {
     match tab {
         RailTab::Chats => icon_home(size, color),
-        RailTab::Group => icon_group(size, color),
+        RailTab::Group => icon_live(size, color),
         RailTab::Cloud => icon_cloud(size, color),
         // Not in the reference UI's rail (single-page: chats, projects, cloud only);
         // mapped for completeness if a panel reuses the helper.
@@ -2112,12 +2094,6 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
         };
         tx.wake_after(std::time::Duration::from_millis(wait));
     }
-    if tick_voice_breathe(s) {
-        // `voice-breathe` is a 1.2 s scale/opacity keyframe. Rune has no
-        // infinite scale loop; publish it into the Live tracks at 60 Hz while
-        // a mic is live, then stop waking when the session ends.
-        tx.wake_after(std::time::Duration::from_millis(16));
-    }
     if let Some(at) = s.chats.ui_dirty_at {
         let left = (0.4 - (clock - at)).max(0.01);
         tx.wake_after(std::time::Duration::from_secs_f64(left));
@@ -2144,20 +2120,6 @@ fn trace_animating(s: &ShellState) -> bool {
     closing(&s.transcript)
         || closing(&s.personal)
         || s.canvas.sessions.threads.values().any(closing)
-}
-
-/// Publish the `voice-breathe` pose for every live voice bus. Clones share
-/// their `Live` sources, so ticking the transcript, personal, canvas and
-/// card-thread buses is cheap and consistent.
-fn tick_voice_breathe(s: &ShellState) -> bool {
-    let now = crate::clock::now_millis();
-    let mut live = s.transcript.voice.tick_breathe(now);
-    live |= s.personal.voice.tick_breathe(now);
-    live |= s.canvas.voice.tick_breathe(now);
-    for thread in s.canvas.sessions.threads.values() {
-        live |= thread.voice.tick_breathe(now);
-    }
-    live
 }
 
 /// Start uploads for browser-picked files. Fresh cards create their chat
@@ -2832,8 +2794,6 @@ fn apply_voice(s: &mut ShellState) {
     let thread = s.canvas.thread_mut(&id);
     thread.voice.live = true;
     thread.voice.level = 0.6;
-    thread.voice.breathe_start_ms = crate::clock::now_millis().saturating_sub(600);
-    let _ = thread.voice.tick_breathe(crate::clock::now_millis());
 }
 
 /// The exact Inter variable face the browser loads from Google Fonts.

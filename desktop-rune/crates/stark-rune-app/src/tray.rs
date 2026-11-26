@@ -35,6 +35,9 @@ fn tooltip(model: &IslandModel) -> String {
             IslandAttentionKind::Draft => "Stark — voice draft ready".to_string(),
         };
     }
+    if model.armed {
+        return "Stark — live mode on".to_string();
+    }
     match model.runs.len() {
         0 => "Stark — idle".to_string(),
         1 => "Stark — 1 agent running".to_string(),
@@ -49,8 +52,10 @@ fn menu(model: &IslandModel, prefs: &LivePrefs) -> Vec<TrayItem> {
             "listen",
             if model.listening {
                 "Stop listening"
-            } else {
+            } else if model.armed {
                 "Start listening"
+            } else {
+                "Turn live mode on"
             },
         ),
         TrayItem::Separator,
@@ -213,6 +218,9 @@ mod tests {
         assert!(tooltip(&m).contains("1 agent"));
         m.listening = true;
         assert!(tooltip(&m).contains("listening"));
+        m.listening = false;
+        m.armed = true;
+        assert!(tooltip(&m).contains("live mode on"));
     }
 
     #[test]
@@ -233,6 +241,31 @@ mod tests {
         assert!(labels
             .iter()
             .any(|label| label.contains("Show Stark Island")));
+        assert!(labels
+            .iter()
+            .any(|label| label.contains("Turn live mode on")));
+
+        // Armed: the tray offers capture; live: it offers stop.
+        let mut armed = model();
+        armed.armed = true;
+        let armed_labels: Vec<String> = menu(&armed, &prefs)
+            .into_iter()
+            .filter_map(|item| match item {
+                TrayItem::Action { label, .. } => Some(label),
+                _ => None,
+            })
+            .collect();
+        assert!(armed_labels.iter().any(|l| l == "Start listening"));
+        let mut live = model();
+        live.listening = true;
+        let live_labels: Vec<String> = menu(&live, &prefs)
+            .into_iter()
+            .filter_map(|item| match item {
+                TrayItem::Action { label, .. } => Some(label),
+                _ => None,
+            })
+            .collect();
+        assert!(live_labels.iter().any(|l| l == "Stop listening"));
         assert!(labels
             .iter()
             .any(|label| label.contains("Auto-send voice: on")));

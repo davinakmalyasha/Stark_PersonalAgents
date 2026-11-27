@@ -73,6 +73,8 @@ mod rune_canvas;
 #[cfg(feature = "rune-real")]
 mod rune_transcript;
 #[cfg(feature = "rune-real")]
+mod screen;
+#[cfg(feature = "rune-real")]
 mod settings;
 #[cfg(feature = "rune-real")]
 mod shell;
@@ -95,6 +97,8 @@ mod transport;
 #[cfg(all(feature = "rune-real", not(target_arch = "wasm32")))]
 #[path = "tray.rs"]
 mod tray;
+#[cfg(feature = "rune-real")]
+mod tts;
 #[cfg(feature = "rune-real")]
 mod updater;
 #[cfg(feature = "rune-real")]

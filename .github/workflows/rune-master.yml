@@ -175,7 +175,10 @@ jobs:
           cargo build --manifest-path desktop-rune/Cargo.toml --release \
             -p stark-rune-app -p stark-launcher \
             --features stark-rune-app/rune-real
-          cargo build --manifest-path backend-rs/Cargo.toml --release -p stark-server
+          # The desktop feed ships its own local server; enable the MSVC
+          # Moonshine backend so Dictate / Live capture works out of the box.
+          cargo build --manifest-path backend-rs/Cargo.toml --release \
+            -p stark-server --features voice-stt
 
       - name: Authenticode sign binaries (optional)
         if: ${{ env.WINDOWS_CERT_BASE64 != '' }}

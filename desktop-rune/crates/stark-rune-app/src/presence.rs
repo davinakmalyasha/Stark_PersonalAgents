@@ -7,7 +7,7 @@
 //! - publishes a small immutable [`IslandModel`] to the overlay;
 //! - keeps the tray menu/tooltip and close-to-tray behavior in sync.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 use rune::Tx;
@@ -15,13 +15,22 @@ use rune::Tx;
 use crate::cloud::CloudRun;
 use crate::island::{
     IslandAttention, IslandAttentionKind, IslandChat, IslandChatRow, IslandCommand, IslandKind,
-    IslandLink, IslandModel, IslandRun, IslandShelfItem, IslandTarget,
+    IslandLink, IslandModel, IslandRecent, IslandRecentKind, IslandRun, IslandScreenSource,
+    IslandShelfItem, IslandTarget, IslandVoiceMode,
 };
 use crate::projects::GroupProject;
 use crate::rune_transcript::{
     stage_abort, stage_send, stage_send_prompt_with_attachments, RuneTranscriptState,
 };
 use crate::shell::ShellState;
+
+#[derive(Clone)]
+struct RecentRun {
+    at_ms: u64,
+    target: IslandTarget,
+    title: String,
+    kind: IslandRecentKind,
+}
 
 /// Everything the native presence layer remembers between frames.
 #[derive(Clone, Default)]
@@ -50,6 +59,17 @@ pub struct PresenceState {
     /// reconcile step so one warm/release pair covers any number of arm
     /// toggles across threads.
     models_warm: bool,
+    /// Live settings for the one open island chat.
+    pub live_voice: IslandVoiceMode,
+    pub live_screen: bool,
+    /// Displays the Live menu can share.
+    pub screen_sources: Vec<IslandScreenSource>,
+    /// Finished runs for Overview's Recent card.
+    recent: VecDeque<RecentRun>,
+    /// Spoken replies for Live mode.
+    pub tts: crate::tts::TtsPlayer,
+    /// Background display capture for Live mode.
+    pub screen_share: crate::screen::ScreenShare,
 }
 
 impl std::fmt::Debug for PresenceState {
@@ -161,6 +181,13 @@ fn active_key(s: &ShellState) -> String {
     "main".to_string()
 }
 
+fn target_elapsed_secs(thread: &RuneTranscriptState, now_ms: f64) -> u64 {
+    let Some(start) = thread.run_started_ms else {
+        return 0;
+    };
+    ((now_ms - start).max(0.0) / 1000.0).floor() as u64
+}
+
 fn target_elapsed(thread: &RuneTranscriptState, now_ms: f64) -> String {
     let Some(start) = thread.run_started_ms else {
         // A run adopted from the server has no local start stamp. Empty is
@@ -228,6 +255,7 @@ fn collect_runs(s: &ShellState, now_ms: f64) -> Vec<IslandRun> {
             target,
             activity: activity_of(thread),
             elapsed: target_elapsed(thread, now_ms),
+            elapsed_secs: target_elapsed_secs(thread, now_ms),
             stoppable: true,
         });
     }
@@ -260,6 +288,7 @@ fn collect_runs(s: &ShellState, now_ms: f64) -> Vec<IslandRun> {
                     target,
                     activity: "Running on the VPS".to_string(),
                     elapsed: String::new(),
+                    elapsed_secs: 0,
                     stoppable: false,
                 });
             }
@@ -596,6 +625,11 @@ fn chat_snapshot(s: &ShellState, target: &IslandTarget) -> Option<IslandChat> {
         });
     }
     rows.reverse();
+    let live_here = s
+        .presence
+        .island_chat
+        .as_ref()
+        .is_some_and(|open| open.thread_key == target.thread_key);
     Some(IslandChat {
         target: target_for(s, &target.thread_key).unwrap_or_else(|| target.clone()),
         rows,
@@ -609,6 +643,23 @@ fn chat_snapshot(s: &ShellState, target: &IslandTarget) -> Option<IslandChat> {
         },
         draft: thread.edit.text.clone(),
         draft_rev: thread.voice.final_seq,
+        voice: if live_here {
+            s.presence.live_voice
+        } else {
+            IslandVoiceMode::Dictate
+        },
+        screen: live_here && s.presence.live_screen,
+        screen_source: if live_here {
+            s.presence.screen_share.source_id()
+        } else {
+            String::new()
+        },
+        screen_name: if live_here {
+            s.presence.screen_share.source_name()
+        } else {
+            String::new()
+        },
+        speaking: live_here && s.presence.tts.is_speaking(),
     })
 }
 
@@ -630,6 +681,19 @@ pub fn rekey_island_chat(s: &mut ShellState, old_key: &str, workspace: &str, cha
     }
     if let Some(target) = s.presence.island_focus.as_mut() {
         update(target);
+    }
+    // The screen worker keys frames by the chat's thread key. A draft chat
+    // that gets its real key must restart so the next turn can find its frame.
+    if s.presence.live_screen
+        && s.presence
+            .island_chat
+            .as_ref()
+            .is_some_and(|target| target.thread_key == new_key)
+    {
+        let source = s.presence.screen_share.source_id();
+        let host = crate::rune_transcript::DEFAULT_API_HOST;
+        let port = crate::rune_transcript::api_port();
+        let _ = s.presence.screen_share.start(host, port, &new_key, &source);
     }
 }
 
@@ -719,7 +783,11 @@ fn is_voice_attention(attention: &IslandAttention) -> bool {
     match attention.kind {
         IslandAttentionKind::Draft => true,
         IslandAttentionKind::Done => attention.title == "Voice sent",
-        IslandAttentionKind::Error => attention.title == "Microphone",
+        IslandAttentionKind::Error => {
+            attention.title == "Microphone"
+                || attention.title == "Screen"
+                || attention.title == "Voice"
+        }
         IslandAttentionKind::Question => false,
     }
 }
@@ -773,6 +841,32 @@ fn voice_view(s: &ShellState) -> VoiceView {
     }
 }
 
+fn relative_ago(now_ms: u64, at_ms: u64) -> String {
+    let secs = now_ms.saturating_sub(at_ms) / 1000;
+    if secs < 45 {
+        "now".to_string()
+    } else if secs < 3_600 {
+        format!("{}m", (secs / 60).max(1))
+    } else {
+        format!("{}h", secs / 3_600)
+    }
+}
+
+fn recent_for(s: &ShellState, now_ms: u64) -> Vec<IslandRecent> {
+    s.presence
+        .recent
+        .iter()
+        .rev()
+        .take(3)
+        .map(|run| IslandRecent {
+            target: run.target.clone(),
+            title: run.title.clone(),
+            kind: run.kind,
+            when: relative_ago(now_ms, run.at_ms),
+        })
+        .collect()
+}
+
 fn snapshot(s: &ShellState, now_ms: u64) -> IslandModel {
     let runs = collect_runs(s, crate::clock::monotonic_millis());
     let shelf = collect_shelf(s, crate::clock::monotonic_millis());
@@ -800,8 +894,11 @@ fn snapshot(s: &ShellState, now_ms: u64) -> IslandModel {
     // and questions stay on the tray, never the island.
     let voice_card = attention.as_ref().is_some_and(is_voice_attention);
     let armed = any_armed(s);
-    let live_now = voice.live || voice_card || armed;
-    let tick_step = if voice.live { 80 } else { 1000 };
+    let speaking = s.presence.tts.is_speaking();
+    let sharing = s.presence.screen_share.is_sharing();
+    let live_now = voice.live || voice_card || armed || speaking || sharing;
+    let tick_step = if voice.live || speaking { 80 } else { 1000 };
+    let needs = attention.is_some() as u64 + shelf.iter().map(|item| item.waiting).sum::<u64>();
     IslandModel {
         runs,
         shelf,
@@ -818,6 +915,9 @@ fn snapshot(s: &ShellState, now_ms: u64) -> IslandModel {
         attention,
         auto_send_voice: s.settings.live.auto_send_voice,
         island_enabled: s.settings.live.island,
+        screen_sources: s.presence.screen_sources.clone(),
+        recent: recent_for(s, now_ms),
+        needs,
         // Keep the waveform breathing while live and the draft card ticking
         // while it is up, without a second timer in the overlay.
         tick_ms: if live_now {
@@ -926,7 +1026,10 @@ fn disarm_all(s: &mut ShellState) {
 /// eagerly per bus (idempotent POSTs); this flag keeps the release side to
 /// the single moment the last bus goes quiet.
 fn reconcile_models(s: &mut ShellState) {
-    let need = any_armed(s) || any_live_voice(s);
+    let need = any_armed(s)
+        || any_live_voice(s)
+        || s.presence.live_voice == IslandVoiceMode::Live
+        || s.presence.tts.is_speaking();
     if need && !s.presence.models_warm {
         crate::voice::VoiceBus::ensure_warmed();
         s.presence.models_warm = true;
@@ -996,6 +1099,67 @@ fn update_live_tracking(s: &mut ShellState) {
     }
 }
 
+fn live_target(s: &ShellState) -> Option<IslandTarget> {
+    s.presence.island_chat.clone()
+}
+
+fn set_voice_mode(s: &mut ShellState, target: &IslandTarget, mode: IslandVoiceMode) {
+    s.presence.island_chat = Some(target.clone());
+    s.presence.live_voice = mode;
+    if mode == IslandVoiceMode::Live {
+        crate::voice::VoiceBus::ensure_warmed();
+    } else {
+        s.presence.tts.stop();
+    }
+    if mode == IslandVoiceMode::Off {
+        stop_all_voice(s);
+    }
+}
+
+fn stop_live(s: &mut ShellState, key: &str) {
+    if any_live_voice(s) {
+        stop_all_voice(s);
+    }
+    s.presence.tts.stop();
+    s.presence.screen_share.stop();
+    s.presence.live_screen = false;
+    s.presence.live_voice = IslandVoiceMode::Dictate;
+    let _ = key;
+}
+
+fn set_screen_share(s: &mut ShellState, target: &IslandTarget, on: bool, source: &str) {
+    s.presence.island_chat = Some(target.clone());
+    if !on {
+        s.presence.screen_share.stop();
+        s.presence.live_screen = false;
+        return;
+    }
+    let host = crate::rune_transcript::DEFAULT_API_HOST;
+    let port = crate::rune_transcript::api_port();
+    match s
+        .presence
+        .screen_share
+        .start(host, port, &target.thread_key, source)
+    {
+        Ok(_) => {
+            s.presence.live_screen = true;
+            if s.presence.screen_sources.is_empty() {
+                s.presence.screen_sources = crate::screen::list_sources();
+            }
+        }
+        Err(error) => {
+            s.presence.live_screen = false;
+            s.presence.toast = Some(IslandAttention {
+                kind: IslandAttentionKind::Error,
+                title: "Screen".to_string(),
+                body: error,
+                target: target.clone(),
+                expires_ms: crate::clock::now_millis() + 6_000,
+            });
+        }
+    }
+}
+
 fn handle_commands(s: &mut ShellState) -> bool {
     let Some(link) = s.presence.link.clone() else {
         return false;
@@ -1033,19 +1197,46 @@ fn handle_commands(s: &mut ShellState) -> bool {
                 if let Some(thread) = thread_mut(s, &key) {
                     thread.voice.note = None;
                 }
+                if s.presence.toast.as_ref().is_some_and(|toast| {
+                    toast.kind == IslandAttentionKind::Error && toast.target.thread_key == key
+                }) {
+                    s.presence.toast = None;
+                }
             }
             IslandCommand::WatchChat(target) => {
                 if ensure_island_thread(s, &target) {
+                    if s.presence
+                        .island_chat
+                        .as_ref()
+                        .map(|open| open.thread_key.as_str())
+                        != Some(target.thread_key.as_str())
+                    {
+                        stop_live(s, &target.thread_key);
+                        s.presence.live_voice = IslandVoiceMode::Dictate;
+                        s.presence.live_screen = false;
+                    }
                     s.presence.island_chat = Some(target);
                 }
             }
-            IslandCommand::UnwatchChat => s.presence.island_chat = None,
+            IslandCommand::UnwatchChat => {
+                if let Some(open) = live_target(s) {
+                    stop_live(s, &open.thread_key);
+                }
+                s.presence.island_chat = None;
+            }
             IslandCommand::SendPrompt { target, text } => {
                 if ensure_island_thread(s, &target) {
                     s.presence.island_chat = Some(target.clone());
+                    s.presence.tts.stop();
                     let key = target.thread_key.clone();
+                    let frame = if s.presence.live_screen {
+                        s.presence.screen_share.latest(&key)
+                    } else {
+                        None
+                    };
+                    let attachments = frame.into_iter().collect::<Vec<_>>();
                     if let Some(thread) = thread_mut(s, &key) {
-                        if stage_send_prompt_with_attachments(thread, text, Vec::new()) {
+                        if stage_send_prompt_with_attachments(thread, text, attachments) {
                             // The island owns the prompt lifecycle; leave no
                             // shell draft for the next publish to seed back
                             // into the overlay composer.
@@ -1065,6 +1256,7 @@ fn handle_commands(s: &mut ShellState) -> bool {
                 }
             }
             IslandCommand::NewChat => {
+                stop_live(s, "");
                 let id = s.canvas.new_session();
                 if let Some(target) = target_for(s, &id) {
                     s.presence.island_chat = Some(target.clone());
@@ -1090,7 +1282,26 @@ fn handle_commands(s: &mut ShellState) -> bool {
                 s.canvas.projects.group.open(host, port, id);
                 open_main(s);
             }
-            IslandCommand::ToggleVoice(key) => toggle_capture_on(s, &key),
+            IslandCommand::ToggleVoice(key) => {
+                if s.presence.live_voice == IslandVoiceMode::Off {
+                    s.presence.live_voice = IslandVoiceMode::Dictate;
+                }
+                if let Some(target) = target_for(s, &key) {
+                    s.presence.island_chat = Some(target);
+                }
+                s.presence.tts.stop();
+                toggle_capture_on(s, &key);
+            }
+            IslandCommand::SetVoiceMode { target, mode } => {
+                set_voice_mode(s, &target, mode);
+            }
+            IslandCommand::SetScreenShare { target, on, source } => {
+                set_screen_share(s, &target, on, &source);
+            }
+            IslandCommand::StopLive(key) => stop_live(s, &key),
+            IslandCommand::RefreshScreenSources => {
+                s.presence.screen_sources = crate::screen::list_sources();
+            }
             IslandCommand::FocusKeys => link.request_keys(),
             IslandCommand::SetActivatable(active) => link.set_activatable(active),
             IslandCommand::SetFullInput(all) => {
@@ -1112,11 +1323,36 @@ fn apply_finals(s: &mut ShellState, now_ms: u64, auto_send: bool) -> bool {
     }
     for event in events {
         s.presence.last_final.insert(event.key.clone(), event.seq);
+        let per_chat = s
+            .presence
+            .island_chat
+            .as_ref()
+            .is_some_and(|open| open.thread_key == event.target.thread_key);
+        let island_live = per_chat && s.presence.live_voice == IslandVoiceMode::Live;
+        let screen_here = per_chat && s.presence.live_screen;
+        let send_now = if per_chat { island_live } else { auto_send };
         let mut sent = false;
-        if auto_send {
+        if send_now {
+            let frame = if screen_here {
+                s.presence.screen_share.latest(&event.key)
+            } else {
+                None
+            };
             if let Some(thread) = thread_mut(s, &event.key) {
                 if !thread.live && !thread.aborting {
-                    sent = stage_send(thread);
+                    if let Some(frame) = frame {
+                        let text = thread.edit.text.trim().to_string();
+                        if !text.is_empty()
+                            && stage_send_prompt_with_attachments(thread, text, vec![frame])
+                        {
+                            thread.edit.text.clear();
+                            thread.edit.anchor = 0;
+                            thread.edit.focus = 0;
+                            sent = true;
+                        }
+                    } else {
+                        sent = stage_send(thread);
+                    }
                 }
             }
         }
@@ -1143,6 +1379,17 @@ fn apply_finals(s: &mut ShellState, now_ms: u64, auto_send: bool) -> bool {
     true
 }
 
+fn assistant_reply(s: &ShellState, key: &str) -> Option<String> {
+    let thread = thread_ref(s, key)?;
+    let row = thread.rows.iter().rev().find(|row| {
+        !row.body.trim().is_empty()
+            && !matches!(row.role, "user" | "system" | "error")
+            && !row.is_streaming
+    })?;
+    let body = compact_body(row);
+    (!body.trim().is_empty()).then_some(body)
+}
+
 fn apply_ended_runs(s: &mut ShellState, now_ms: u64) -> bool {
     let ended = collect_ended_runs(s);
     if ended.is_empty() {
@@ -1161,6 +1408,32 @@ fn apply_ended_runs(s: &mut ShellState, now_ms: u64) -> bool {
         } else {
             "Finished — open to review".to_string()
         };
+        s.presence.recent.push_back(RecentRun {
+            at_ms: now_ms,
+            target: run.target.clone(),
+            title: run.target.display().to_string(),
+            kind: if run.error {
+                IslandRecentKind::Error
+            } else if run.stopped {
+                IslandRecentKind::Stopped
+            } else {
+                IslandRecentKind::Done
+            },
+        });
+        while s.presence.recent.len() > 8 {
+            s.presence.recent.pop_front();
+        }
+        let live_here = s
+            .presence
+            .island_chat
+            .as_ref()
+            .is_some_and(|open| open.thread_key == run.target.thread_key)
+            && s.presence.live_voice == IslandVoiceMode::Live;
+        if live_here && !run.error && !run.stopped {
+            if let Some(reply) = assistant_reply(s, &run.target.thread_key) {
+                s.presence.tts.speak(&reply);
+            }
+        }
         s.presence.toast = Some(IslandAttention {
             kind,
             title: if run.error {
@@ -1204,8 +1477,10 @@ fn apply_requests(s: &mut ShellState) -> bool {
 /// armed, while voice is live, or while a voice card (draft/error) is up.
 /// Agent runs and questions stay on the tray, never the island.
 fn island_desired(prefs_island: bool, model: &IslandModel) -> bool {
-    let live_now =
-        model.armed || model.listening || model.attention.as_ref().is_some_and(is_voice_attention);
+    let live_now = model.armed
+        || model.listening
+        || model.chat.is_some()
+        || model.attention.as_ref().is_some_and(is_voice_attention);
     prefs_island && live_now
 }
 
@@ -1220,7 +1495,9 @@ fn publish(s: &mut ShellState, model: &IslandModel) {
             }
             s.presence.island_visible = Some(desired);
         }
-        let exclude = s.settings.live.exclude_from_capture;
+        // A shared screen should not feed the island back to the agent. Keep
+        // the user's preference when idle; force exclusion while sharing.
+        let exclude = s.settings.live.exclude_from_capture || s.presence.screen_share.is_sharing();
         if s.presence.capture_excluded != Some(exclude) {
             link.set_capture_exclusion(exclude);
             s.presence.capture_excluded = Some(exclude);
@@ -1238,6 +1515,16 @@ pub fn tick(s: &mut ShellState, _clock: f64, tx: &mut Tx) -> bool {
     let auto_send = s.settings.live.auto_send_voice;
     changed |= apply_finals(s, now_ms, auto_send);
     changed |= apply_ended_runs(s, now_ms);
+    if let Some(note) = s.presence.tts.take_note() {
+        s.presence.toast = Some(IslandAttention {
+            kind: IslandAttentionKind::Error,
+            title: "Voice".to_string(),
+            body: note,
+            target: active_target(s),
+            expires_ms: now_ms + 6_000,
+        });
+        changed = true;
+    }
     update_live_tracking(s);
     reconcile_models(s);
 
@@ -1254,8 +1541,9 @@ pub fn tick(s: &mut ShellState, _clock: f64, tx: &mut Tx) -> bool {
     publish(s, &model);
     let island_up =
         model.armed || model.listening || model.attention.as_ref().is_some_and(is_voice_attention);
-    if model.listening {
-        // Keep the mic bars alive even between level packets.
+    if model.listening || s.presence.tts.is_speaking() {
+        // Keep the mic bars and the spoken-reply equalizer alive even between
+        // level packets.
         tx.wake_after(Duration::from_millis(80));
     }
     if island_up && (!model.runs.is_empty() || model.attention.is_some() || model.armed) {
@@ -1271,6 +1559,9 @@ pub fn tick(s: &mut ShellState, _clock: f64, tx: &mut Tx) -> bool {
 /// models stay warm. Quitting disarms (see `on_quit`).
 pub fn on_close(s: &mut ShellState, tx: &mut Tx) {
     stop_all_voice(s);
+    s.presence.tts.stop();
+    s.presence.screen_share.stop();
+    s.presence.live_screen = false;
     // Close hides; agents keep working. Tell the user once per session where
     // the app went, without opening a modal over the hidden window.
     if !s.presence.close_hint_shown {
@@ -1293,6 +1584,8 @@ pub fn on_close(s: &mut ShellState, tx: &mut Tx) {
 /// bus and release the models, then persist the island choices — an idle
 /// app holds no speech memory. Run state is left to the server's shutdown.
 pub fn on_quit(s: &mut ShellState, _tx: &mut Tx) {
+    s.presence.tts.stop();
+    s.presence.screen_share.stop();
     disarm_all(s);
     crate::prefs::save(&s.settings.live);
 }
@@ -1452,6 +1745,7 @@ mod tests {
             target: target.clone(),
             activity: "Working".to_string(),
             elapsed: "0:01".to_string(),
+            elapsed_secs: 1,
             stoppable: true,
         });
         assert!(

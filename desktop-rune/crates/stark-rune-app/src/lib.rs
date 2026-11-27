@@ -71,6 +71,9 @@ pub mod rune_canvas;
 #[cfg(feature = "rune-real")]
 #[path = "rune_transcript.rs"]
 pub mod rune_transcript;
+#[cfg(all(feature = "rune-real", not(target_arch = "wasm32")))]
+#[path = "screen.rs"]
+pub mod screen;
 #[cfg(feature = "rune-real")]
 #[path = "settings.rs"]
 pub mod settings;
@@ -104,6 +107,9 @@ pub mod transport;
 #[cfg(all(feature = "rune-real", not(target_arch = "wasm32")))]
 #[path = "tray.rs"]
 pub mod tray;
+#[cfg(all(feature = "rune-real", not(target_arch = "wasm32")))]
+#[path = "tts.rs"]
+pub mod tts;
 #[cfg(feature = "rune-real")]
 #[path = "updater.rs"]
 pub mod updater;

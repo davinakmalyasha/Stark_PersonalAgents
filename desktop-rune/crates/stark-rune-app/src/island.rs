@@ -20,8 +20,8 @@ use crate::shell::ShellState;
 
 /// The native overlay is larger than any state it draws: the pill grows into
 /// it without a native resize, and the clear area stays click-through. The
-/// chat surface sets the width ceiling (552) and Live / chat share the height
-/// ceiling (480), plus breathing room.
+/// chat surface sets the width ceiling (552) and Overview / chat share the
+/// height ceiling (480), plus breathing room.
 pub const ISLAND_WINDOW: (f32, f32) = (620.0, 560.0);
 
 const SHELF_W: f32 = 456.0;
@@ -29,11 +29,12 @@ const CHAT_W: f32 = 552.0;
 /// Compact on purpose: a scanner + composer, not a full-page chat. Longer
 /// transcripts scroll inside the body.
 const CHAT_H: f32 = 480.0;
-/// Live is a chat with a voice stage. It shares the chat's height ceiling so
-/// neither surface reaches down into the app's prompt dock.
-const LIVE_H: f32 = 480.0;
+/// Overview shares the chat's height ceiling so switching panes never resizes
+/// the notch vertically.
+const OVERVIEW_H: f32 = 480.0;
 const MODE_RAIL_W: f32 = 158.0;
-const MODE_TAB_W: f32 = 76.0;
+const MODE_TAB_W: f32 = 70.0;
+const OVERVIEW_TAB_W: f32 = 82.0;
 
 const HAIRLINE: &str = "#ffffff14";
 const TEXT: &str = "#f4f4f5";
@@ -41,7 +42,6 @@ const MUTED: &str = "#8a8a93";
 const RED: &str = "#f87171";
 const SPRING: rune::Spring = rune::Spring::new(0.36, 0.16);
 const MODE_PILL: rune::Spring = rune::Spring::new(0.38, 0.22);
-const ORB_FLIGHT: rune::Spring = rune::Spring::new(0.46, 0.12);
 
 fn ink(hex: &'static str) -> rune::Color {
     rune::color::hex(hex).unwrap_or(rune::Color::BLACK)
@@ -78,6 +78,9 @@ pub struct IslandRun {
     pub target: IslandTarget,
     pub activity: String,
     pub elapsed: String,
+    /// Machine-readable duration for the Overview time card. Adopted cloud
+    /// runs have no local start stamp and report `0`.
+    pub elapsed_secs: u64,
     /// A local run can be stopped from the island; a cloud run only opens.
     pub stoppable: bool,
 }
@@ -91,13 +94,64 @@ pub enum IslandKind {
     Cloud,
 }
 
-/// The expanded island has two rooms. Live is the voice-first chat surface;
-/// Work is the activity shelf. Live is the default whenever the island opens.
+/// The expanded island has two rooms. Overview is the glanceable dashboard;
+/// Work is the activity shelf. Overview is the default on every fresh open.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum IslandPane {
     #[default]
-    Live,
+    Overview,
     Work,
+}
+
+/// Voice behaviour for one open chat. `Dictate` keeps speech editable;
+/// `Live` sends it and speaks the answer back. `Off` leaves the chat typed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IslandVoiceMode {
+    Off,
+    #[default]
+    Dictate,
+    Live,
+}
+
+impl IslandVoiceMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Dictate => "Dictate",
+            Self::Live => "Live",
+        }
+    }
+
+    pub fn speaks(self) -> bool {
+        self == Self::Live
+    }
+}
+
+/// One display the overlay can share. Windows are intentionally out of scope
+/// for the compact menu; the primary display is the default.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IslandScreenSource {
+    pub id: String,
+    pub name: String,
+    pub primary: bool,
+}
+
+/// One finished run in the Overview's Recent card.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IslandRecentKind {
+    Done,
+    Stopped,
+    Error,
+}
+
+/// A compact completed-run row. `when` is rendered by the shell so the
+/// overlay never needs a second clock.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IslandRecent {
+    pub target: IslandTarget,
+    pub title: String,
+    pub kind: IslandRecentKind,
+    pub when: String,
 }
 
 /// One row in the activity shelf or in the add menu's existing list. The
@@ -142,6 +196,13 @@ pub struct IslandChat {
     /// Bumped when a finished utterance replaces that draft, so the overlay
     /// can pick up a voice final while its chat is open.
     pub draft_rev: u64,
+    /// Per-chat Live settings. They survive pointer moves while the chat is
+    /// open and reset when the chat is left.
+    pub voice: IslandVoiceMode,
+    pub screen: bool,
+    pub screen_source: String,
+    pub screen_name: String,
+    pub speaking: bool,
 }
 
 /// A pending question, a finished/failed run, or a voice draft.
@@ -191,6 +252,12 @@ pub struct IslandModel {
     pub attention: Option<IslandAttention>,
     pub auto_send_voice: bool,
     pub island_enabled: bool,
+    /// Displays the Live menu can share.
+    pub screen_sources: Vec<IslandScreenSource>,
+    /// Last few completed runs for Overview.
+    pub recent: Vec<IslandRecent>,
+    /// Actionable items waiting on the user (questions, approvals, errors).
+    pub needs: u64,
     /// A coarse wall-clock bucket while listening or running, so the overlay
     /// keeps repainting its waveform/elapsed label without a separate clock.
     pub tick_ms: u64,
@@ -214,6 +281,9 @@ impl Default for IslandModel {
             attention: None,
             auto_send_voice: false,
             island_enabled: true,
+            screen_sources: Vec::new(),
+            recent: Vec::new(),
+            needs: 0,
             tick_ms: 0,
         }
     }
@@ -244,8 +314,25 @@ pub enum IslandCommand {
     NewCloudTask,
     OpenProject(String),
     OpenCloud,
-    /// Start/stop capture on a specific thread (the overlay's mic).
+    /// Start/stop capture on a specific thread (the overlay's mic or Live
+    /// button). The shell uses the chat's selected voice mode for auto-send
+    /// and spoken replies.
     ToggleVoice(String),
+    /// Set Dictate / Live / Off for the open chat. Applies immediately.
+    SetVoiceMode {
+        target: IslandTarget,
+        mode: IslandVoiceMode,
+    },
+    /// Start or stop screen sharing for the open chat.
+    SetScreenShare {
+        target: IslandTarget,
+        on: bool,
+        source: String,
+    },
+    /// Stop capture, speech and screen sharing for one chat.
+    StopLive(String),
+    /// Ask the shell to enumerate displays for the Live menu.
+    RefreshScreenSources,
     /// Ask the platform for keyboard focus (macOS panels / layer shells).
     FocusKeys,
     /// Windows overlays are click-through and never activate by default. The
@@ -308,37 +395,40 @@ pub enum AddMenu {
     Existing(IslandKind),
 }
 
+/// The Live split-button's anchored menu. `Sources` replaces the options with
+/// the display list, with a back row to return.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LiveMenu {
+    #[default]
+    Closed,
+    Options,
+    Sources,
+}
+
 /// The overlay's own state. Hover is intentionally local so pointer travel
 /// never rebuilds the whole shell.
 pub struct IslandState {
     pub shared: Arc<IslandShared>,
     pub hovered: bool,
     pub collapse_at: Option<f64>,
-    /// Live | Work. Every fresh expansion starts on Live.
+    /// Overview | Work. Every fresh expansion starts on Overview.
     pub pane: IslandPane,
     /// The chat surface is open and pinned: a pointer leave must not collapse
     /// it while the user reads or types.
     pub open_chat: Option<IslandTarget>,
-    /// Live's watched chat. The shell publishes its compact transcript while
-    /// the Live surface is visible.
-    pub live_target: Option<IslandTarget>,
-    /// Live stays open after an interaction (typing, sending, speaking), so a
-    /// pointer leave does not pull the surface out from under the user.
-    pub live_pinned: bool,
-    /// Keyboard activation is on while Live is visible and off in Work. The
-    /// style itself does not activate the window; the click does.
+    /// Keyboard activation is on while a chat is visible. The style itself
+    /// does not activate the window; the click does.
     keys_on: bool,
     /// A compact attention card is a direct-action surface. If one appeared
     /// while the island was collapsed, hover must not grow the pane and move
     /// its Send/Dismiss button.
     attention_hold: bool,
     seen_attention: Option<IslandAttention>,
-    /// Recently opened chats, newest last (capped at three). Tabs let the
-    /// overlay switch between concurrent work without going back to the list.
-    pub tabs: Vec<IslandTarget>,
     /// One composer draft per open chat.
     pub composers: HashMap<String, TextEdit>,
     pub add_menu: AddMenu,
+    /// The Live split-button's menu (options or display picker).
+    pub live_menu: LiveMenu,
     seen_revision: u64,
     seen_focus: u64,
     /// Shell draft already seeded into a chat composer (never overwrite what
@@ -354,16 +444,14 @@ impl IslandState {
             shared,
             hovered: false,
             collapse_at: None,
-            pane: IslandPane::Live,
+            pane: IslandPane::Overview,
             open_chat: None,
-            live_target: None,
-            live_pinned: false,
             keys_on: false,
             attention_hold: false,
             seen_attention: None,
-            tabs: Vec::new(),
             composers: HashMap::new(),
             add_menu: AddMenu::Closed,
+            live_menu: LiveMenu::Closed,
             seen_revision: 0,
             seen_focus: 0,
             seeded_draft: None,
@@ -376,100 +464,46 @@ impl IslandState {
         self.composers.entry(key.to_string()).or_default()
     }
 
-    /// Bind Live to the active thread immediately, before the next poll. The
-    /// first click on the dock always has a target to send or speak to.
-    pub fn bind_live(&mut self) {
-        if self.open_chat.is_some() {
-            return;
-        }
-        let Ok(model) = self.shared.model.lock() else {
-            return;
-        };
-        let target = model.target.clone();
-        if self
-            .live_target
-            .as_ref()
-            .is_some_and(|live| live.thread_key == target.thread_key)
-        {
-            return;
-        }
-        self.live_target = Some(target.clone());
-        self.shared.push(IslandCommand::WatchChat(target));
-        self.seeded_draft = None;
-        self.seen_draft_rev = None;
-        self.last_chat_draft.clear();
-    }
-
-    /// The mode rail. Entering Live never starts capture; leaving Live always
-    /// stops it. Work drops the watched chat and keyboard activation because
-    /// it is a pointer-only shelf.
-    pub fn set_pane(&mut self, pane: IslandPane, listening: bool) {
+    /// The mode rail. Both rooms are pointer surfaces; neither starts capture.
+    /// A chat owns activation and its own Live state.
+    pub fn set_pane(&mut self, pane: IslandPane, _listening: bool) {
         if self.pane == pane {
             return;
         }
         self.pane = pane;
         self.add_menu = AddMenu::Closed;
-        if pane == IslandPane::Live {
-            self.bind_live();
-        } else if pane == IslandPane::Work {
-            self.live_pinned = false;
-            if listening {
-                self.shared.push(IslandCommand::StopListen);
-            }
-            if self.open_chat.is_none() && self.live_target.take().is_some() {
-                self.shared.push(IslandCommand::UnwatchChat);
-            }
+        self.live_menu = LiveMenu::Closed;
+        if self.open_chat.is_none() {
+            self.shared.push(IslandCommand::UnwatchChat);
             self.set_keys(false);
         }
     }
 
-    /// Live is a chat surface: sending typed text and speaking both pin it.
-    pub fn send_live(&mut self, running: bool) {
-        let Some(target) = self.live_target.clone() else {
-            return;
-        };
-        self.live_pinned = true;
-        if running {
-            self.shared.push(IslandCommand::StopRun(target.thread_key));
-            return;
-        }
-        let text = self
-            .composers
-            .get(&target.thread_key)
-            .map(|edit| edit.text.trim().to_string())
-            .unwrap_or_default();
-        if text.is_empty() {
-            return;
-        }
-        if let Some(edit) = self.composers.get_mut(&target.thread_key) {
-            edit.text.clear();
-            edit.anchor = 0;
-            edit.focus = 0;
-        }
-        self.shared.push(IslandCommand::SendPrompt { target, text });
-    }
-
-    /// Close Live back to the compact island. Like the chat surface's X, this
-    /// stops a running capture first so closing never leaves a hot mic.
-    pub fn close_live(&mut self, listening: bool) {
+    /// Close the island back to its compact mark. This never leaves a hot mic
+    /// or a shared display behind.
+    pub fn close_island(&mut self, listening: bool) {
         if listening {
             self.shared.push(IslandCommand::StopListen);
         }
-        self.live_pinned = false;
-        self.pane = IslandPane::Live;
+        if let Some(open) = self.open_chat.clone() {
+            self.shared
+                .push(IslandCommand::StopLive(open.thread_key.clone()));
+        }
+        self.pane = IslandPane::Overview;
         self.hovered = false;
         self.collapse_at = None;
         self.add_menu = AddMenu::Closed;
-        if self.open_chat.is_none() {
-            self.live_target = None;
-            self.shared.push(IslandCommand::UnwatchChat);
+        self.live_menu = LiveMenu::Closed;
+        if self.open_chat.take().is_some() {
+            self.shared.push(IslandCommand::SetFullInput(false));
         }
+        self.shared.push(IslandCommand::UnwatchChat);
         self.set_keys(false);
     }
 
     /// Keep the window style in step with the visible surface. The style alone
     /// never steals focus: the next click activates the overlay, which is what
-    /// lets the Live prompt dock take keys.
+    /// lets the prompt dock take keys.
     pub fn set_keys(&mut self, on: bool) {
         if self.keys_on == on {
             return;
@@ -481,22 +515,10 @@ impl IslandState {
     /// Open a chat and pin the surface. Watching is a shell round-trip: the
     /// next model publish carries that thread's compact transcript.
     pub fn enter_chat(&mut self, target: IslandTarget) {
-        if !self
-            .tabs
-            .iter()
-            .any(|tab| tab.thread_key == target.thread_key)
-        {
-            self.tabs.push(target.clone());
-            // Three concurrent chats is the compact surface's honest limit.
-            if self.tabs.len() > 3 {
-                self.tabs.remove(0);
-            }
-        }
         self.pane = IslandPane::Work;
         self.open_chat = Some(target.clone());
-        self.live_target = None;
-        self.live_pinned = false;
         self.add_menu = AddMenu::Closed;
+        self.live_menu = LiveMenu::Closed;
         self.composer(&target.thread_key);
         self.seeded_draft = None;
         self.seen_draft_rev = None;
@@ -511,27 +533,19 @@ impl IslandState {
     }
 
     pub fn leave_chat(&mut self) {
+        if let Some(open) = self.open_chat.clone() {
+            self.shared
+                .push(IslandCommand::StopLive(open.thread_key.clone()));
+        }
         self.open_chat = None;
         self.add_menu = AddMenu::Closed;
+        self.live_menu = LiveMenu::Closed;
         self.seeded_draft = None;
         self.seen_draft_rev = None;
         self.shared.push(IslandCommand::UnwatchChat);
         self.shared.push(IslandCommand::SetActivatable(false));
         self.shared.push(IslandCommand::SetFullInput(false));
         self.keys_on = false;
-    }
-
-    pub fn switch_chat(&mut self, target: IslandTarget) {
-        if self.open_chat.as_ref().map(|open| &open.thread_key) == Some(&target.thread_key) {
-            return;
-        }
-        self.open_chat = Some(target.clone());
-        self.composer(&target.thread_key);
-        self.seeded_draft = None;
-        self.seen_draft_rev = None;
-        self.last_chat_draft.clear();
-        self.shared.push(IslandCommand::WatchChat(target));
-        self.shared.push(IslandCommand::FocusKeys);
     }
 
     fn send_chat(&mut self, running: bool) {
@@ -638,32 +652,12 @@ pub fn island_poll(s: &mut IslandState, _clock: f64, tx: &mut Tx) -> bool {
     }
     // Compact attention cards must not grow under the pointer: that would
     // move their Send/Dismiss button between press and release. An attention
-    // that arrives while the pane is actually open is different — the pane
-    // keeps it inline (Live) or in the shelf (Work).
+    // that arrives while the pane is actually open is different — Work keeps
+    // it in the shelf and Overview counts it.
     if s.seen_attention.as_ref() != model.attention.as_ref() {
-        let was_expanded =
-            s.open_chat.is_some() || s.live_pinned || (s.hovered && !s.attention_hold);
+        let was_expanded = s.open_chat.is_some() || (s.hovered && !s.attention_hold);
         s.attention_hold = model.attention.is_some() && !was_expanded;
         s.seen_attention = model.attention.clone();
-        changed = true;
-    }
-    // Arming owns the island. Once the dock is off and no capture is live,
-    // a pinned Live surface is no longer something the user is looking at.
-    if !model.armed && !model.listening && s.open_chat.is_none() && s.live_pinned {
-        s.live_pinned = false;
-        changed = true;
-    }
-    // Capture that starts outside Live keeps the compact listening card until
-    // the pointer opens the surface; once the Live surface has been seen
-    // during a capture, it stays pinned so the orb is not pulled away.
-    if model.listening
-        && s.open_chat.is_none()
-        && s.pane == IslandPane::Live
-        && s.hovered
-        && !s.attention_hold
-        && !s.live_pinned
-    {
-        s.live_pinned = true;
         changed = true;
     }
     // A new chat created from the add menu comes back as a focus target.
@@ -676,16 +670,9 @@ pub fn island_poll(s: &mut IslandState, _clock: f64, tx: &mut Tx) -> bool {
     }
     // A fresh chat gets its real server key after the first send. The shell
     // republishes the watched chat under that key; adopt it and carry the
-    // tab + draft across so the overlay never drops the conversation.
+    // composer across so the overlay never drops the conversation.
     if let (Some(open), Some(chat)) = (s.open_chat.clone(), model.chat.as_ref()) {
         if chat.target.thread_key != open.thread_key {
-            if let Some(tab) = s
-                .tabs
-                .iter_mut()
-                .find(|tab| tab.thread_key == open.thread_key)
-            {
-                *tab = chat.target.clone();
-            }
             if let Some(edit) = s.composers.remove(&open.thread_key) {
                 s.composers
                     .entry(chat.target.thread_key.clone())
@@ -698,86 +685,18 @@ pub fn island_poll(s: &mut IslandState, _clock: f64, tx: &mut Tx) -> bool {
             changed = true;
         }
     }
-    // A chat's title follows its first message. Keep the header and its tab
-    // reading the live title instead of the draft-time "New Chat".
+    // A chat's title follows its first message. Keep the header reading the
+    // live title instead of the draft-time "New Chat".
     if let (Some(open), Some(chat)) = (s.open_chat.as_mut(), model.chat.as_ref()) {
         if chat.target.thread_key == open.thread_key && chat.target.title != open.title {
             *open = chat.target.clone();
-            if let Some(tab) = s
-                .tabs
-                .iter_mut()
-                .find(|tab| tab.thread_key == chat.target.thread_key)
-            {
-                *tab = chat.target.clone();
-            }
             changed = true;
         }
-    }
-    // Live is the default room and owns one watched chat: the active thread.
-    // Work is a shelf, so it releases the watch and the keyboard activation.
-    let live_visible = s.open_chat.is_none()
-        && s.pane == IslandPane::Live
-        && (s.hovered || s.live_pinned)
-        && !(model.attention.is_some() && s.attention_hold);
-    if s.open_chat.is_none() {
-        if live_visible {
-            let target = model.target.clone();
-            let bind = s.live_target.is_none()
-                || (!s.live_pinned
-                    && s.live_target
-                        .as_ref()
-                        .is_some_and(|live| live.thread_key != target.thread_key));
-            if bind {
-                s.live_target = Some(target.clone());
-                s.shared.push(IslandCommand::WatchChat(target));
-                s.seeded_draft = None;
-                s.seen_draft_rev = None;
-                s.last_chat_draft.clear();
-                changed = true;
-            }
-            // A chat's title follows its first message, exactly as it does in
-            // the full chat surface.
-            if let (Some(live), Some(chat)) = (s.live_target.as_mut(), model.chat.as_ref()) {
-                if chat.target.thread_key == live.thread_key && chat.target.title != live.title {
-                    *live = chat.target.clone();
-                    changed = true;
-                }
-            }
-            // A fresh chat gets its real server key after the first send. The
-            // chat surface adopts that rekey; Live must carry its composer and
-            // watched target across too, or the first Live message would land
-            // in a thread the surface no longer recognises.
-            if s.live_pinned {
-                if let (Some(live), Some(chat)) = (s.live_target.clone(), model.chat.as_ref()) {
-                    if chat.target.thread_key != live.thread_key {
-                        let new = chat.target.clone();
-                        if let Some(edit) = s.composers.remove(&live.thread_key) {
-                            s.composers.entry(new.thread_key.clone()).or_insert(edit);
-                        }
-                        s.live_target = Some(new);
-                        s.seeded_draft = None;
-                        s.seen_draft_rev = None;
-                        s.last_chat_draft.clear();
-                        changed = true;
-                    }
-                }
-            }
-        } else if s.live_target.take().is_some() {
-            s.shared.push(IslandCommand::UnwatchChat);
-            changed = true;
-        }
-        s.set_keys(live_visible);
     }
 
     // Seed the overlay composer with the shell thread's draft once per open,
     // then follow voice finals that replace that draft while the surface is up.
-    let surface = s.open_chat.clone().or_else(|| {
-        if live_visible {
-            s.live_target.clone()
-        } else {
-            None
-        }
-    });
+    let surface = s.open_chat.clone();
     if let Some(surface) = surface {
         if let Some(chat) = model
             .chat
@@ -848,6 +767,10 @@ fn island_key(s: &mut IslandState, key: &rune::KeyEvent, _tx: &mut Tx) -> bool {
     if key.key != rune::Key::Escape {
         return false;
     }
+    if s.live_menu != LiveMenu::Closed {
+        s.live_menu = LiveMenu::Closed;
+        return true;
+    }
     if s.add_menu != AddMenu::Closed {
         s.add_menu = AddMenu::Closed;
         return true;
@@ -856,7 +779,7 @@ fn island_key(s: &mut IslandState, key: &rune::KeyEvent, _tx: &mut Tx) -> bool {
         s.leave_chat();
         return true;
     }
-    if s.pane == IslandPane::Live && (s.live_pinned || s.hovered) {
+    if s.hovered {
         let listening = s
             .shared
             .model
@@ -867,7 +790,7 @@ fn island_key(s: &mut IslandState, key: &rune::KeyEvent, _tx: &mut Tx) -> bool {
             s.shared.push(IslandCommand::StopListen);
             return true;
         }
-        s.close_live(false);
+        s.close_island(false);
         return true;
     }
     false
@@ -875,11 +798,10 @@ fn island_key(s: &mut IslandState, key: &rune::KeyEvent, _tx: &mut Tx) -> bool {
 
 fn hover_handler(s: &mut IslandState, inside: bool, tx: &mut Tx) {
     if inside {
-        // Every fresh expansion begins in Live. The user can still switch to
-        // Work while the pane stays open.
+        // Every fresh expansion begins on Overview. Work selection lasts only
+        // while the pane stays open.
         if !s.hovered && s.open_chat.is_none() {
-            s.pane = IslandPane::Live;
-            s.bind_live();
+            s.pane = IslandPane::Overview;
         }
         s.hovered = true;
         s.collapse_at = None;
@@ -1473,9 +1395,8 @@ fn attention_shelf_row(attention: &IslandAttention) -> El {
     row
 }
 
-/// The old `1 active` line is now the mode chooser itself: Live and Work,
-/// nothing else. The active chip is a frosted lozenge that flies between the
-/// two labels on a matched spring.
+/// The mode chooser: Overview and Work, nothing else. The active chip is a
+/// frosted lozenge that flies between the two labels on a matched spring.
 fn mode_header(s: &IslandState, model: &IslandModel) -> El {
     let listening = model.listening;
     let mut head = row()
@@ -1497,22 +1418,24 @@ fn mode_header(s: &IslandState, model: &IslandModel) -> El {
                 .border(1.0, ink("#ffffff12"))
                 .border_layout()
                 .child(mode_tab(
-                    "island-mode-live",
-                    "Live",
-                    s.pane == IslandPane::Live,
-                    mode_live_glyph(
+                    "island-mode-overview",
+                    "Overview",
+                    OVERVIEW_TAB_W,
+                    s.pane == IslandPane::Overview,
+                    mode_overview_glyph(
                         11.0,
-                        ink(if s.pane == IslandPane::Live {
+                        ink(if s.pane == IslandPane::Overview {
                             TEXT
                         } else {
                             "#7d7d87"
                         }),
                     ),
-                    move |s| s.set_pane(IslandPane::Live, listening),
+                    move |s| s.set_pane(IslandPane::Overview, listening),
                 ))
                 .child(mode_tab(
                     "island-mode-work",
                     "Work",
+                    MODE_TAB_W,
                     s.pane == IslandPane::Work,
                     mode_work_glyph(
                         11.0,
@@ -1526,15 +1449,24 @@ fn mode_header(s: &IslandState, model: &IslandModel) -> El {
                 )),
         )
         .child(rune::el().grow(1.0));
-    if s.pane == IslandPane::Live {
-        head = head.child(icon_button(
-            "island-live-close",
-            "Close live",
-            30.0,
-            ink("#232328"),
-            x_glyph(13.0, ink(MUTED)),
-            move |s| s.close_live(listening),
-        ));
+    if s.pane == IslandPane::Overview {
+        head = head
+            .child(icon_button(
+                "island-overview-work",
+                "Open Work",
+                26.0,
+                rgba(1.0, 1.0, 1.0, 0.0),
+                chevron_right_glyph(14.0, ink(MUTED)),
+                move |s| s.set_pane(IslandPane::Work, listening),
+            ))
+            .child(icon_button(
+                "island-overview-close",
+                "Close island",
+                26.0,
+                rgba(1.0, 1.0, 1.0, 0.0),
+                x_glyph(13.0, ink(MUTED)),
+                move |s| s.close_island(listening),
+            ));
     } else {
         // The add control floats above this corner; reserve its hit area.
         head = head.child(rune::el().size(30.0, 30.0).inert());
@@ -1545,6 +1477,7 @@ fn mode_header(s: &IslandState, model: &IslandModel) -> El {
 fn mode_tab(
     key: &str,
     label: &str,
+    width: f32,
     active: bool,
     glyph: El,
     press: impl Fn(&mut IslandState) + 'static,
@@ -1554,7 +1487,7 @@ fn mode_tab(
         .role("button")
         .focusable(true)
         .label(format!("{label} mode"))
-        .w(MODE_TAB_W)
+        .w(width)
         .h(24.0)
         .radius(7.0)
         .items_center()
@@ -1585,19 +1518,22 @@ fn mode_tab(
     )
 }
 
-fn mode_live_glyph(size: f32, color: rune::Color) -> El {
-    let mut glyph = row()
-        .key("island-mode-live-glyph")
-        .w(size)
-        .h(size)
-        .items_center()
-        .justify_center()
-        .gap(1.5)
-        .inert();
-    for h in [5.0, 9.0, 6.5] {
-        glyph = glyph.child(el().w(1.8).h(h).radius(0.9).fill(color));
-    }
-    glyph
+fn mode_overview_glyph(size: f32, color: rune::Color) -> El {
+    el().key("island-mode-overview-glyph")
+        .size(size, size)
+        .inert()
+        .shape(crate::icons::lucide(
+            &["M22 12h-4l-3 9L9 3l-3 9H2"],
+            size,
+            2.0,
+            color,
+        ))
+}
+
+fn chevron_right_glyph(size: f32, color: rune::Color) -> El {
+    el().size(size, size)
+        .inert()
+        .shape(crate::icons::lucide(&["m9 18 6-6-6-6"], size, 2.0, color))
 }
 
 fn mode_work_glyph(size: f32, color: rune::Color) -> El {
@@ -2169,68 +2105,6 @@ fn add_scrim() -> El {
         .on_press(|s: &mut IslandState| s.add_menu = AddMenu::Closed)
 }
 
-fn tab_row(s: &IslandState) -> El {
-    let mut tabs = row()
-        .key("island-chat-tabs")
-        .w_full()
-        .h(30.0)
-        .px(12.0)
-        .pb(3.0)
-        .gap(5.0)
-        .border_sides([0.0, 0.0, 1.0, 0.0], ink(HAIRLINE))
-        .border_layout();
-    for tab in &s.tabs {
-        let target = tab.clone();
-        let active = s
-            .open_chat
-            .as_ref()
-            .is_some_and(|open| open.thread_key == tab.thread_key);
-        let mut chip = row()
-            .key(format!("island-chat-tab-{}", tab.thread_key))
-            .role("button")
-            .focusable(true)
-            .label(format!("Switch to {}", tab.display()))
-            .h(22.0)
-            .max_w(158.0)
-            .px(8.0)
-            .items_center()
-            .gap(5.0)
-            .radius(6.0)
-            .fill(if active {
-                rgba(1.0, 1.0, 1.0, 0.10)
-            } else {
-                rgba(1.0, 1.0, 1.0, 0.0)
-            })
-            .border(
-                1.0,
-                if active {
-                    rgba(1.0, 1.0, 1.0, 0.16)
-                } else {
-                    rgba(1.0, 1.0, 1.0, 0.07)
-                },
-            )
-            .border_layout()
-            .hover(rgba(1.0, 1.0, 1.0, 0.08))
-            .on_press(move |s: &mut IslandState| s.switch_chat(target.clone()))
-            .child(
-                text(tab.display().to_string())
-                    .grow(1.0)
-                    .min_w(0.0)
-                    .truncate()
-                    .font(rune::tok::TextStyle::new(
-                        10.0,
-                        if active { 600.0 } else { 400.0 },
-                    ))
-                    .color(ink(if active { TEXT } else { MUTED })),
-            );
-        if active {
-            chip = chip.child(pulse_dot(4.0, ink(TEXT), false));
-        }
-        tabs = tabs.child(chip);
-    }
-    tabs
-}
-
 fn chat_bubble(item: &IslandChatRow) -> El {
     if item.role == "event" {
         return row()
@@ -2330,59 +2204,533 @@ fn chat_bubble(item: &IslandChatRow) -> El {
     line
 }
 
-fn chat_mic_button(model: &IslandModel, target: &IslandTarget) -> El {
+fn audio_lines_glyph(size: f32, color: rune::Color) -> El {
+    el().size(size, size)
+        .inert()
+        .shape(crate::lucide_audio_lines(size, color))
+}
+
+fn monitor_glyph(size: f32, color: rune::Color) -> El {
+    el().size(size, size).inert().shape(crate::icons::lucide(
+        &["M2 3h20v14H2z", "M8 21h8", "M12 17v4"],
+        size,
+        2.0,
+        color,
+    ))
+}
+
+fn chevron_down_glyph(size: f32, color: rune::Color) -> El {
+    el().size(size, size)
+        .inert()
+        .shape(crate::icons::lucide(&["m6 9 6 6 6-6"], size, 2.0, color))
+}
+
+fn live_bars(size: f32, color: rune::Color, animate: bool) -> El {
+    let mut bars = row().h(size).items_center().gap(1.7).inert();
+    const BAR_H: [f32; 5] = [5.0, 9.0, 13.0, 8.0, 11.0];
+    for (i, h) in BAR_H.iter().enumerate() {
+        let factor = size / 13.0;
+        let mut bar = el()
+            .size(1.7 * factor, *h * factor)
+            .radius(0.9 * factor)
+            .fill(color);
+        if animate {
+            bar = bar.looping(rune::LoopSpec::opacity(1.2, i as f64 * 0.13, 0.35, 1.0));
+        }
+        bars = bars.child(bar.inert());
+    }
+    bars
+}
+
+/// The Live split control: press the left pill to start/stop capture, press
+/// the small chevron for voice mode and screen settings.
+fn chat_live_controls(model: &IslandModel, target: &IslandTarget, menu: LiveMenu) -> El {
+    let chat = model
+        .chat
+        .as_ref()
+        .filter(|chat| chat.target.thread_key == target.thread_key);
+    let voice = chat.map(|chat| chat.voice).unwrap_or_default();
+    let screen = chat.is_some_and(|chat| chat.screen);
+    let speaking = chat.is_some_and(|chat| chat.speaking);
     let listening = model.listening && model.voice_thread == target.thread_key;
+    let active = listening || speaking;
+    let ink_color = if active { "#0b0b0d" } else { TEXT };
     let key = target.thread_key.clone();
-    let mut button = el()
-        .key("island-chat-mic")
+    let mut main = row()
+        .key("island-chat-live")
         .role("button")
         .focusable(true)
         .label(if listening {
             "Stop listening"
+        } else if speaking {
+            "Interrupt the spoken reply"
         } else {
             "Start listening"
         })
-        .size(30.0, 30.0)
+        .h(30.0)
+        .w(88.0)
+        .px(9.0)
+        .items_center()
+        .justify_center()
+        .gap(5.0)
         .radius(15.0)
-        .center()
-        .fill(if listening {
+        .fill(if active {
             ink("#ffffff")
         } else {
             ink("#232328")
         })
         .border(
             1.0,
-            if listening {
+            if active {
                 ink("#ffffff")
             } else {
                 ink("#ffffff1f")
             },
         )
-        .hover(if listening {
+        .hover(if active {
             ink("#ffffff")
         } else {
             ink("#2d2d34")
         })
         .on_press(move |s: &mut IslandState| {
+            s.live_menu = LiveMenu::Closed;
             s.shared.push(IslandCommand::ToggleVoice(key.clone()));
         });
-    if listening {
-        let mut bars = row().h(13.0).items_center().gap(1.8).inert();
-        const BAR_H: [f32; 5] = [5.0, 9.0, 13.0, 8.0, 11.0];
-        for (i, h) in BAR_H.iter().enumerate() {
-            bars = bars.child(
-                el().size(1.8, *h)
-                    .radius(0.9)
-                    .fill(ink("#111113"))
-                    .looping(rune::LoopSpec::opacity(1.2, i as f64 * 0.13, 0.35, 1.0))
-                    .inert(),
-            );
-        }
-        button = button.child(bars);
+    if listening || speaking {
+        main = main.child(live_bars(13.0, ink(ink_color), true));
     } else {
-        button = button.child(mic_glyph(13.0, ink(TEXT)));
+        main = main.child(audio_lines_glyph(12.0, ink(ink_color)));
     }
-    button
+    main = main.child(
+        text(voice.label().to_string())
+            .font(rune::tok::TextStyle::new(9.5, 650.0))
+            .color(ink(ink_color)),
+    );
+    if screen {
+        main = main.child(monitor_glyph(9.0, ink(ink_color)));
+    }
+
+    let arrow = el()
+        .key("island-chat-live-arrow")
+        .role("button")
+        .focusable(true)
+        .label("Live settings")
+        .size(22.0, 30.0)
+        .radius(11.0)
+        .center()
+        .fill(if menu == LiveMenu::Closed {
+            ink("#232328")
+        } else {
+            ink("#303038")
+        })
+        .border(1.0, ink("#ffffff1f"))
+        .hover(ink("#2d2d34"))
+        .on_press(move |s: &mut IslandState| {
+            if s.live_menu == LiveMenu::Closed {
+                s.live_menu = LiveMenu::Options;
+                if s.shared
+                    .model
+                    .lock()
+                    .is_ok_and(|m| m.screen_sources.is_empty())
+                {
+                    s.shared.push(IslandCommand::RefreshScreenSources);
+                }
+            } else {
+                s.live_menu = LiveMenu::Closed;
+            }
+        })
+        .child(chevron_down_glyph(11.0, ink(MUTED)));
+
+    row().items_center().gap(4.0).child(main).child(arrow)
+}
+
+fn live_voice_option(key: &str, mode: IslandVoiceMode, active: bool, target: &IslandTarget) -> El {
+    let target = target.clone();
+    el().key(format!("island-chat-live-voice-{key}"))
+        .role("button")
+        .focusable(true)
+        .label(format!("{} voice mode", mode.label()))
+        .h(27.0)
+        .grow(1.0)
+        .radius(7.0)
+        .center()
+        .fill(if active {
+            ink("#f4f4f5")
+        } else {
+            rgba(1.0, 1.0, 1.0, 0.04)
+        })
+        .border(
+            1.0,
+            if active {
+                ink("#ffffff")
+            } else {
+                ink("#ffffff10")
+            },
+        )
+        .hover(rgba(1.0, 1.0, 1.0, 0.09))
+        .on_press(move |s: &mut IslandState| {
+            s.shared.push(IslandCommand::SetVoiceMode {
+                target: target.clone(),
+                mode,
+            });
+        })
+        .child(
+            text(mode.label().to_string())
+                .font(rune::tok::TextStyle::new(9.5, 600.0))
+                .color(ink(if active { "#0b0b0d" } else { "#b4b4bc" })),
+        )
+}
+
+fn live_screen_switch(on: bool, target: &IslandTarget, source: String) -> El {
+    let target = target.clone();
+    let mut switch = el()
+        .key("island-chat-live-screen")
+        .role("button")
+        .focusable(true)
+        .label(if on {
+            "Stop sharing screen"
+        } else {
+            "Share screen"
+        })
+        .w(34.0)
+        .h(19.0)
+        .radius(9.5)
+        .px(2.0)
+        .items_center()
+        .fill(if on {
+            ink("#f4f4f5")
+        } else {
+            rgba(1.0, 1.0, 1.0, 0.12)
+        })
+        .border(1.0, rgba(1.0, 1.0, 1.0, 0.12))
+        .on_press(move |s: &mut IslandState| {
+            s.shared.push(IslandCommand::SetScreenShare {
+                target: target.clone(),
+                on: !on,
+                source: source.clone(),
+            });
+        })
+        .child(el().size(15.0, 15.0).radius(7.5).fill(if on {
+            ink("#0b0b0d")
+        } else {
+            ink("#e4e4e7")
+        }));
+    switch = if on {
+        switch.justify_end()
+    } else {
+        switch.justify_start()
+    };
+    switch
+}
+
+fn live_sources_panel(_s: &IslandState, model: &IslandModel, target: &IslandTarget) -> El {
+    let active_source = model
+        .chat
+        .as_ref()
+        .filter(|chat| chat.target.thread_key == target.thread_key)
+        .map(|chat| chat.screen_source.clone())
+        .unwrap_or_default();
+    let mut panel = col()
+        .key("island-chat-live-menu")
+        .anchored_fit(
+            "island-chat-live-arrow",
+            rune::Side::Top,
+            rune::Align::End,
+            8.0,
+        )
+        .anchored_round()
+        .w(250.0)
+        .gap(6.0)
+        .radius(12.0)
+        .fill(ink("#17171b"))
+        .border(1.0, ink("#ffffff1f"))
+        .px(9.0)
+        .py(9.0)
+        .transition(crate::motion::menu_enter())
+        .modal(true, |s: &mut IslandState| s.live_menu = LiveMenu::Closed)
+        .child(
+            row()
+                .w_full()
+                .h(24.0)
+                .items_center()
+                .gap(4.0)
+                .child(icon_button(
+                    "island-chat-live-sources-back",
+                    "Back to Live settings",
+                    22.0,
+                    rgba(1.0, 1.0, 1.0, 0.0),
+                    back_glyph(12.0, ink(MUTED)),
+                    |s| s.live_menu = LiveMenu::Options,
+                ))
+                .child(
+                    text("Share screen".to_string())
+                        .font(rune::tok::TextStyle::new(11.5, 650.0))
+                        .color(ink(TEXT)),
+                ),
+        );
+    if model.screen_sources.is_empty() {
+        panel = panel.child(
+            row()
+                .w_full()
+                .h(38.0)
+                .items_center()
+                .gap(7.0)
+                .px(4.0)
+                .child(pulse_dot(4.0, ink(MUTED), true))
+                .child(tiny_label(
+                    "island-chat-live-sources-empty",
+                    "Looking for displays…",
+                    10.0,
+                    400.0,
+                    ink(MUTED),
+                )),
+        );
+    } else {
+        for source in &model.screen_sources {
+            let source_id = source.id.clone();
+            let source_name = source.name.clone();
+            let target = target.clone();
+            let active = source.id == active_source;
+            let mut row = row()
+                .key(format!("island-chat-live-source-{}", source.id))
+                .w_full()
+                .h(34.0)
+                .px(7.0)
+                .items_center()
+                .gap(7.0)
+                .radius(7.0)
+                .hover(rgba(1.0, 1.0, 1.0, 0.08))
+                .role("button")
+                .focusable(true)
+                .label(format!("Share {}", source.name))
+                .on_press(move |s: &mut IslandState| {
+                    s.shared.push(IslandCommand::SetScreenShare {
+                        target: target.clone(),
+                        on: true,
+                        source: source_id.clone(),
+                    });
+                    s.live_menu = LiveMenu::Closed;
+                })
+                .child(monitor_glyph(12.0, ink(if active { TEXT } else { MUTED })))
+                .child(
+                    text(source_name)
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .truncate()
+                        .font(rune::tok::TextStyle::new(10.0, 500.0))
+                        .color(ink(TEXT)),
+                );
+            if source.primary {
+                row = row.child(tiny_label(
+                    "island-chat-live-source-primary",
+                    "Primary",
+                    8.5,
+                    500.0,
+                    ink(MUTED),
+                ));
+            }
+            if active {
+                row = row.child(check_glyph(10.0, ink(TEXT)));
+            }
+            panel = panel.child(row);
+        }
+    }
+    panel
+}
+
+fn live_menu_panel(s: &IslandState, model: &IslandModel, target: &IslandTarget) -> El {
+    if s.live_menu == LiveMenu::Sources {
+        return live_sources_panel(s, model, target);
+    }
+    let chat = model
+        .chat
+        .as_ref()
+        .filter(|chat| chat.target.thread_key == target.thread_key);
+    let voice = chat.map(|chat| chat.voice).unwrap_or_default();
+    let screen = chat.is_some_and(|chat| chat.screen);
+    let speaking = chat.is_some_and(|chat| chat.speaking);
+    let listening = model.listening && model.voice_thread == target.thread_key;
+    let source_name = chat
+        .map(|chat| chat.screen_name.clone())
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| {
+            model
+                .screen_sources
+                .iter()
+                .find(|source| source.primary)
+                .map(|source| source.name.clone())
+        })
+        .unwrap_or_else(|| "Primary display".to_string());
+    let source_id = chat
+        .map(|chat| chat.screen_source.clone())
+        .unwrap_or_default();
+    let screen_target = target.clone();
+    let end_target = target.clone();
+    let show_end = listening || speaking || screen;
+    let mut panel = col()
+        .key("island-chat-live-menu")
+        .anchored_fit(
+            "island-chat-live-arrow",
+            rune::Side::Top,
+            rune::Align::End,
+            8.0,
+        )
+        .anchored_round()
+        .w(250.0)
+        .gap(7.0)
+        .radius(12.0)
+        .fill(ink("#17171b"))
+        .border(1.0, ink("#ffffff1f"))
+        .px(9.0)
+        .py(9.0)
+        .transition(crate::motion::menu_enter())
+        .modal(true, |s: &mut IslandState| s.live_menu = LiveMenu::Closed)
+        .child(
+            row()
+                .w_full()
+                .items_center()
+                .gap(6.0)
+                .child(
+                    text("Live".to_string())
+                        .font(rune::tok::TextStyle::new(11.5, 650.0))
+                        .color(ink(TEXT)),
+                )
+                .child(pulse_dot(
+                    4.5,
+                    ink(if listening || speaking {
+                        TEXT
+                    } else {
+                        "#5a5a62"
+                    }),
+                    listening || speaking,
+                ))
+                .child(rune::el().grow(1.0))
+                .child(tiny_label(
+                    "island-chat-live-state",
+                    if listening {
+                        "Listening"
+                    } else if speaking {
+                        "Speaking"
+                    } else if screen {
+                        "Sharing"
+                    } else {
+                        "Ready"
+                    },
+                    9.0,
+                    400.0,
+                    ink(MUTED),
+                )),
+        )
+        .child(
+            text("VOICE".to_string())
+                .font(rune::tok::TextStyle::new(8.0, 600.0))
+                .color(ink("#777782")),
+        )
+        .child(
+            row()
+                .w_full()
+                .gap(4.0)
+                .child(live_voice_option(
+                    "off",
+                    IslandVoiceMode::Off,
+                    voice == IslandVoiceMode::Off,
+                    target,
+                ))
+                .child(live_voice_option(
+                    "dictate",
+                    IslandVoiceMode::Dictate,
+                    voice == IslandVoiceMode::Dictate,
+                    target,
+                ))
+                .child(live_voice_option(
+                    "live",
+                    IslandVoiceMode::Live,
+                    voice == IslandVoiceMode::Live,
+                    target,
+                )),
+        )
+        .child(
+            row()
+                .key("island-chat-live-screen-row")
+                .w_full()
+                .h(30.0)
+                .items_center()
+                .gap(7.0)
+                .child(monitor_glyph(12.0, ink(if screen { TEXT } else { MUTED })))
+                .child(
+                    text("Share screen".to_string())
+                        .grow(1.0)
+                        .font(rune::tok::TextStyle::new(10.0, 500.0))
+                        .color(ink(TEXT)),
+                )
+                .child(live_screen_switch(screen, &screen_target, source_id)),
+        );
+    if screen {
+        panel = panel.child(
+            el().key("island-chat-live-source-row")
+                .role("button")
+                .focusable(true)
+                .label("Choose a display to share")
+                .w_full()
+                .h(28.0)
+                .px(7.0)
+                .items_center()
+                .radius(7.0)
+                .hover(rgba(1.0, 1.0, 1.0, 0.08))
+                .on_press(move |s: &mut IslandState| {
+                    s.live_menu = LiveMenu::Sources;
+                    s.shared.push(IslandCommand::RefreshScreenSources);
+                })
+                .child(
+                    text(source_name)
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .truncate()
+                        .font(rune::tok::TextStyle::new(9.5, 400.0))
+                        .color(ink("#a1a1aa")),
+                )
+                .child(chevron_right_glyph(10.0, ink(MUTED))),
+        );
+    }
+    panel = panel.child(
+        text(if voice.speaks() {
+            "Sends when you stop; replies are spoken."
+        } else if voice == IslandVoiceMode::Dictate {
+            "Speech becomes an editable draft."
+        } else {
+            "Voice is off; typing only."
+        })
+        .w_full()
+        .font(rune::tok::TextStyle::new(8.5, 400.0))
+        .color(ink("#777782")),
+    );
+    if show_end {
+        panel = panel.child(
+            row()
+                .key("island-chat-live-end")
+                .role("button")
+                .focusable(true)
+                .label("End live")
+                .w_full()
+                .h(28.0)
+                .items_center()
+                .justify_center()
+                .radius(7.0)
+                .fill(rgba(1.0, 1.0, 1.0, 0.06))
+                .hover(rgba(1.0, 1.0, 1.0, 0.10))
+                .on_press(move |s: &mut IslandState| {
+                    s.shared
+                        .push(IslandCommand::StopLive(end_target.thread_key.clone()));
+                    s.live_menu = LiveMenu::Closed;
+                })
+                .child(
+                    text("End live".to_string())
+                        .font(rune::tok::TextStyle::new(9.5, 600.0))
+                        .color(ink(TEXT)),
+                ),
+        );
+    }
+    panel
 }
 
 fn chat_surface(s: &IslandState, model: &IslandModel, target: &IslandTarget) -> El {
@@ -2502,8 +2850,11 @@ fn chat_surface(s: &IslandState, model: &IslandModel, target: &IslandTarget) -> 
     let submit_key = key.clone();
     let empty = TextEdit::new("");
     let edit = s.composers.get(&key).unwrap_or(&empty);
+    let speaking = chat.is_some_and(|chat| chat.speaking);
     let placeholder = if model.listening && model.voice_thread == key {
         "Listening…".to_string()
+    } else if speaking {
+        "Stark is speaking…".to_string()
     } else if title.chars().count() <= 20 {
         format!("Message {title}")
     } else {
@@ -2516,8 +2867,6 @@ fn chat_surface(s: &IslandState, model: &IslandModel, target: &IslandTarget) -> 
     })
     .key("island-chat-input")
     .w_full()
-    .min_h(34.0)
-    .max_h(68.0)
     .pt(2.0)
     .pb(2.0)
     .placeholder(placeholder, ink("#74747d"))
@@ -2571,16 +2920,16 @@ fn chat_surface(s: &IslandState, model: &IslandModel, target: &IslandTarget) -> 
     let mut composer = col()
         .key("island-chat-composer")
         .w_full()
-        .gap(5.0)
+        .gap(4.0)
         .px(12.0)
-        .pt(8.0)
-        .pb(10.0)
+        .pt(7.0)
+        .pb(9.0)
         .border_sides([1.0, 0.0, 0.0, 0.0], ink(HAIRLINE))
         .border_layout();
     if let Some(attention) = &model.attention {
-        let microphone = attention.title == "Microphone";
+        let live_error = matches!(attention.title.as_str(), "Microphone" | "Voice" | "Screen");
         let mine = attention.target.thread_key.is_empty() || attention.target.thread_key == key;
-        if microphone && mine {
+        if live_error && mine {
             let note_key = attention.target.thread_key.clone();
             composer = composer.child(
                 row()
@@ -2634,32 +2983,29 @@ fn chat_surface(s: &IslandState, model: &IslandModel, target: &IslandTarget) -> 
                 ),
         );
     }
-    composer = composer.child(input).child(
+    composer = composer.child(
         row()
+            .key("island-chat-dock-row")
             .w_full()
-            .items_center()
-            .gap(8.0)
-            .child(chat_mic_button(model, target))
-            .child(rune::el().grow(1.0))
+            .items_end()
+            .gap(7.0)
             .child(
-                text(if running {
-                    "Working".to_string()
-                } else if has_text {
-                    "Enter to send".to_string()
-                } else {
-                    "Shift+Enter for a new line".to_string()
-                })
-                .font(rune::tok::TextStyle::new(9.0, 400.0))
-                .color(ink("#66666f")),
+                row()
+                    .key("island-chat-input-wrap")
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .child(rune::auto_grow(input, 1, 3).min_h(34.0).max_h(68.0)),
             )
+            .child(chat_live_controls(model, target, s.live_menu))
             .child(send),
     );
 
     let mut pill = col().key("island-chat").w_full().h_full().child(head);
-    if s.tabs.len() > 1 {
-        pill = pill.child(tab_row(s));
+    pill = pill.child(body).child(composer);
+    if s.live_menu != LiveMenu::Closed {
+        pill = pill.child(live_menu_panel(s, model, target));
     }
-    pill.child(body).child(composer)
+    pill
 }
 
 fn listening_body(model: &IslandModel) -> El {
@@ -2699,454 +3045,378 @@ fn listening_body(model: &IslandModel) -> El {
 /// like a normal chat: conversation when there is one, the hero when empty,
 /// and the prompt dock underneath. With the mic on the surface clears to the
 /// orb and the live transcript.
-fn live_surface(s: &IslandState, model: &IslandModel) -> El {
-    let target = s
-        .live_target
-        .clone()
-        .unwrap_or_else(|| model.target.clone());
-    let mut surface = col().key("island-live").w_full().grow(1.0).min_h(0.0);
-    if model.listening {
-        surface = surface
-            .child(live_listening(model, &target).transition(rune::Transition::blur_replace()));
+fn overview_value(secs: u64) -> String {
+    if secs == 0 {
+        return "—".to_string();
+    }
+    let mins = secs / 60;
+    let hours = mins / 60;
+    if hours > 0 {
+        format!("{hours}h {:02}m", mins % 60)
     } else {
-        surface = surface
-            .child(live_idle(s, model, &target).transition(rune::Transition::blur_replace()));
+        format!("{}:{:02}", mins, secs % 60)
     }
-    surface
 }
 
-fn live_idle(s: &IslandState, model: &IslandModel, target: &IslandTarget) -> El {
-    let chat = model
-        .chat
-        .as_ref()
-        .filter(|chat| chat.target.thread_key == target.thread_key);
-    let running = chat.is_some_and(|chat| chat.live);
-    let body = match chat {
-        Some(chat) if !chat.rows.is_empty() => live_chat_body(chat),
-        _ => live_hero(model, target, chat),
-    };
+fn overview_card(key: &str, label: &str, glyph: El) -> El {
     col()
-        .key("island-live-idle")
-        .w_full()
+        .key(key.to_string())
         .grow(1.0)
-        .min_h(0.0)
-        .child(body)
-        .child(live_composer(s, model, target, running))
-}
-
-fn live_chat_body(chat: &IslandChat) -> El {
-    let mut body = col()
-        .key("island-live-chat-body")
-        .w_full()
-        .grow(1.0)
-        .min_h(0.0)
-        .gap(9.0)
+        .h(201.0)
+        .min_w(0.0)
+        .gap(5.0)
+        .radius(14.0)
+        .fill(rgba(1.0, 1.0, 1.0, 0.025))
+        .border(1.0, ink("#ffffff10"))
+        .border_layout()
         .px(14.0)
-        .py(10.0)
-        .scroll(rune::ScrollSpec { stick_bottom: true });
-    for row in &chat.rows {
-        body = body.child(chat_bubble(row));
-    }
-    body
-}
-
-fn live_hero(model: &IslandModel, target: &IslandTarget, chat: Option<&IslandChat>) -> El {
-    let running = chat.is_some_and(|chat| chat.live);
-    let mut hero = col()
-        .key("island-live-hero")
-        .w_full()
-        .grow(1.0)
-        .min_h(0.0)
-        .items_center()
-        .justify_center()
-        .gap(3.0)
-        .child(live_orb_stage(model, target, 84.0, false))
+        .py(13.0)
         .child(
-            text("The mic is yours, Boss".to_string())
-                .key("island-live-title")
-                .truncate()
-                .max_w(380.0)
-                .font(rune::tok::TextStyle::new(24.5, 500.0))
-                .color(ink(TEXT)),
-        );
-    hero = if running {
-        hero.child(
             row()
+                .w_full()
                 .items_center()
                 .gap(6.0)
-                .child(pulse_dot(4.5, ink(TEXT), true))
-                .child(tiny_label(
-                    "island-live-subtitle",
-                    "Stark is working…",
-                    10.5,
-                    400.0,
-                    ink(MUTED),
-                )),
-        )
-    } else {
-        hero.child(tiny_label(
-            "island-live-subtitle",
-            "Tap the orb to speak.",
-            11.0,
-            400.0,
-            ink(MUTED),
-        ))
-    };
-    hero
-}
-
-fn live_listening(model: &IslandModel, target: &IslandTarget) -> El {
-    let spoken = model.voice_text.trim().to_string();
-    let mut slot = col()
-        .key("island-live-transcript")
-        .w(380.0)
-        .h(66.0)
-        .items_center()
-        .justify_center();
-    if !spoken.is_empty() {
-        slot = slot.child(
-            text(spoken)
-                .max_w(360.0)
-                .max_lines(3)
-                .font(rune::tok::TextStyle::new(13.5, 400.0))
-                .color(ink("#e4e4e7")),
-        );
-    }
-    col()
-        .key("island-live-listening")
-        .w_full()
-        .grow(1.0)
-        .min_h(0.0)
-        .items_center()
-        .justify_center()
-        .gap(4.0)
-        .child(live_orb_stage(model, target, 120.0, true))
-        .child(slot)
-}
-
-/// The five-bar mark inside the white disc. Unlike the wide compact waveform,
-/// this one keeps a clear resting silhouette and grows with the mic level.
-fn live_orb_bars(model: &IslandModel, size: f32, color: rune::Color) -> El {
-    let amount = if model.listening {
-        model.level.clamp(0.0, 1.0).max(0.22)
-    } else {
-        0.0
-    };
-    let now = model.tick_ms as f32 / 1000.0;
-    const BASE: [f32; 5] = [0.24, 0.42, 0.62, 0.36, 0.52];
-    let mut bars = row()
-        .key("island-live-orb-bars")
-        .h(size * 0.52)
-        .items_center()
-        .justify_center()
-        .gap(size * 0.034)
-        .inert();
-    for (i, base) in BASE.iter().enumerate() {
-        let phase = (now * 6.0 + i as f32 * 1.1).sin() * 0.5 + 0.5;
-        let h = size * (base * 0.64 + amount * 0.52 * (0.5 + 0.5 * phase)).clamp(0.09, 0.72);
-        bars = bars.child(
-            el().key(format!("island-live-orb-bar-{i}"))
-                .w(size * 0.046)
-                .h(h)
-                .radius(size * 0.023)
-                .fill(color)
-                .looping(rune::LoopSpec::opacity(1.3, i as f64 * 0.1, 0.62, 1.0))
-                .inert(),
-        );
-    }
-    bars
-}
-
-/// The dock's white disc, enlarged. Its matched id lets it fly from the hero
-/// position into the centre of the listening stage and back.
-fn live_orb_stage(model: &IslandModel, target: &IslandTarget, size: f32, listening: bool) -> El {
-    let key = target.thread_key.clone();
-    let stage = size + 64.0;
-    let halo = stage;
-    let ring = size + 24.0;
-    let orbit = size + 12.0;
-    let disc = el()
-        .key("island-live-orb")
-        .role("button")
-        .focusable(true)
-        .label(if listening {
-            "Stop listening"
-        } else {
-            "Start listening"
-        })
-        .size(size, size)
-        .radius(size / 2.0)
-        .center()
-        .fill(ink("#f7f7f8"))
-        .radial_gradient(
-            [size * 0.34, size * 0.28],
-            size * 0.85,
-            [
-                (0.0, ink("#ffffff")),
-                (0.66, ink("#f6f6f8")),
-                (1.0, ink("#d6d6dd")),
-            ],
-        )
-        .border(1.0, rgba(0.0, 0.0, 0.0, 0.12))
-        .box_shadow(rune::Shadow {
-            x: 0.0,
-            y: 8.0,
-            blur: 26.0,
-            spread: -2.0,
-            color: rgba(0.0, 0.0, 0.0, 0.48),
-            inset: false,
-        })
-        .on_press(move |s: &mut IslandState| {
-            s.live_pinned = true;
-            s.shared.push(IslandCommand::ToggleVoice(key.clone()));
-        })
-        .press_scale(0.97)
-        .matched("island-live-orb-flight")
-        .motion(ORB_FLIGHT)
-        .child(live_orb_bars(model, size, ink("#111113")));
-    el().key("island-live-orb-stage")
-        .size(stage, stage)
-        .center()
-        .child(
-            el().key("island-live-orb-halo")
-                .absolute(0.0, 0.0)
-                .size(halo, halo)
-                .radius(halo / 2.0)
-                .radial_gradient(
-                    [halo / 2.0, halo / 2.0],
-                    halo / 2.0,
-                    [
-                        (0.0, rgba(1.0, 1.0, 1.0, 0.10)),
-                        (0.55, rgba(1.0, 1.0, 1.0, 0.035)),
-                        (1.0, rgba(1.0, 1.0, 1.0, 0.0)),
-                    ],
+                .child(
+                    text(label.to_uppercase())
+                        .grow(1.0)
+                        .font(rune::tok::TextStyle::new(8.5, 600.0))
+                        .color(ink("#777782")),
                 )
-                .looping(rune::LoopSpec::opacity(
-                    if listening { 1.6 } else { 3.6 },
-                    0.0,
-                    0.55,
-                    1.0,
-                ))
-                .inert(),
+                .child(glyph),
         )
-        .child(
-            el().key("island-live-orb-ring")
-                .absolute((stage - ring) / 2.0, (stage - ring) / 2.0)
-                .size(ring, ring)
-                .radius(ring / 2.0)
-                .border(1.0, rgba(1.0, 1.0, 1.0, 0.08))
-                .border_layout()
-                .inert(),
-        )
-        .child(
-            el().key("island-live-orb-orbit")
-                .absolute((stage - orbit) / 2.0, (stage - orbit) / 2.0)
-                .size(orbit, orbit)
-                .radius(orbit / 2.0)
-                .border(1.2, rgba(1.0, 1.0, 1.0, 0.16))
-                .border_layout()
-                .border_dash(size * 0.34, size * 0.72)
-                .looping(rune::LoopSpec::border_sweep(if listening {
-                    2.2
-                } else {
-                    3.4
-                }))
-                .inert(),
-        )
-        .child(disc)
 }
 
-fn live_composer(s: &IslandState, model: &IslandModel, target: &IslandTarget, running: bool) -> El {
-    let key = target.thread_key.clone();
-    let edit_key = key.clone();
-    let submit_key = key.clone();
-    let empty = TextEdit::new("");
-    let edit = s.composers.get(&key).unwrap_or(&empty);
-    let input = rune::text_input(edit, {
-        let mut style = rune::tok::TextStyle::new(12.5, 400.0);
-        style.line_height = 19.0;
-        style
-    })
-    .key("island-live-input")
-    .w_full()
-    .min_h(34.0)
-    .max_h(68.0)
-    .pt(2.0)
-    .pb(2.0)
-    .placeholder("Type or speak…", ink("#74747d"))
-    .caret(ink("#f2f2f4"), crate::motion::TEXT_SELECTION)
-    .on_edit(move |s: &mut IslandState| {
-        // Typing pins the surface exactly like clicking the mic does, so a
-        // pointer drift cannot fold the dock while the user is composing.
-        s.live_pinned = true;
-        s.composer(&edit_key)
-    })
-    .on_input_key(
-        move |s: &mut IslandState, key: &rune::KeyEvent, _tx: &mut Tx| {
-            if key.key != rune::Key::Enter || key.mods.shift {
-                return false;
-            }
-            if s.composers
-                .get(&submit_key)
-                .is_some_and(|edit| edit.preedit.is_some())
-            {
-                return false;
-            }
-            s.send_live(running);
-            true
+fn overview_running_card(model: &IslandModel) -> El {
+    let count = model.runs.len();
+    let target = model.runs.first().map(|run| run.target.clone());
+    let mut card = overview_card(
+        "island-overview-running",
+        "Running",
+        if count > 0 {
+            pulse_dot(5.0, ink(TEXT), true)
+        } else {
+            pulse_dot(5.0, ink("#5a5a62"), false)
         },
     )
-    .on_submit(move |s: &mut IslandState, _tx: &mut Tx| s.send_live(running));
-
-    let has_text = s
-        .composers
-        .get(&key)
-        .is_some_and(|edit| !edit.text.trim().is_empty());
-    let mut send = el()
-        .key("island-live-send")
-        .role("button")
-        .focusable(true)
-        .label(if running { "Stop run" } else { "Send" })
-        .size(32.0, 32.0)
-        .radius(16.0)
-        .center()
-        .fill(if running || has_text {
-            ink("#ffffff")
+    .hover(rgba(1.0, 1.0, 1.0, 0.04))
+    .on_press(move |s: &mut IslandState| {
+        if let Some(target) = target.clone() {
+            s.enter_chat(target);
         } else {
-            ink("#29292f")
+            s.set_pane(IslandPane::Work, false);
+        }
+    })
+    .child(
+        text(count.to_string())
+            .font(crate::motion::tabular(rune::tok::TextStyle::new(
+                30.0, 600.0,
+            )))
+            .color(ink(TEXT)),
+    )
+    .child(
+        text(if count == 1 {
+            "agent".to_string()
+        } else {
+            "agents".to_string()
         })
-        .on_press(move |s: &mut IslandState| s.send_live(running));
-    if running || has_text {
-        send = send.hover(ink("#ededf1"));
-    }
-    send = send.child(if running {
-        stop_glyph(9.0, ink("#0b0b0d"))
+        .font(rune::tok::TextStyle::new(9.0, 500.0))
+        .color(ink(MUTED)),
+    )
+    .child(rune::el().grow(1.0));
+    if count == 0 {
+        card = card.child(
+            text("All quiet".to_string())
+                .font(rune::tok::TextStyle::new(9.5, 400.0))
+                .color(ink("#9b9ba5")),
+        );
     } else {
-        send_glyph(13.0, ink(if has_text { "#0b0b0d" } else { "#71717a" }))
-    });
-
-    let mut card = col()
-        .key("island-live-composer")
-        .w_full()
-        .radius(14.0)
-        .fill(ink("#111114"))
-        .border(1.0, ink("#ffffff14"))
-        .border_layout()
-        .px(10.0)
-        .pt(8.0)
-        .pb(8.0)
-        .gap(4.0);
-    if let Some(attention) = &model.attention {
-        let microphone = attention.title == "Microphone";
-        let mine = attention.target.thread_key.is_empty()
-            || attention.target.thread_key == target.thread_key;
-        if microphone && mine {
-            let note_key = attention.target.thread_key.clone();
+        for run in model.runs.iter().take(2) {
             card = card.child(
                 row()
-                    .key("island-live-mic-error")
                     .w_full()
                     .items_center()
                     .gap(6.0)
-                    .px(2.0)
-                    .child(alert_glyph(11.0, ink(RED)))
+                    .child(pulse_dot(4.0, ink(TEXT), true))
                     .child(
-                        tiny_label(
-                            "island-live-mic-error-text",
-                            &attention.body,
-                            9.5,
-                            400.0,
-                            ink(RED),
-                        )
-                        .max_w(370.0),
+                        col()
+                            .grow(1.0)
+                            .min_w(0.0)
+                            .gap(1.0)
+                            .child(
+                                text(run.target.display().to_string())
+                                    .truncate()
+                                    .font(rune::tok::TextStyle::new(9.5, 600.0))
+                                    .color(ink(TEXT)),
+                            )
+                            .child(
+                                text(run.activity.clone())
+                                    .truncate()
+                                    .font(rune::tok::TextStyle::new(8.5, 400.0))
+                                    .color(ink("#777782")),
+                            ),
                     )
-                    .child(rune::el().grow(1.0))
-                    .child(icon_button(
-                        "island-live-mic-error-x",
-                        "Dismiss microphone error",
-                        20.0,
-                        rgba(1.0, 1.0, 1.0, 0.0),
-                        x_glyph(10.0, ink(MUTED)),
-                        move |s| {
-                            s.shared
-                                .push(IslandCommand::DismissVoiceNote(note_key.clone()))
-                        },
-                    )),
+                    .child(
+                        text(run.elapsed.clone())
+                            .font(rune::tok::TextStyle::new(8.5, 400.0))
+                            .color(ink(MUTED)),
+                    ),
+            );
+        }
+        if count > 2 {
+            card = card.child(
+                text(format!("+{} more", count - 2))
+                    .font(rune::tok::TextStyle::new(8.5, 400.0))
+                    .color(ink("#66666f")),
             );
         }
     }
-    card = card.child(input).child(
+    card
+}
+
+fn overview_time_card(model: &IslandModel) -> El {
+    let total: u64 = model.runs.iter().map(|run| run.elapsed_secs).sum();
+    let longest = model
+        .runs
+        .iter()
+        .map(|run| run.elapsed_secs)
+        .max()
+        .unwrap_or(0);
+    let value = if total == 0 {
+        "0:00".to_string()
+    } else {
+        overview_value(longest)
+    };
+    let mut card = overview_card(
+        "island-overview-time",
+        "Time",
+        el().size(11.0, 11.0).inert().shape(crate::icons::lucide(
+            &["M12 6v6l4 2", "M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z"],
+            11.0,
+            2.0,
+            ink(MUTED),
+        )),
+    )
+    .hover(rgba(1.0, 1.0, 1.0, 0.04))
+    .on_press(|s: &mut IslandState| s.set_pane(IslandPane::Work, false))
+    .child(
+        text(value)
+            .font(crate::motion::tabular(rune::tok::TextStyle::new(
+                30.0, 600.0,
+            )))
+            .color(ink(TEXT)),
+    )
+    .child(
+        text("longest active run".to_string())
+            .font(rune::tok::TextStyle::new(9.0, 500.0))
+            .color(ink(MUTED)),
+    )
+    .child(rune::el().grow(1.0));
+    card = card.child(
         row()
             .w_full()
             .items_center()
-            .gap(8.0)
-            .child(live_mic_button(model, target))
-            .child(rune::el().grow(1.0))
-            .child(send),
+            .child(
+                text("Total".to_string())
+                    .grow(1.0)
+                    .font(rune::tok::TextStyle::new(9.0, 400.0))
+                    .color(ink("#777782")),
+            )
+            .child(
+                text(overview_value(total))
+                    .font(crate::motion::tabular(rune::tok::TextStyle::new(
+                        9.5, 500.0,
+                    )))
+                    .color(ink("#a1a1aa")),
+            ),
     );
-
-    col()
-        .key("island-live-dock")
-        .w_full()
-        .px(10.0)
-        .pb(10.0)
-        .child(card)
+    card.child(
+        row()
+            .w_full()
+            .items_center()
+            .child(
+                text("Runs".to_string())
+                    .grow(1.0)
+                    .font(rune::tok::TextStyle::new(9.0, 400.0))
+                    .color(ink("#777782")),
+            )
+            .child(
+                text(model.runs.len().to_string())
+                    .font(crate::motion::tabular(rune::tok::TextStyle::new(
+                        9.5, 500.0,
+                    )))
+                    .color(ink("#a1a1aa")),
+            ),
+    )
 }
 
-fn live_mic_button(model: &IslandModel, target: &IslandTarget) -> El {
-    let key = target.thread_key.clone();
-    let listening = model.listening && model.voice_thread == target.thread_key;
-    let mut button = el()
-        .key("island-live-mic")
+fn overview_needs_card(model: &IslandModel) -> El {
+    let attention = model.attention.as_ref();
+    let action = attention.cloned();
+    let detail = attention
+        .map(|attention| {
+            if attention.body.trim().is_empty() {
+                attention.title.clone()
+            } else {
+                attention.body.clone()
+            }
+        })
+        .unwrap_or_else(|| "Nothing waiting".to_string());
+    let mut card = overview_card(
+        "island-overview-needs",
+        "Needs you",
+        if attention.is_some() {
+            alert_glyph(11.0, ink(TEXT))
+        } else {
+            check_glyph(11.0, ink("#5a5a62"))
+        },
+    )
+    .hover(rgba(1.0, 1.0, 1.0, 0.04))
+    .on_press(move |s: &mut IslandState| {
+        if let Some(attention) = &action {
+            s.shared.push(open_cmd(&attention.target));
+        } else {
+            s.set_pane(IslandPane::Work, false);
+        }
+    })
+    .child(
+        text(model.needs.max(attention.map_or(0, |_| 1)).to_string())
+            .font(crate::motion::tabular(rune::tok::TextStyle::new(
+                30.0, 600.0,
+            )))
+            .color(ink(TEXT)),
+    )
+    .child(
+        text(if model.needs == 1 {
+            "item".to_string()
+        } else {
+            "items".to_string()
+        })
+        .font(rune::tok::TextStyle::new(9.0, 500.0))
+        .color(ink(MUTED)),
+    )
+    .child(rune::el().grow(1.0));
+    if let Some(attention) = attention {
+        card = card.child(
+            text(attention.title.clone())
+                .w_full()
+                .truncate()
+                .font(rune::tok::TextStyle::new(9.5, 600.0))
+                .color(ink(TEXT)),
+        );
+    }
+    card = card.child(
+        text(detail)
+            .w_full()
+            .max_lines(3)
+            .font(rune::tok::TextStyle::new(9.5, 400.0))
+            .color(ink("#9b9ba5")),
+    );
+    if let Some(attention) = attention {
+        if attention.kind == IslandAttentionKind::Error {
+            card = card.border(1.0, ink("#fb71853d"));
+        }
+    }
+    card
+}
+
+fn overview_recent_row(recent: &IslandRecent) -> El {
+    let target = recent.target.clone();
+    let dot = match recent.kind {
+        IslandRecentKind::Done => ink(TEXT),
+        IslandRecentKind::Stopped => ink("#777782"),
+        IslandRecentKind::Error => ink(RED),
+    };
+    row()
+        .key(format!(
+            "island-overview-recent-{}",
+            recent.target.thread_key
+        ))
+        .w_full()
+        .h(28.0)
+        .items_center()
+        .gap(7.0)
+        .radius(6.0)
+        .hover(rgba(1.0, 1.0, 1.0, 0.05))
         .role("button")
         .focusable(true)
-        .label(if listening {
-            "Stop listening"
-        } else {
-            "Start listening"
-        })
-        .size(30.0, 30.0)
-        .radius(15.0)
-        .center()
-        .fill(if listening {
-            ink("#ffffff")
-        } else {
-            ink("#232328")
-        })
-        .border(
-            1.0,
-            if listening {
-                ink("#ffffff")
-            } else {
-                ink("#ffffff1f")
-            },
+        .label(format!("Open {}", recent.title))
+        .on_press(move |s: &mut IslandState| s.enter_chat(target.clone()))
+        .child(pulse_dot(4.0, dot, false))
+        .child(
+            text(recent.title.clone())
+                .grow(1.0)
+                .min_w(0.0)
+                .truncate()
+                .font(rune::tok::TextStyle::new(9.5, 500.0))
+                .color(ink(TEXT)),
         )
-        .hover(if listening {
-            ink("#ffffff")
-        } else {
-            ink("#2d2d34")
-        })
-        .on_press(move |s: &mut IslandState| {
-            s.live_pinned = true;
-            s.shared.push(IslandCommand::ToggleVoice(key.clone()));
-        });
-    if listening {
-        let mut bars = row().h(13.0).items_center().gap(1.8).inert();
-        const BAR_H: [f32; 5] = [5.0, 9.0, 13.0, 8.0, 11.0];
-        for (i, h) in BAR_H.iter().enumerate() {
-            bars = bars.child(
-                el().size(1.8, *h)
-                    .radius(0.9)
-                    .fill(ink("#111113"))
-                    .looping(rune::LoopSpec::opacity(1.2, i as f64 * 0.13, 0.35, 1.0))
-                    .inert(),
-            );
-        }
-        button = button.child(bars);
+        .child(
+            text(recent.when.clone())
+                .font(rune::tok::TextStyle::new(8.5, 400.0))
+                .color(ink("#777782")),
+        )
+}
+
+fn overview_recent_card(model: &IslandModel) -> El {
+    let mut card = overview_card(
+        "island-overview-recent",
+        "Recent",
+        el().size(11.0, 11.0).inert().shape(crate::icons::lucide(
+            &[
+                "M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8",
+                "M3 3v5h5",
+                "M12 7v5l4 2",
+            ],
+            11.0,
+            2.0,
+            ink(MUTED),
+        )),
+    )
+    .child(rune::el().grow(1.0));
+    if model.recent.is_empty() {
+        card = card
+            .child(rune::el().grow(1.0))
+            .child(
+                text("No activity yet".to_string())
+                    .font(rune::tok::TextStyle::new(9.5, 400.0))
+                    .color(ink("#777782")),
+            )
+            .child(rune::el().grow(1.0));
     } else {
-        button = button.child(mic_glyph(13.0, ink(TEXT)));
+        for recent in model.recent.iter().take(3) {
+            card = card.child(overview_recent_row(recent));
+        }
     }
-    button
+    card
+}
+
+fn overview_body(model: &IslandModel) -> El {
+    col()
+        .key("island-pane-overview")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .px(12.0)
+        .pt(4.0)
+        .pb(12.0)
+        .gap(10.0)
+        .transition(rune::Transition::blur_replace())
+        .child(
+            row()
+                .w_full()
+                .grow(1.0)
+                .gap(10.0)
+                .child(overview_running_card(model))
+                .child(overview_time_card(model)),
+        )
+        .child(
+            row()
+                .w_full()
+                .grow(1.0)
+                .gap(10.0)
+                .child(overview_needs_card(model))
+                .child(overview_recent_card(model)),
+        )
 }
 
 pub fn island_view(s: &IslandState, _cx: &mut Cx<IslandState>) -> El {
@@ -3162,15 +3432,17 @@ pub fn island_view(s: &IslandState, _cx: &mut Cx<IslandState>) -> El {
     // A compact attention card keeps its direct-action button under the
     // pointer. Only a pane that was already open grows with a new card.
     let held = attention.is_some() && s.attention_hold;
-    let expanded = chat_open.is_none() && (s.hovered || s.live_pinned) && !held;
-    let live_open = expanded && s.pane == IslandPane::Live;
+    // A global dock capture keeps the compact listening card; hovering it
+    // must not swap the live transcript for Overview.
+    let expanded = chat_open.is_none() && s.hovered && !held && !listening;
+    let overview_open = expanded && s.pane == IslandPane::Overview;
     let work_open = expanded && s.pane == IslandPane::Work;
     let runs = model.runs.len();
 
     let (w, h) = if chat_open.is_some() {
         (CHAT_W, CHAT_H)
-    } else if live_open {
-        (SHELF_W, LIVE_H)
+    } else if overview_open {
+        (SHELF_W, OVERVIEW_H)
     } else if work_open {
         (SHELF_W, shelf_height(&model, s.add_menu))
     } else if listening {
@@ -3208,7 +3480,7 @@ pub fn island_view(s: &IslandState, _cx: &mut Cx<IslandState>) -> El {
             color: rgba(0.0, 0.0, 0.0, 0.58),
             inset: false,
         });
-    if live_open {
+    if overview_open {
         // A quiet top light, still strictly white/grey. The Work shelf keeps
         // the flat notch; switching rooms springs between the two.
         notch = notch.linear_gradient(
@@ -3225,9 +3497,8 @@ pub fn island_view(s: &IslandState, _cx: &mut Cx<IslandState>) -> El {
         notch = notch.child(chat_surface(s, &model, target));
     } else if expanded {
         notch = notch.child(mode_header(s, &model));
-        if live_open {
-            notch =
-                notch.child(live_surface(s, &model).transition(rune::Transition::blur_replace()));
+        if overview_open {
+            notch = notch.child(overview_body(&model));
         } else if work_open {
             notch = notch.child(
                 col()
@@ -3299,6 +3570,7 @@ mod tests {
                 },
                 activity: "Editing rune_canvas.rs".to_string(),
                 elapsed: "0:42".to_string(),
+                elapsed_secs: 42,
                 stoppable: true,
             })
             .collect();
@@ -3367,152 +3639,70 @@ mod tests {
     }
 
     #[test]
-    fn running_pill_opens_live_and_work_keeps_the_shelf() {
-        let compact = render(model(false, 2), false);
-        assert!(compact.find("island-run-count").is_some());
-        assert!(compact.find("island-shelf").is_none());
-        assert!(compact.find("island-live").is_none());
+    fn overview_is_the_default_and_shows_four_cards() {
+        let rt = render(model(false, 2), true);
+        assert!(rt.find("island-mode-overview").is_some());
+        assert!(rt.find("island-mode-work").is_some());
+        assert!(rt.find("island-pane-overview").is_some());
+        assert!(rt.find("island-overview-running").is_some());
+        assert!(rt.find("island-overview-time").is_some());
+        assert!(rt.find("island-overview-needs").is_some());
+        assert!(rt.find("island-overview-recent").is_some());
+        assert!(rt.find("island-shelf").is_none(), "Overview is the default");
+        assert!(
+            rt.find("island-live").is_none(),
+            "the old Live room is gone"
+        );
+        assert!(rt.find("island-overview-close").is_some());
+        assert!(rt.find("island-overview-work").is_some());
+    }
 
-        let live = render(model(false, 2), true);
-        assert!(live.find("island-live").is_some());
-        assert!(live.find("island-mode-live").is_some());
-        assert!(live.find("island-mode-work").is_some());
-        assert!(live.find("island-shelf").is_none(), "Live is the default");
-        assert!(live.find("island-live-orb").is_some());
-        assert!(live.find("island-live-input").is_some());
-        assert!(live.find("island-live-mic").is_some());
-        assert!(live.find("island-live-send").is_some());
-        assert!(live.find("island-live-title").is_some());
-        // No prompt chips and no status-count copy in the new header.
-        assert!(live.find("island-shelf-status").is_none());
-        assert!(live.find("island-live-prompt").is_none());
+    #[test]
+    fn overview_time_formats_seconds_for_the_card() {
+        assert_eq!(overview_value(0), "—");
+        assert_eq!(overview_value(42), "0:42");
+        assert_eq!(overview_value(125), "2:05");
+        assert_eq!(overview_value(3_725), "1h 02m");
+    }
 
-        let work = render_with(model(false, 2), |state| {
+    #[test]
+    fn overview_recent_rows_carry_their_target() {
+        let mut m = model(false, 0);
+        m.recent = vec![IslandRecent {
+            target: m.target.clone(),
+            title: "Writer".to_string(),
+            kind: IslandRecentKind::Done,
+            when: "2m".to_string(),
+        }];
+        let rt = render(m, true);
+        assert!(rt.find("island-overview-recent-chat:ws:c1").is_some());
+    }
+
+    #[test]
+    fn overview_arrow_opens_work() {
+        let mut rt = render(model(false, 1), true);
+        let (x, y) = rt.find("island-overview-work").expect("work arrow");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.pane, IslandPane::Work);
+    }
+
+    #[test]
+    fn work_keeps_the_shelf_and_add_menu() {
+        let rt = render_with(model(false, 2), |state| {
             state.hovered = true;
             state.pane = IslandPane::Work;
         });
-        assert!(work.find("island-shelf").is_some());
-        assert!(work.find("island-shelf-chat:ws:c0").is_some());
-        assert!(work.find("island-add").is_some());
-        assert!(work.find("island-live").is_none());
-        assert!(work.find("island-shelf-status").is_none());
-        // The old footer is gone: no mic, shortcut text, open arrow or brand.
-        assert!(work.find("island-mic").is_none());
-        assert!(work.find("island-shortcut").is_none());
-        assert!(work.find("island-open").is_none());
-        assert!(work.find("island-brand").is_none());
+        assert!(rt.find("island-shelf").is_some());
+        assert!(rt.find("island-shelf-chat:ws:c0").is_some());
+        assert!(rt.find("island-add").is_some());
+        assert!(rt.find("island-pane-overview").is_none());
     }
 
-    #[test]
-    fn switching_to_work_stops_capture_and_drops_the_live_watch() {
-        let shared = Arc::new(IslandShared::new(None));
-        *shared.model.lock().unwrap() = model(true, 0);
-        let mut state = IslandState::new(shared.clone());
-        state.hovered = true;
-        state.bind_live();
-        let mut rt = Runtime::new(state, island_view, ISLAND_WINDOW, Env::new(true, 1.0));
-        rt.frame(0.0);
-        let (x, y) = rt.find("island-mode-work").expect("Work tab");
-        rt.pointer_down(x, y);
-        rt.pointer_up(x, y);
-        rt.frame(1.0 / 60.0);
-        let commands = shared.take_commands();
-        assert!(
-            commands.contains(&IslandCommand::StopListen),
-            "leaving Live stops the mic: {commands:?}"
-        );
-        assert!(
-            commands.contains(&IslandCommand::UnwatchChat),
-            "leaving Live releases the watch: {commands:?}"
-        );
-    }
-
-    #[test]
-    fn live_orb_and_prompt_dock_mic_start_capture() {
-        let shared = Arc::new(IslandShared::new(None));
-        *shared.model.lock().unwrap() = model(false, 0);
-        let mut state = IslandState::new(shared.clone());
-        state.hovered = true;
-        state.bind_live();
-        let mut rt = Runtime::new(state, island_view, ISLAND_WINDOW, Env::new(true, 1.0));
-        rt.frame(0.0);
-        let (x, y) = rt.find("island-live-orb").expect("orb");
-        rt.pointer_down(x, y);
-        rt.pointer_up(x, y);
-        rt.frame(1.0 / 60.0);
-        assert!(rt.state.live_pinned, "the orb pins the surface");
-        let commands = shared.take_commands();
-        assert!(
-            commands.iter().any(|cmd| matches!(
-                cmd,
-                IslandCommand::ToggleVoice(key) if key == "chat:ws:c1"
-            )),
-            "orb starts capture: {commands:?}"
-        );
-
-        let (x, y) = rt.find("island-live-mic").expect("dock mic");
-        rt.pointer_down(x, y);
-        rt.pointer_up(x, y);
-        rt.frame(2.0 / 60.0);
-        let commands = shared.take_commands();
-        assert!(
-            commands.iter().any(|cmd| matches!(
-                cmd,
-                IslandCommand::ToggleVoice(key) if key == "chat:ws:c1"
-            )),
-            "dock mic starts capture: {commands:?}"
-        );
-    }
-
-    #[test]
-    fn live_prompt_dock_sends_and_clears_the_draft() {
-        let shared = Arc::new(IslandShared::new(None));
-        *shared.model.lock().unwrap() = model(false, 0);
-        let mut state = IslandState::new(shared.clone());
-        state.hovered = true;
-        state.bind_live();
-        state.composer("chat:ws:c1").text = "summarise the run".to_string();
-        let mut rt = Runtime::new(state, island_view, ISLAND_WINDOW, Env::new(true, 1.0));
-        rt.frame(0.0);
-        let (x, y) = rt.find("island-live-send").expect("send");
-        rt.pointer_down(x, y);
-        rt.pointer_up(x, y);
-        rt.frame(1.0 / 60.0);
-        assert!(rt.state.composer("chat:ws:c1").text.is_empty());
-        assert!(rt.state.live_pinned);
-        let commands = shared.take_commands();
-        assert!(
-            commands.iter().any(|cmd| matches!(
-                cmd,
-                IslandCommand::SendPrompt { target, text }
-                    if target.thread_key == "chat:ws:c1" && text == "summarise the run"
-            )),
-            "Live send reaches the shell: {commands:?}"
-        );
-    }
-
-    #[test]
-    fn live_listening_is_just_the_orb_and_transcript() {
-        let shared = Arc::new(IslandShared::new(None));
-        *shared.model.lock().unwrap() = model(true, 0);
-        let mut state = IslandState::new(shared);
-        state.hovered = true;
-        state.bind_live();
-        let mut rt = Runtime::new(state, island_view, ISLAND_WINDOW, Env::new(true, 1.0));
-        rt.frame(0.0);
-        assert!(rt.find("island-live-listening").is_some());
-        assert!(rt.find("island-live-orb").is_some());
-        assert!(rt.find("island-live-transcript").is_some());
-        assert!(rt.find("island-live-composer").is_none());
-        assert!(rt.find("island-live-title").is_none());
-        assert!(rt.find("island-shelf").is_none());
-    }
-
-    #[test]
-    fn live_chat_replaces_the_hero_when_messages_exist() {
-        let mut m = model(false, 0);
-        let mut target = m.target.clone();
-        target.title = "Writer".to_string();
+    fn chat_model() -> (IslandModel, IslandTarget) {
+        let mut m = model(false, 1);
+        let target = m.shelf[0].target.clone();
         m.chat = Some(IslandChat {
             target: target.clone(),
             rows: vec![IslandChatRow {
@@ -3526,18 +3716,162 @@ mod tests {
             status: "Ready".to_string(),
             draft: String::new(),
             draft_rev: 0,
+            ..IslandChat::default()
+        });
+        (m, target)
+    }
+
+    #[test]
+    fn chat_dock_is_inline_and_has_no_tabs() {
+        let (m, target) = chat_model();
+        let rt = render_with(m, |state| {
+            state.hovered = true;
+            state.enter_chat(target);
+        });
+        assert!(rt.find("island-chat-dock-row").is_some());
+        assert!(rt.find("island-chat-input").is_some());
+        assert!(rt.find("island-chat-live").is_some());
+        assert!(rt.find("island-chat-live-arrow").is_some());
+        assert!(rt.find("island-chat-send").is_some());
+        assert!(rt.find("island-chat-mic").is_none(), "mic merged into Live");
+        assert!(rt.find("island-chat-tabs").is_none(), "one chat at a time");
+        let (input, _) = rt.presented("island-chat-input").expect("input");
+        let (send, _) = rt.presented("island-chat-send").expect("send");
+        let (live, _) = rt.presented("island-chat-live").expect("live");
+        assert!(
+            (input[1] - live[1]).abs() < 12.0 && (send[1] - live[1]).abs() < 12.0,
+            "buttons share the input row: input {input:?} live {live:?} send {send:?}"
+        );
+    }
+
+    #[test]
+    fn live_split_control_starts_capture_and_opens_settings() {
+        let (m, target) = chat_model();
+        let shared = Arc::new(IslandShared::new(None));
+        *shared.model.lock().unwrap() = m;
+        let mut state = IslandState::new(shared.clone());
+        state.hovered = true;
+        state.enter_chat(target);
+        let mut rt = Runtime::new(state, island_view, ISLAND_WINDOW, Env::new(true, 1.0));
+        rt.frame(0.0);
+        let (x, y) = rt.find("island-chat-live").expect("live");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        let commands = shared.take_commands();
+        assert!(
+            commands.iter().any(|cmd| matches!(
+                cmd,
+                IslandCommand::ToggleVoice(key) if key == "chat:ws:c0"
+            )),
+            "Live starts capture: {commands:?}"
+        );
+
+        let (x, y) = rt.find("island-chat-live-arrow").expect("arrow");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(2.0 / 60.0);
+        assert!(rt.find("island-chat-live-menu").is_some());
+        assert!(rt.find("island-chat-live-voice-dictate").is_some());
+        assert!(rt.find("island-chat-live-voice-live").is_some());
+        assert!(rt.find("island-chat-live-screen").is_some());
+    }
+
+    #[test]
+    fn voice_mode_and_screen_share_queue_commands() {
+        let (m, target) = chat_model();
+        let shared = Arc::new(IslandShared::new(None));
+        *shared.model.lock().unwrap() = m;
+        let mut state = IslandState::new(shared.clone());
+        state.hovered = true;
+        state.enter_chat(target);
+        state.live_menu = LiveMenu::Options;
+        let mut rt = Runtime::new(state, island_view, ISLAND_WINDOW, Env::new(true, 1.0));
+        rt.frame(0.0);
+        let (x, y) = rt.find("island-chat-live-voice-live").expect("live voice");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        let (x, y) = rt.find("island-chat-live-screen").expect("screen switch");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(2.0 / 60.0);
+        let commands = shared.take_commands();
+        assert!(
+            commands.iter().any(|cmd| matches!(
+                cmd,
+                IslandCommand::SetVoiceMode {
+                    mode: IslandVoiceMode::Live,
+                    ..
+                }
+            )),
+            "voice mode reaches the shell: {commands:?}"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|cmd| matches!(cmd, IslandCommand::SetScreenShare { on: true, .. })),
+            "screen share reaches the shell: {commands:?}"
+        );
+    }
+
+    #[test]
+    fn leaving_chat_stops_live_and_releases_the_watch() {
+        let (m, target) = chat_model();
+        let shared = Arc::new(IslandShared::new(None));
+        *shared.model.lock().unwrap() = m;
+        let mut state = IslandState::new(shared.clone());
+        state.hovered = true;
+        state.enter_chat(target);
+        let mut rt = Runtime::new(state, island_view, ISLAND_WINDOW, Env::new(true, 1.0));
+        rt.frame(0.0);
+        let (x, y) = rt.find("island-chat-back").expect("back");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        let commands = shared.take_commands();
+        assert!(commands.iter().any(|cmd| matches!(
+            cmd,
+            IslandCommand::StopLive(key) if key == "chat:ws:c0"
+        )));
+        assert!(commands.contains(&IslandCommand::UnwatchChat));
+        assert!(commands.contains(&IslandCommand::SetActivatable(false)));
+    }
+
+    #[test]
+    fn rekeyed_chat_carries_its_composer_and_header() {
+        let mut m = model(false, 0);
+        let draft = IslandTarget {
+            thread_key: "draft:new".to_string(),
+            title: "New Chat".to_string(),
+            ..IslandTarget::default()
+        };
+        m.chat = Some(IslandChat {
+            target: m.target.clone(),
+            rows: Vec::new(),
+            live: false,
+            status: "Ready".to_string(),
+            draft: String::new(),
+            draft_rev: 0,
+            ..IslandChat::default()
         });
         let shared = Arc::new(IslandShared::new(None));
         *shared.model.lock().unwrap() = m;
         let mut state = IslandState::new(shared);
-        state.hovered = true;
-        state.bind_live();
-        let mut rt = Runtime::new(state, island_view, ISLAND_WINDOW, Env::new(true, 1.0));
-        rt.frame(0.0);
-        assert!(rt.find("island-live-chat-body").is_some());
-        assert!(rt.find("island-chat-row-u0").is_some());
-        assert!(rt.find("island-live-title").is_none());
-        assert!(rt.find("island-live-input").is_some());
+        state.open_chat = Some(draft.clone());
+        state.composer(&draft.thread_key).text = "first message".to_string();
+        let mut tx = Tx::default();
+        island_poll(&mut state, 0.0, &mut tx);
+        assert_eq!(
+            state.open_chat.as_ref().map(|t| t.thread_key.as_str()),
+            Some("chat:ws:c1")
+        );
+        assert_eq!(
+            state.composer("chat:ws:c1").text,
+            "first message",
+            "the composer follows the real key"
+        );
+        assert!(state.composer(&draft.thread_key).text.is_empty());
     }
 
     #[test]
@@ -3560,89 +3894,7 @@ mod tests {
         let mut rt = Runtime::new(state, island_view, ISLAND_WINDOW, Env::new(true, 1.0));
         rt.frame(0.0);
         assert!(rt.find("island-attention-title").is_some());
-        assert!(rt.find("island-live").is_none());
-    }
-
-    #[test]
-    fn seeing_live_during_capture_pins_the_orb_surface() {
-        let mut m = model(true, 0);
-        m.armed = true;
-        let shared = Arc::new(IslandShared::new(None));
-        *shared.model.lock().unwrap() = m;
-        let mut state = IslandState::new(shared);
-        state.hovered = true;
-        let mut tx = Tx::default();
-        island_poll(&mut state, 0.0, &mut tx);
-        assert!(state.live_pinned, "watching a capture pins Live");
-        state.hovered = false;
-        island_poll(&mut state, 0.0, &mut tx);
-        assert!(state.live_pinned, "the pin survives the pointer leaving");
-    }
-
-    #[test]
-    fn live_adopts_the_rekeyed_chat_and_carries_its_composer() {
-        let mut m = model(false, 0);
-        m.armed = true;
-        let draft = IslandTarget {
-            thread_key: "draft:new".to_string(),
-            title: "New Chat".to_string(),
-            ..IslandTarget::default()
-        };
-        m.chat = Some(IslandChat {
-            target: m.target.clone(),
-            rows: Vec::new(),
-            live: false,
-            status: "Ready".to_string(),
-            draft: String::new(),
-            draft_rev: 0,
-        });
-        let shared = Arc::new(IslandShared::new(None));
-        *shared.model.lock().unwrap() = m;
-        let mut state = IslandState::new(shared);
-        state.hovered = true;
-        state.live_pinned = true;
-        state.live_target = Some(draft.clone());
-        state.composer(&draft.thread_key).text = "first live message".to_string();
-        let mut tx = Tx::default();
-        island_poll(&mut state, 0.0, &mut tx);
-        assert_eq!(
-            state.live_target.as_ref().map(|t| t.thread_key.as_str()),
-            Some("chat:ws:c1")
-        );
-        assert_eq!(
-            state.composer("chat:ws:c1").text,
-            "first live message",
-            "the composer follows the real key"
-        );
-        assert!(state.composer(&draft.thread_key).text.is_empty());
-    }
-
-    #[test]
-    fn live_visibility_watches_the_chat_and_enables_keys() {
-        let mut m = model(false, 0);
-        m.armed = true;
-        let shared = Arc::new(IslandShared::new(None));
-        *shared.model.lock().unwrap() = m;
-        let mut state = IslandState::new(shared.clone());
-        state.hovered = true;
-        let mut tx = Tx::default();
-        island_poll(&mut state, 0.0, &mut tx);
-        assert_eq!(
-            state.live_target.as_ref().map(|t| t.thread_key.as_str()),
-            Some("chat:ws:c1")
-        );
-        let commands = shared.take_commands();
-        assert!(commands.iter().any(|cmd| matches!(
-            cmd,
-            IslandCommand::WatchChat(target) if target.thread_key == "chat:ws:c1"
-        )));
-        assert!(commands.contains(&IslandCommand::SetActivatable(true)));
-
-        state.hovered = false;
-        island_poll(&mut state, 0.0, &mut tx);
-        let commands = shared.take_commands();
-        assert!(commands.contains(&IslandCommand::UnwatchChat));
-        assert!(commands.contains(&IslandCommand::SetActivatable(false)));
+        assert!(rt.find("island-pane-overview").is_none());
     }
 
     #[test]
@@ -3699,6 +3951,7 @@ mod tests {
             status: "Writing".to_string(),
             draft: String::new(),
             draft_rev: 0,
+            ..IslandChat::default()
         });
         let rt = render_with(m, |state| {
             state.hovered = true;
@@ -3710,7 +3963,7 @@ mod tests {
         assert!(rt.find("island-chat-row-a1").is_some());
         assert!(rt.find("island-chat-input").is_some());
         assert!(rt.find("island-chat-send").is_some());
-        assert!(rt.find("island-chat-mic").is_some());
+        assert!(rt.find("island-chat-live").is_some());
         assert!(rt.find("island-chat-back").is_some());
         assert!(rt.find("island-shelf").is_none(), "chat replaces the shelf");
     }
@@ -3726,6 +3979,7 @@ mod tests {
             status: "Ready".to_string(),
             draft: String::new(),
             draft_rev: 0,
+            ..IslandChat::default()
         });
         let shared = Arc::new(IslandShared::new(None));
         *shared.model.lock().unwrap() = m.clone();
@@ -3765,6 +4019,7 @@ mod tests {
             status: "Ready".to_string(),
             draft: String::new(),
             draft_rev: 0,
+            ..IslandChat::default()
         });
         let shared = Arc::new(IslandShared::new(None));
         *shared.model.lock().unwrap() = m.clone();
@@ -3784,7 +4039,6 @@ mod tests {
             state.open_chat.as_ref().map(|open| open.title.as_str()),
             Some("hello island")
         );
-        assert!(state.tabs.iter().any(|tab| tab.title == "hello island"));
     }
 
     #[test]

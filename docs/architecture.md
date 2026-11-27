@@ -46,27 +46,33 @@ The native app is also a background desktop surface:
   raises it: the prompt-dock mic warms the speech models and shows the idle
   island (104×24 mark + status dot, white hairline, no glow), while only the
   island's mic — or `Ctrl+Space` while armed — starts capture.
-  Hover opens the **Live / Work** shell on the active thread. Live is the
-  default and replaces the old status line with a two-seat mode rail:
-  - **Live** is the active chat with a voice stage. With the mic off it shows
-    the conversation (or the “The mic is yours, Boss” hero when empty) above a
-    real prompt dock with text send and mic. The mic starts the existing STT;
-    while listening the surface clears to the live orb and interim transcript,
-    and the dock returns when capture stops. Finals use the same draft /
-    auto-send path as the rest of the app. Live watches the active chat and
-    opts into keyboard activation (`OverlayHandle::set_activatable`) so its
-    dock can take keys; the window style alone never steals focus.
+  Hover opens the **Overview / Work** shell on the active thread. Overview is
+  the default and replaces the old status line with a two-seat mode rail:
+  - **Overview** is a glanceable dashboard: running agents and their current
+    activity, active run time, items waiting on the user, and the last three
+    finished/stopped/failed runs. The top-right chevron opens Work and the
+    adjacent close button collapses the island. There is no live status strip
+    and no count in the rail.
   - **Work** is the activity shelf: running chats, active group projects and
     cloud runs, three rows at a time with the rest scrolling. The top-right
     add control fans into Chat / Group / Cloud; each offers a new item or picks
-    an existing one. Choosing a chat opens a pinned in-overlay chat (compact
-    prompt dock with mic and send, up to three tabs for concurrent work),
-    backed by the same markdown renderer as the main transcript. The chat
-    surface captures the whole overlay so a click can never leak through.
-  Switching to Work stops capture and releases the Live watch; a fresh hover
-  starts in Live again. Turning the dock off disarms every bus, releases the
-  models and hides the island. A hidden island releases its GPU surface after
-  20s.
+    an existing one. Choosing a chat opens one pinned in-overlay chat at a time
+    (no tab strip), backed by the same markdown renderer as the main
+    transcript. The chat surface captures the whole overlay so a click can
+    never leak through.
+  The chat prompt dock is one inline row: text field, Live split control and
+  send. The Live control's left side starts/stops capture; its chevron opens
+  the anchored settings menu. Per-chat settings are **Dictate** (STT turns
+  speech into an editable draft), **Live** (STT auto-sends and the final reply
+  is spoken through the backend TTS), **Off**, and an independent **Share
+  screen** toggle. The screen worker captures the selected display, uploads
+  frames to `/api/vision/frame`, and attaches the latest frame to the next
+  turn. Only one chat can be live at a time; leaving the chat ends capture,
+  speech and screen sharing. Live chats opt into keyboard activation
+  (`OverlayHandle::set_activatable`) so the dock can take keys; the window
+  style alone never steals focus. A fresh hover starts on Overview again.
+  Turning the dock off disarms every bus, releases the models and hides the
+  island. A hidden island releases its GPU surface after 20s.
 - **Background lifetime** (`presence.rs`, `shell.rs`) uses `keep_running`:
   closing the main window hides it and stops capture but keeps live mode
   armed — agents, the tray and the idle island stay alive. `--background`
@@ -75,8 +81,9 @@ The native app is also a background desktop surface:
 - **Speech models are live-mode owned.** The backend loads Moonshine STT
   lazily on first live use (`session.start`, file transcription, backend
   capture) and `POST /api/voice/release_asr` drops it; TTS warms when the
-  first bus arms (`POST /api/voice/warm_tts`) and releases only once no bus
-  is armed or live (`POST /api/voice/release_tts`). The UI's on-device engine
+  first bus arms or a chat selects Live (`POST /api/voice/warm_tts`) and
+  releases only once no bus is armed, no chat is live and no reply is speaking
+  (`POST /api/voice/release_tts`). The UI's on-device engine
   loads on first local dictation and releases when the models release.
   Stopping capture drops back to armed-idle — models stay warm. An idle,
   disarmed app holds no STT memory in either process; the ~500 MB UI baseline

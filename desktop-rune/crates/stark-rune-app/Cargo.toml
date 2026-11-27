@@ -24,10 +24,11 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 minisign-verify = "0.3"
 ureq = { version = "2.12", default-features = false, features = ["tls"] }
 rodio = { version = "0.23", default-features = false, features = ["playback", "mp3", "mp4", "flac", "vorbis", "wav"] }
+base64 = "0.22"
 # Backend-assisted dictation: stream captured PCM to `stark-server`'s
 # `/api/voice/ws` (the pre-rewrite split). Pure Rust, works on GNU + MSVC.
 tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "=0.2.129"
@@ -98,6 +99,11 @@ moonshine-rs = { version = "0.2.6", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_UI_Shell", "Win32_System_Threading", "Win32_System_Registry"] }
+
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+# Live-mode display sharing. Windows uses Windows Graphics Capture so the
+# frame matches what the user sees, not a stale GDI copy.
+xcap = { version = "0.9.8", features = ["wgc"] }
 
 [build-dependencies]
 embed-resource = "3.0"

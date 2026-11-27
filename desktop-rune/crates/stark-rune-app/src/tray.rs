@@ -213,6 +213,7 @@ mod tests {
             target: IslandTarget::default(),
             activity: "Working".to_string(),
             elapsed: "0:01".to_string(),
+            elapsed_secs: 1,
             stoppable: true,
         });
         assert!(tooltip(&m).contains("1 agent"));

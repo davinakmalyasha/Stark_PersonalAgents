@@ -1117,7 +1117,7 @@ pub fn settings_sheet<S: SettingsHost + 'static>(s: &SettingsState, width: f32, 
             crate::shell::icon_live(13.0, ink("#71717a")),
         ))
         .child(paragraph(
-            "Live mode warms the speech models and shows the island. The dock mic arms live mode; the mic in the island (or Ctrl+Space while armed) starts listening. Turning the dock off unloads the models and hides the island.",
+            "Live mode warms the speech models and shows the island. The dock mic arms live mode; the mic in the island (or Ctrl+Space while armed) starts listening. Work chats carry their own Live control: Dictate stages speech as a draft, Live sends and speaks the reply, and Share screen attaches display frames to each turn. Turning the dock off unloads the models and hides the island.",
         ))
         .child(toggle_row::<S>(
             "settings-island-toggle",

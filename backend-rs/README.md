@@ -31,8 +31,8 @@ cargo test --workspace
 
 ## Tool contract
 
-`specs/tool-specs.json` is the model-facing contract: `contract_version` 6,
-49 tools, nine scopes (`developer`, `coder`, `general`, `house`, `dfd`,
+`specs/tool-specs.json` is the model-facing contract: `contract_version` 10,
+49 tools, eight scopes (`developer`, `general`, `house`, `dfd`,
 `orchestrator`, `devops`, `explore`, `ui`). It is validated by
 `stark-contract`; implementations are registered in
 `stark-tools/src/inventory.rs`. The Rust inventory is the source of truth for

@@ -7,6 +7,10 @@ pub struct AgentSpec {
     pub plan_scope: &'static str,
     pub tier: &'static str,
     pub instructions: &'static str,
+    /// Alternate names that resolve to this agent. Aliases are for
+    /// compatibility (old configs, group manifests, saved sessions); they are
+    /// never listed as agents of their own.
+    pub aliases: &'static [&'static str],
 }
 
 pub const DEVELOPER: AgentSpec = AgentSpec {
@@ -14,15 +18,8 @@ pub const DEVELOPER: AgentSpec = AgentSpec {
     display: "Developer",
     plan_scope: "developer",
     tier: "workspace",
-    instructions: "You are the Developer agent. Implement, test, and verify code. Read files before editing. Keep the plan current for multi-step work.",
-};
-
-pub const CODER: AgentSpec = AgentSpec {
-    key: "coder",
-    display: "Coder",
-    plan_scope: "coder",
-    tier: "workspace",
-    instructions: "You are the Coder agent. Implement, test, and verify code through programs that call tools. Read files before editing. Keep the plan current for multi-step work.",
+    instructions: "You are the Developer agent. Implement, test, and verify code through programs that call tools. Read files before editing. Keep the plan current for multi-step work.",
+    aliases: &["dev", "coding", "coder", "engineer"],
 };
 
 pub const GENERAL: AgentSpec = AgentSpec {
@@ -30,6 +27,7 @@ pub const GENERAL: AgentSpec = AgentSpec {
     display: "General",
     plan_scope: "general",
     tier: "workspace",
+    aliases: &["research", "researcher", "writer", "analyst"],
     instructions: r#"You are the General agent: the user's personal operator for everyday life — research, writing, admin, personal records, signed-in browser tasks, and desktop actions. Software projects belong to Developer; smart-home devices belong to House. You do not build or refactor software.
 
 ## Route the work
@@ -58,6 +56,7 @@ pub const HOUSE: AgentSpec = AgentSpec {
     plan_scope: "house",
     tier: "workspace",
     instructions: "You are the House agent. Read and control the smart home through the house tools. You do not write code. You may read household context from personal_os (overview, todo_list, food_summary, training_summary); money and all personal_os writes are blocked for you, so never attempt them.",
+    aliases: &[],
 };
 
 pub const DFD: AgentSpec = AgentSpec {
@@ -66,6 +65,7 @@ pub const DFD: AgentSpec = AgentSpec {
     plan_scope: "dfd",
     tier: "workspace",
     instructions: "You are the DFD agent. Handle agency clients, projects, and scaffolding. You do not move money.",
+    aliases: &[],
 };
 
 pub const UI: AgentSpec = AgentSpec {
@@ -74,6 +74,7 @@ pub const UI: AgentSpec = AgentSpec {
     plan_scope: "ui",
     tier: "workspace",
     instructions: "You are the UI agent. Design and verify frontends with the browser and editing tools.",
+    aliases: &["design", "designer", "frontend", "front-end"],
 };
 
 pub const DEVOPS: AgentSpec = AgentSpec {
@@ -82,6 +83,7 @@ pub const DEVOPS: AgentSpec = AgentSpec {
     plan_scope: "devops",
     tier: "specialist",
     instructions: "You are the DevOps agent. Handle deployment, CI, infrastructure, and operational verification. Prefer reproducible commands and explicit rollback paths.",
+    aliases: &["ops", "operations", "sre", "infra"],
 };
 
 pub const EXPLORE: AgentSpec = AgentSpec {
@@ -90,6 +92,7 @@ pub const EXPLORE: AgentSpec = AgentSpec {
     plan_scope: "explore",
     tier: "specialist",
     instructions: "You are the Explore agent. Read broadly, map unfamiliar code, and report concise findings with exact paths. Do not edit files unless explicitly asked.",
+    aliases: &["scout", "explorer"],
 };
 
 pub const ORCHESTRATOR: AgentSpec = AgentSpec {
@@ -106,6 +109,7 @@ When the request needs edits, builds, tests, deployments, file writes, browser m
 Use workspace to list or resolve registered workspaces. If a path is outside every registered workspace, say so and ask the user whether to register it; do not silently give up. Use create_group, group_update, schedule, give_note, and canvas_mode to coordinate work. Group progress is event-driven; call group_board once only when the user asks for status. You do not maintain a plan or todo list; coordination state belongs to groups and schedules.
 
 Memory is historical context, not current policy. The runtime context in this prompt (workspace, sandbox, approvals) always wins over memory entries. If memory contradicts what you can verify now, trust the verification and say what you found. Never invent tool results. If a tool fails, report the exact error, fix the arguments or try the next read-only alternative, and only then report a blocker."#,
+    aliases: &[],
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,7 +143,9 @@ impl FileAccess {
 }
 
 pub fn default_access(scope: &str, depth: u32, spawned: bool) -> FileAccess {
-    let scope = scope.trim().to_ascii_lowercase();
+    // Resolve aliases first so compatibility names keep their agent's access.
+    let canonical = for_scope(scope).map(|agent| agent.key).unwrap_or(scope);
+    let scope = canonical.trim().to_ascii_lowercase();
     if scope == "orchestrator" || scope == "house" || scope == "explore" {
         return FileAccess::Read;
     }
@@ -148,13 +154,13 @@ pub fn default_access(scope: &str, depth: u32, spawned: bool) -> FileAccess {
     }
     if !spawned {
         return match scope.as_str() {
-            "developer" | "coder" | "ui" | "devops" => FileAccess::Write,
+            "developer" | "ui" | "devops" => FileAccess::Write,
             "general" | "dfd" => FileAccess::Write,
             _ => FileAccess::Read,
         };
     }
     match scope.as_str() {
-        "developer" | "coder" | "ui" | "devops" => FileAccess::Worktree,
+        "developer" | "ui" | "devops" => FileAccess::Worktree,
         "general" | "dfd" => FileAccess::Write,
         _ => FileAccess::Read,
     }
@@ -167,9 +173,8 @@ pub fn worktree_mode() -> String {
         .to_ascii_lowercase()
 }
 
-const WORKSPACE_AGENTS: &[AgentSpec] = &[
+pub const WORKSPACE_AGENTS: &[AgentSpec] = &[
     DEVELOPER,
-    CODER,
     GENERAL,
     HOUSE,
     DFD,
@@ -179,12 +184,17 @@ const WORKSPACE_AGENTS: &[AgentSpec] = &[
     ORCHESTRATOR,
 ];
 
+/// Every first-class agent, in registry order. Consumers (the config API, the
+/// picker, docs) derive their lists from here instead of duplicating keys.
+pub fn workspace_agents() -> &'static [AgentSpec] {
+    WORKSPACE_AGENTS
+}
+
 pub fn for_scope(scope: &str) -> Option<AgentSpec> {
     let scope = scope.trim().to_lowercase();
-    WORKSPACE_AGENTS
-        .iter()
-        .copied()
-        .find(|agent| agent.key == scope)
+    WORKSPACE_AGENTS.iter().copied().find(|agent| {
+        agent.key == scope.as_str() || agent.aliases.iter().any(|alias| *alias == scope.as_str())
+    })
 }
 
 pub fn resolve_agent(
@@ -246,9 +256,38 @@ mod tests {
     #[test]
     fn scopes_resolve_case_insensitively() {
         assert_eq!(for_scope("Developer"), Some(DEVELOPER));
-        assert_eq!(for_scope("Coder"), Some(CODER));
         assert_eq!(for_scope("UI"), Some(UI));
         assert_eq!(for_scope("missing"), None);
+    }
+
+    #[test]
+    fn aliases_resolve_to_their_canonical_agent() {
+        assert_eq!(for_scope("coder"), Some(DEVELOPER));
+        assert_eq!(for_scope("Coder"), Some(DEVELOPER));
+        assert_eq!(for_scope("frontend"), Some(UI));
+        assert_eq!(for_scope("ops"), Some(DEVOPS));
+    }
+
+    #[test]
+    fn coder_is_not_a_first_class_agent() {
+        assert_eq!(workspace_agents().len(), 8);
+        assert!(workspace_agents().iter().all(|agent| agent.key != "coder"));
+        assert_eq!(for_scope("coder").map(|agent| agent.key), Some("developer"));
+    }
+
+    #[test]
+    fn aliases_are_unique_and_do_not_shadow_agent_keys() {
+        let mut seen: Vec<&str> = Vec::new();
+        for agent in WORKSPACE_AGENTS {
+            for alias in agent.aliases {
+                assert!(
+                    !WORKSPACE_AGENTS.iter().any(|other| other.key == *alias),
+                    "alias {alias} shadows an agent key"
+                );
+                assert!(!seen.contains(alias), "duplicate alias {alias}");
+                seen.push(alias);
+            }
+        }
     }
 
     #[test]
@@ -269,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn coder_matches_developer_access() {
+    fn coder_alias_matches_developer_access() {
         assert_eq!(default_access("coder", 0, false), FileAccess::Write);
         assert_eq!(default_access("coder", 1, true), FileAccess::Worktree);
         assert_eq!(default_access("coder", 2, false), FileAccess::Read);
@@ -283,6 +322,12 @@ mod tests {
                 contract.scope_map.contains_key(agent.key),
                 "missing scope {}",
                 agent.key
+            );
+        }
+        for scope in contract.scope_map.keys() {
+            assert!(
+                WORKSPACE_AGENTS.iter().any(|agent| agent.key == scope),
+                "contract scope {scope} has no registered agent"
             );
         }
     }

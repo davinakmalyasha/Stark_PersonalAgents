@@ -1,0 +1,10 @@
+{
+  "type": "custom",
+  "custom": {
+    "name": "execute",
+    "description": "desc",
+    "format": {
+      "type": "text"
+    }
+  }
+}

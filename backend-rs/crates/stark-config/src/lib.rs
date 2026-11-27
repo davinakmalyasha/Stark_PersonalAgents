@@ -11,15 +11,24 @@
 //! Environment variables are only used for secrets (`key_env` references).
 //! Provider mode, base URL, model ids, tier defaults, and reasoning effort all
 //! come from the files (or the built-in defaults when a file is absent).
+//!
+//! API keys managed from the app live in
+//! `.deep_agents/secrets/provider_keys.json`. The file is deliberately outside
+//! the config directory so portable backups never pick it up; one active key
+//! per provider wins over the `.env` fallback.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 pub const CONFIG_VERSION: u32 = 1;
 pub const THINKING_LEVELS: &[&str] = &["minimal", "low", "medium", "high"];
+
+const PROVIDER_KEYS_FILE: &str = "provider_keys.json";
+const PROVIDER_KEYS_DIR: &str = "secrets";
 
 fn default_version() -> u32 {
     CONFIG_VERSION
@@ -58,6 +67,76 @@ impl From<Vec<&str>> for EnvList {
     }
 }
 
+/// One saved API key. The secret never leaves the config store except through
+/// [`ConfigStore::resolve_key`]; API responses use [`ProviderKeyInfo`].
+#[derive(Clone, Deserialize, Serialize)]
+struct ProviderKeyEntry {
+    id: String,
+    #[serde(default)]
+    label: String,
+    secret: String,
+    #[serde(default)]
+    created_ms: u64,
+}
+
+impl std::fmt::Debug for ProviderKeyEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderKeyEntry")
+            .field("id", &self.id)
+            .field("label", &self.label)
+            .field("secret", &"<redacted>")
+            .field("created_ms", &self.created_ms)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct ProviderKeySet {
+    /// Selected managed key id. Empty means the `.env` fallback.
+    #[serde(default)]
+    active: String,
+    #[serde(default)]
+    keys: Vec<ProviderKeyEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ProviderKeysFile {
+    #[serde(default = "default_version")]
+    version: u32,
+    #[serde(default)]
+    providers: BTreeMap<String, ProviderKeySet>,
+}
+
+impl Default for ProviderKeysFile {
+    fn default() -> Self {
+        Self {
+            version: CONFIG_VERSION,
+            providers: BTreeMap::new(),
+        }
+    }
+}
+
+/// Public, secret-free key metadata. `masked` is safe to render and log.
+#[derive(Clone, Debug, Serialize)]
+pub struct ProviderKeyInfo {
+    pub id: String,
+    pub label: String,
+    pub masked: String,
+    /// `managed` or `env`.
+    pub source: String,
+    pub active: bool,
+    pub created_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProviderKeysReport {
+    pub provider: String,
+    pub keys: Vec<ProviderKeyInfo>,
+    /// Managed key id, `env`, or empty when no key is configured.
+    pub active: String,
+    pub has_env: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelSpec {
@@ -69,6 +148,10 @@ pub struct ModelSpec {
     pub context: Option<usize>,
     #[serde(default)]
     pub reasoning: bool,
+    /// OpenCode freeform tool formats this model accepts: `text`, `lark`,
+    /// and/or `regex`. Empty keeps JSON function tools.
+    #[serde(default)]
+    pub freeform: Vec<String>,
     /// Accepted alternative spellings (old persisted slugs, UI labels).
     #[serde(default)]
     pub aliases: Vec<String>,
@@ -163,6 +246,7 @@ impl ProvidersFile {
                             label: "DeepSeek V4.1 Flash".to_string(),
                             context: Some(131_072),
                             reasoning: true,
+                            freeform: Vec::new(),
                             aliases: vec![
                                 "deepseek/deepseek-v4.1-flash-1017".to_string(),
                                 "deepseek/deepseek-v4.1-flash".to_string(),
@@ -179,6 +263,7 @@ impl ProvidersFile {
                             label: "MiMo V2.6 Flash".to_string(),
                             context: None,
                             reasoning: true,
+                            freeform: Vec::new(),
                             aliases: vec![
                                 "xiaomi/mimo-v2.6-flash".to_string(),
                                 "mimo-v2.6-flash".to_string(),
@@ -192,6 +277,7 @@ impl ProvidersFile {
                             label: "MiMo V2.6 Pro".to_string(),
                             context: None,
                             reasoning: true,
+                            freeform: Vec::new(),
                             aliases: vec![
                                 "xiaomi/mimo-v2.6-pro".to_string(),
                                 "mimo-v2.6-pro".to_string(),
@@ -205,6 +291,7 @@ impl ProvidersFile {
                             label: "Muse Spark 1.3 Contributor".to_string(),
                             context: None,
                             reasoning: true,
+                            freeform: Vec::new(),
                             aliases: vec!["meta/muse-spark-1.3-contributor".to_string()],
                         },
                     ),
@@ -229,6 +316,7 @@ impl ProvidersFile {
                         label: "DeepSeek V4.1 Flash (OpenRouter)".to_string(),
                         context: Some(131_072),
                         reasoning: false,
+                        freeform: Vec::new(),
                         aliases: vec![
                             "deepseek/deepseek-v4.1-flash".to_string(),
                             "deepseek-v4.1-flash".to_string(),
@@ -252,6 +340,7 @@ impl ProvidersFile {
                         label: "DeepSeek Chat".to_string(),
                         context: Some(65_536),
                         reasoning: false,
+                        freeform: Vec::new(),
                         aliases: vec![],
                     },
                 )]),
@@ -272,6 +361,7 @@ impl ProvidersFile {
                         label: "DeepSeek V4.1 Flash (Command)".to_string(),
                         context: None,
                         reasoning: true,
+                        freeform: Vec::new(),
                         aliases: vec!["deepseek-v4.1-flash".to_string()],
                     },
                 )]),
@@ -442,6 +532,13 @@ pub struct AgentFile {
     /// Replaces the built-in agent preamble. Harness/tool/safety text still
     /// applies.
     pub system_prompt: Option<String>,
+    /// Code Mode partition: `off`, `hybrid`, or `only`. `null` inherits the
+    /// scope default (coding agents default to `only`).
+    pub code_mode: Option<String>,
+    /// OpenCode `full_codemode`: Bun/path globals, `timeout`/`background`
+    /// script jobs, and the pinned file/shell catalog. `null` inherits the
+    /// scope default (coding agents default to on, like OpenCode local/dev).
+    pub full_codemode: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -461,6 +558,13 @@ pub struct EffectiveAgent {
     pub skills: Option<Vec<String>>,
     pub mcp: Option<Vec<String>>,
     pub system_prompt: Option<String>,
+    /// Resolved Code Mode partition (`off`, `hybrid`, or `only`).
+    pub code_mode: Option<String>,
+    /// Resolved OpenCode `full_codemode` override. `None` inherits the scope
+    /// default (coding agents default to on).
+    pub full_codemode: Option<bool>,
+    /// OpenCode freeform formats advertised by the selected model.
+    pub freeform: Vec<String>,
     /// Environment variable names that can hold this provider's key.
     pub key_env: Vec<String>,
     pub has_key: bool,
@@ -484,6 +588,7 @@ pub struct ModelSummary {
     pub label: String,
     pub context: Option<usize>,
     pub reasoning: bool,
+    pub freeform: Vec<String>,
     pub aliases: Vec<String>,
 }
 
@@ -501,8 +606,14 @@ pub enum ConfigError {
     NoModels(String),
     #[error("invalid thinking level '{level}' (use inherit/none/minimal/low/medium/high)")]
     InvalidThinking { level: String },
+    #[error("invalid code mode '{value}' (use off/hybrid/only)")]
+    InvalidCodeMode { value: String },
     #[error("invalid agent key '{0}' (lowercase letters, digits, '_' or '-')")]
     InvalidAgentKey(String),
+    #[error("invalid API key: {0}")]
+    InvalidProviderKey(String),
+    #[error("unknown API key '{0}'")]
+    UnknownProviderKey(String),
     #[error("{0}")]
     Io(String),
     #[error("{0}")]
@@ -513,12 +624,14 @@ pub enum ConfigError {
 struct Signature {
     providers: Option<(u64, u128)>,
     agents: BTreeMap<String, (u64, u128)>,
+    keys: Option<(u64, u128)>,
 }
 
 impl Signature {
     fn read(root: &Path) -> Self {
         let dir = root.join(".deep_agents").join("config");
         let providers = file_stamp(&dir.join("providers.json"));
+        let keys = file_stamp(&provider_keys_path(root));
         let mut agents = BTreeMap::new();
         if let Ok(entries) = std::fs::read_dir(dir.join("agents")) {
             for entry in entries.flatten() {
@@ -534,8 +647,55 @@ impl Signature {
                 }
             }
         }
-        Self { providers, agents }
+        Self {
+            providers,
+            agents,
+            keys,
+        }
     }
+}
+
+fn provider_keys_path(root: &Path) -> PathBuf {
+    root.join(".deep_agents")
+        .join(PROVIDER_KEYS_DIR)
+        .join(PROVIDER_KEYS_FILE)
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn mask_key(secret: &str) -> String {
+    let chars: Vec<char> = secret.chars().collect();
+    if chars.len() <= 4 {
+        return "…".to_string();
+    }
+    let suffix: String = chars[chars.len() - 4..].iter().collect();
+    let prefix = if secret.starts_with("oc_") {
+        "oc_"
+    } else if secret.starts_with("sk-") {
+        "sk-"
+    } else {
+        ""
+    };
+    format!("{prefix}…{suffix}")
+}
+
+fn env_key_for(provider: &ProviderSpec, get: impl Fn(&str) -> Option<String>) -> String {
+    for name in provider.key_names() {
+        if let Some(value) = get(&name)
+            && let Some(first) = value
+                .split(',')
+                .map(str::trim)
+                .find(|candidate| !candidate.is_empty())
+        {
+            return first.to_string();
+        }
+    }
+    String::new()
 }
 
 fn file_stamp(path: &Path) -> Option<(u64, u128)> {
@@ -567,6 +727,11 @@ pub fn builtin_effective(tier: &str) -> EffectiveAgent {
         .models
         .get(&model_key)
         .is_some_and(|model| model.reasoning);
+    let freeform = provider
+        .models
+        .get(&model_key)
+        .map(|model| model.freeform.clone())
+        .unwrap_or_default();
     EffectiveAgent {
         key: "default".to_string(),
         display: "Default".to_string(),
@@ -581,10 +746,13 @@ pub fn builtin_effective(tier: &str) -> EffectiveAgent {
             .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("inherit"))
             .map(|value| value.to_ascii_lowercase()),
         reasoning,
+        freeform,
         tools: None,
         skills: None,
         mcp: None,
         system_prompt: None,
+        code_mode: None,
+        full_codemode: None,
         key_env: provider.key_names(),
         has_key: false,
     }
@@ -593,6 +761,7 @@ pub fn builtin_effective(tier: &str) -> EffectiveAgent {
 struct Loaded {
     providers: ProvidersFile,
     agents: BTreeMap<String, AgentFile>,
+    keys: ProviderKeysFile,
     issues: Vec<String>,
     /// True when a providers.json exists (so set_active can preserve it).
     has_file: bool,
@@ -680,10 +849,22 @@ impl ConfigStore {
                 }
             }
         }
+        let keys_path = provider_keys_path(root);
+        let keys = match std::fs::read_to_string(&keys_path) {
+            Ok(text) => match serde_json::from_str::<ProviderKeysFile>(&text) {
+                Ok(keys) => keys,
+                Err(error) => {
+                    issues.push(format!("{}: {error}", keys_path.display()));
+                    ProviderKeysFile::default()
+                }
+            },
+            Err(_) => ProviderKeysFile::default(),
+        };
         issues.extend(validate_providers(&providers));
         Loaded {
             providers,
             agents,
+            keys,
             issues,
             has_file,
         }
@@ -808,14 +989,15 @@ impl ConfigStore {
             },
         };
 
+        let freeform = provider
+            .models
+            .get(&model_key)
+            .map(|model| model.freeform.clone())
+            .unwrap_or_default();
         let key_env = provider.key_names();
-        // Resolve keys directly from the provider spec: calling
-        // `resolve_key_with` here would re-enter the state lock.
-        let has_key = key_env.iter().any(|name| {
-            std::env::var(name)
-                .ok()
-                .is_some_and(|value| value.split(',').any(|part| !part.trim().is_empty()))
-        });
+        // Resolve keys from the state we already hold: calling `resolve_key`
+        // here would re-enter the lock.
+        let has_key = !Self::resolve_key_from(&state, &provider_id).is_empty();
 
         Ok(EffectiveAgent {
             key: key.to_ascii_lowercase(),
@@ -832,21 +1014,55 @@ impl ConfigStore {
             model: model_id,
             thinking,
             reasoning,
+            freeform,
             tools: agent.tools.clone(),
             skills: agent.skills.clone(),
             mcp: agent.mcp.clone(),
             system_prompt: agent.system_prompt.clone(),
+            code_mode: agent.code_mode.clone(),
+            full_codemode: agent.full_codemode,
             key_env,
             has_key,
         })
     }
 
-    /// Resolve a provider's key from its configured env names. Comma-separated
-    /// values are accepted (legacy `*_API_KEYS` lists).
+    /// Resolve the active key for a provider: the selected managed key first,
+    /// then the configured `.env` fallback.
     pub fn resolve_key(&self, provider_id: &str) -> String {
-        self.resolve_key_with(provider_id, |name| std::env::var(name).ok())
+        self.ensure_fresh();
+        self.state
+            .read()
+            .map(|state| Self::resolve_key_from(&state, provider_id))
+            .unwrap_or_default()
     }
 
+    /// Resolve a specific saved key, or the `.env` fallback when `key_id` is
+    /// empty or `env`. Used by the usage endpoint so a click shows exactly the
+    /// reports of that key.
+    pub fn resolve_key_entry(&self, provider_id: &str, key_id: &str) -> String {
+        self.ensure_fresh();
+        let Ok(state) = self.state.read() else {
+            return String::new();
+        };
+        let Some(provider) = state.providers.provider(provider_id) else {
+            return String::new();
+        };
+        let id = key_id.trim();
+        if id.is_empty() || id.eq_ignore_ascii_case("env") {
+            return env_key_for(provider, |name| std::env::var(name).ok());
+        }
+        state
+            .keys
+            .providers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(provider_id))
+            .and_then(|(_, set)| set.keys.iter().find(|key| key.id == id))
+            .map(|key| key.secret.clone())
+            .unwrap_or_default()
+    }
+
+    /// Environment-only resolution kept for callers that supply a key getter
+    /// (tests and legacy fallbacks). Managed keys are intentionally ignored.
     pub fn resolve_key_with(
         &self,
         provider_id: &str,
@@ -856,17 +1072,230 @@ impl ConfigStore {
         let Some(provider) = providers.provider(provider_id) else {
             return String::new();
         };
-        for name in provider.key_names() {
-            if let Some(value) = get(&name)
-                && let Some(first) = value
-                    .split(',')
-                    .map(str::trim)
-                    .find(|candidate| !candidate.is_empty())
-            {
-                return first.to_string();
+        env_key_for(provider, get)
+    }
+
+    fn resolve_key_from(state: &Loaded, provider_id: &str) -> String {
+        let Some(provider) = state.providers.provider(provider_id) else {
+            return String::new();
+        };
+        if let Some((_, set)) = state
+            .keys
+            .providers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(provider_id))
+            && !set.active.trim().is_empty()
+            && let Some(key) = set
+                .keys
+                .iter()
+                .find(|key| key.id.eq_ignore_ascii_case(set.active.trim()))
+        {
+            return key.secret.clone();
+        }
+        env_key_for(provider, |name| std::env::var(name).ok())
+    }
+
+    /// Secret-free key list for the provider panel.
+    pub fn provider_keys(&self, provider_id: &str) -> Result<ProviderKeysReport, ConfigError> {
+        self.ensure_fresh();
+        let state = self
+            .state
+            .read()
+            .map_err(|_| ConfigError::Io("config lock poisoned".to_string()))?;
+        Self::provider_keys_from(&state, provider_id)
+    }
+
+    fn provider_keys_from(
+        state: &Loaded,
+        provider_id: &str,
+    ) -> Result<ProviderKeysReport, ConfigError> {
+        let provider = state
+            .providers
+            .provider_id(provider_id)
+            .ok_or_else(|| ConfigError::UnknownProvider(provider_id.to_string()))?;
+        let spec = state
+            .providers
+            .provider(&provider)
+            .ok_or_else(|| ConfigError::UnknownProvider(provider.clone()))?;
+        let set = state.keys.providers.get(&provider);
+        let env = env_key_for(spec, |name| std::env::var(name).ok());
+        let managed_active = set
+            .filter(|set| !set.active.trim().is_empty())
+            .and_then(|set| {
+                set.keys
+                    .iter()
+                    .find(|key| key.id.eq_ignore_ascii_case(set.active.trim()))
+            })
+            .map(|key| key.id.clone());
+        let active = if let Some(id) = &managed_active {
+            id.clone()
+        } else if env.is_empty() {
+            String::new()
+        } else {
+            "env".to_string()
+        };
+        let mut keys = Vec::new();
+        if !env.is_empty() {
+            keys.push(ProviderKeyInfo {
+                id: "env".to_string(),
+                label: "Environment (.env)".to_string(),
+                masked: mask_key(&env),
+                source: "env".to_string(),
+                active: active == "env",
+                created_ms: None,
+            });
+        }
+        if let Some(set) = set {
+            for key in &set.keys {
+                keys.push(ProviderKeyInfo {
+                    id: key.id.clone(),
+                    label: if key.label.trim().is_empty() {
+                        "API key".to_string()
+                    } else {
+                        key.label.clone()
+                    },
+                    masked: mask_key(&key.secret),
+                    source: "managed".to_string(),
+                    active: managed_active.as_deref() == Some(key.id.as_str()),
+                    created_ms: (key.created_ms > 0).then_some(key.created_ms),
+                });
             }
         }
-        String::new()
+        Ok(ProviderKeysReport {
+            provider,
+            keys,
+            active,
+            has_env: !env.is_empty(),
+        })
+    }
+
+    /// Save a key and make it active. The caller is responsible for checking
+    /// it against the provider before persisting.
+    pub fn add_provider_key(
+        &self,
+        provider_id: &str,
+        label: &str,
+        secret: &str,
+    ) -> Result<ProviderKeysReport, ConfigError> {
+        let secret = clean_secret(secret)?;
+        self.mutate_keys(provider_id, |set| {
+            if set.keys.len() >= 20 {
+                return Err(ConfigError::InvalidProviderKey(
+                    "at most 20 keys can be saved per provider".to_string(),
+                ));
+            }
+            if set.keys.iter().any(|key| key.secret == secret) {
+                return Err(ConfigError::InvalidProviderKey(
+                    "this key is already saved".to_string(),
+                ));
+            }
+            let mut id = format!("key-{}", now_millis());
+            while set.keys.iter().any(|key| key.id == id) {
+                id.push('x');
+            }
+            let label = label.trim();
+            let label = if label.is_empty() {
+                format!("Key {}", set.keys.len() + 1)
+            } else {
+                label.chars().take(64).collect()
+            };
+            set.keys.push(ProviderKeyEntry {
+                id: id.clone(),
+                label,
+                secret,
+                created_ms: now_millis(),
+            });
+            set.active = id;
+            Ok(())
+        })
+    }
+
+    /// Select a saved key, or `env`/empty for the `.env` fallback.
+    pub fn activate_provider_key(
+        &self,
+        provider_id: &str,
+        key_id: &str,
+    ) -> Result<ProviderKeysReport, ConfigError> {
+        let id = key_id.trim();
+        self.mutate_keys(provider_id, |set| {
+            if id.is_empty() || id.eq_ignore_ascii_case("env") {
+                set.active.clear();
+                return Ok(());
+            }
+            let key = set
+                .keys
+                .iter()
+                .find(|key| key.id.eq_ignore_ascii_case(id))
+                .ok_or_else(|| ConfigError::UnknownProviderKey(id.to_string()))?;
+            set.active = key.id.clone();
+            Ok(())
+        })
+    }
+
+    /// Remove a managed key. Removing the active key promotes the next saved
+    /// key, then the `.env` fallback.
+    pub fn remove_provider_key(
+        &self,
+        provider_id: &str,
+        key_id: &str,
+    ) -> Result<ProviderKeysReport, ConfigError> {
+        let id = key_id.trim();
+        if id.is_empty() || id.eq_ignore_ascii_case("env") {
+            return Err(ConfigError::InvalidProviderKey(
+                "the .env fallback cannot be removed here".to_string(),
+            ));
+        }
+        self.mutate_keys(provider_id, |set| {
+            let index = set
+                .keys
+                .iter()
+                .position(|key| key.id.eq_ignore_ascii_case(id))
+                .ok_or_else(|| ConfigError::UnknownProviderKey(id.to_string()))?;
+            let removed = set.keys.remove(index);
+            if set.active == removed.id {
+                set.active = set
+                    .keys
+                    .first()
+                    .map(|key| key.id.clone())
+                    .unwrap_or_default();
+            }
+            Ok(())
+        })
+    }
+
+    fn mutate_keys(
+        &self,
+        provider_id: &str,
+        change: impl FnOnce(&mut ProviderKeySet) -> Result<(), ConfigError>,
+    ) -> Result<ProviderKeysReport, ConfigError> {
+        self.ensure_fresh();
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| ConfigError::Io("config lock poisoned".to_string()))?;
+        let provider = state
+            .providers
+            .provider_id(provider_id)
+            .ok_or_else(|| ConfigError::UnknownProvider(provider_id.to_string()))?;
+        let mut file = state.keys.clone();
+        if file.version == 0 {
+            file.version = CONFIG_VERSION;
+        }
+        let set = file.providers.entry(provider.clone()).or_default();
+        change(set)?;
+        let text = serde_json::to_string_pretty(&file)
+            .map_err(|error| ConfigError::Parse(error.to_string()))?;
+        let path = provider_keys_path(&self.root);
+        atomic_write_json(&path, &text)?;
+        restrict_private(&path);
+        restrict_private(&path.with_extension("json.bak"));
+        state.keys = file;
+        let report = Self::provider_keys_from(&state, &provider)?;
+        let signature = Signature::read(&self.root);
+        if let Ok(mut current) = self.signature.lock() {
+            *current = signature;
+        }
+        Ok(report)
     }
 
     /// Resolve a model key/id/alias for a given provider to `(key, id)`.
@@ -899,6 +1328,7 @@ impl ConfigStore {
                     },
                     context: model.context,
                     reasoning: model.reasoning,
+                    freeform: model.freeform.clone(),
                     aliases: model.aliases.clone(),
                 })
                 .collect();
@@ -1005,6 +1435,45 @@ impl ConfigStore {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+}
+
+fn clean_secret(secret: &str) -> Result<String, ConfigError> {
+    let secret = secret
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim()
+        .to_string();
+    if secret.is_empty() {
+        return Err(ConfigError::InvalidProviderKey(
+            "the key is empty".to_string(),
+        ));
+    }
+    if secret.len() > 4_096 {
+        return Err(ConfigError::InvalidProviderKey(
+            "the key is too long".to_string(),
+        ));
+    }
+    if secret.chars().any(|character| character.is_whitespace()) {
+        return Err(ConfigError::InvalidProviderKey(
+            "the key contains whitespace".to_string(),
+        ));
+    }
+    Ok(secret)
+}
+
+/// Key files are private to the logged-in OS user. On Windows the profile ACL
+/// is the boundary; on Unix tighten the file itself.
+fn restrict_private(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
     }
 }
 
@@ -1166,6 +1635,14 @@ fn validate_agent(providers: &ProvidersFile, agent: &AgentFile) -> Result<(), Co
     {
         validate_thinking(thinking)?;
     }
+    if let Some(code_mode) = agent
+        .code_mode
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        validate_code_mode(code_mode)?;
+    }
     if let Some(model) = agent
         .model
         .as_deref()
@@ -1183,6 +1660,15 @@ fn validate_agent(providers: &ProvidersFile, agent: &AgentFile) -> Result<(), Co
         providers.resolve_model(&provider_id, model)?;
     }
     Ok(())
+}
+
+fn validate_code_mode(value: &str) -> Result<(), ConfigError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "off" | "none" | "disabled" | "hybrid" | "both" | "preferred" | "only" | "strict" => Ok(()),
+        _ => Err(ConfigError::InvalidCodeMode {
+            value: value.to_string(),
+        }),
+    }
 }
 
 fn validate_thinking(level: &str) -> Result<Option<String>, ConfigError> {
@@ -1224,6 +1710,41 @@ mod tests {
         assert_eq!(effective.model, "deepseek-v4.1-flash");
         assert_eq!(effective.thinking.as_deref(), Some("high"));
         assert!(effective.key_env.contains(&"OPENCODE_API_KEY".to_string()));
+    }
+
+    #[test]
+    fn model_freeform_capability_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join(".deep_agents/config");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(
+            config.join("providers.json"),
+            r#"{
+                "version": 1,
+                "active": "custom",
+                "providers": {
+                    "custom": {
+                        "label": "Custom",
+                        "base_url": "https://example.test/v1",
+                        "key_env": "CUSTOM_KEY",
+                        "models": {
+                            "m": {
+                                "id": "model-m",
+                                "freeform": ["text", "lark"]
+                            }
+                        },
+                        "default_model": "m"
+                    }
+                },
+                "matrix": {"custom": {"workspace": {"model": "m"}}}
+            }"#,
+        )
+        .unwrap();
+        let store = ConfigStore::open(dir.path());
+        let effective = store.effective("developer", "workspace").unwrap();
+        assert_eq!(effective.provider, "custom");
+        assert_eq!(effective.model, "model-m");
+        assert_eq!(effective.freeform, vec!["text", "lark"]);
     }
 
     #[test]
@@ -1312,6 +1833,61 @@ mod tests {
     }
 
     #[test]
+    fn provider_keys_are_saved_selected_and_removed() {
+        let (dir, store) = temp_root();
+        let first = store
+            .add_provider_key("opencode", "Personal", "oc_test_a1b2")
+            .unwrap();
+        let first_id = first.active.clone();
+        assert!(!first_id.is_empty());
+        assert!(
+            first
+                .keys
+                .iter()
+                .any(|key| { key.id == first_id && key.active && key.masked == "oc_…a1b2" })
+        );
+        assert_eq!(store.resolve_key("opencode"), "oc_test_a1b2");
+        assert!(store.effective("developer", "workspace").unwrap().has_key);
+        let path = dir.path().join(".deep_agents/secrets/provider_keys.json");
+        assert!(path.is_file());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("oc_test_a1b2"));
+        assert!(
+            !serde_json::to_string(&first)
+                .unwrap()
+                .contains("oc_test_a1b2")
+        );
+
+        let second = store
+            .add_provider_key("opencode", "Backup", "oc_test_c3d4")
+            .unwrap();
+        let second_id = second.active.clone();
+        assert_eq!(
+            second
+                .keys
+                .iter()
+                .filter(|key| key.source == "managed")
+                .count(),
+            2
+        );
+        assert_eq!(store.resolve_key("opencode"), "oc_test_c3d4");
+
+        let selected = store.activate_provider_key("opencode", &first_id).unwrap();
+        assert_eq!(selected.active, first_id);
+        assert_eq!(store.resolve_key("opencode"), "oc_test_a1b2");
+
+        let removed = store.remove_provider_key("opencode", &first_id).unwrap();
+        assert_eq!(removed.active, second_id);
+        assert_eq!(store.resolve_key("opencode"), "oc_test_c3d4");
+        assert!(store.remove_provider_key("opencode", "env").is_err());
+        assert!(store.add_provider_key("opencode", "", "bad key").is_err());
+
+        drop(store);
+        let reopened = ConfigStore::open(dir.path());
+        assert_eq!(reopened.resolve_key("opencode"), "oc_test_c3d4");
+    }
+
+    #[test]
     fn saving_agent_persists_and_hot_reloads() {
         let (dir, store) = temp_root();
         store
@@ -1345,6 +1921,61 @@ mod tests {
         assert_eq!(
             store.effective("developer", "workspace").unwrap().provider,
             "opencode"
+        );
+    }
+
+    #[test]
+    fn code_mode_round_trips_and_rejects_unknown_values() {
+        let (_dir, store) = temp_root();
+        store
+            .save_agent(
+                "developer",
+                AgentFile {
+                    code_mode: Some("only".to_string()),
+                    ..AgentFile::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .effective("developer", "workspace")
+                .unwrap()
+                .code_mode
+                .as_deref(),
+            Some("only")
+        );
+        let invalid = store.save_agent(
+            "developer",
+            AgentFile {
+                code_mode: Some("turbo".to_string()),
+                ..AgentFile::default()
+            },
+        );
+        assert!(matches!(invalid, Err(ConfigError::InvalidCodeMode { .. })));
+    }
+
+    #[test]
+    fn full_codemode_round_trips() {
+        let (_dir, store) = temp_root();
+        store
+            .save_agent(
+                "developer",
+                AgentFile {
+                    full_codemode: Some(false),
+                    ..AgentFile::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .effective("developer", "workspace")
+                .unwrap()
+                .full_codemode,
+            Some(false)
+        );
+        assert_eq!(
+            store.effective("ui", "workspace").unwrap().full_codemode,
+            None
         );
     }
 

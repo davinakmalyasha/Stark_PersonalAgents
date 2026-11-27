@@ -73,7 +73,15 @@ endpoint, rebuilds completed items from `/log` when still active, then resumes
 
 The server owns one harness root. It fails closed when `STARK_HARNESS_ROOT` is
 unset. Provider routing and per-agent configuration live under
-`<harness>/.deep_agents/config/`; environment variables supply keys only.
+`<harness>/.deep_agents/config/`. Keys come from the active entry in
+`<harness>/.deep_agents/secrets/provider_keys.json`, falling back to the
+provider's `key_env` variables in `<harness>/.env`.
+
+The desktop provider panel manages those saved keys through local-only
+`/api/provider/keys*` routes and reads OpenCode Go allowance from the official
+`{base_url}/usage` endpoint. The secrets directory is deliberately outside the
+portable backup set. The active key applies on the next run; no server restart
+is needed.
 
 ## Agent components
 
@@ -81,12 +89,130 @@ unset. Provider routing and per-agent configuration live under
 
 `stark-tools/src/inventory.rs` is the source of truth for built-in tool
 metadata. `backend-rs/specs/tool-specs.json` is the frozen model-facing
-contract. Tools are grouped into scopes such as `developer`, `coder`,
+contract. Tools are grouped into scopes such as `developer`,
 `general`, `house`, `dfd`, `orchestrator`, `devops`, `explore`, and `ui`.
 
 Dispatch passes through the policy and plan guards, the question broker, the
 process manager, and MCP routing. Tool output is bounded before it reaches the
 model.
+
+### Code Mode
+
+The coding scope (`developer`) defaults to OpenCode's base Code Mode.
+Core tools (`bash`, `read`, `apply_patch`, `edit`, `glob`, `grep`) stay on the
+direct provider surface; the long-tail tools go into the `# Code Mode`
+catalog and are called through `execute` alongside the direct-only tools
+(`job`, `update_plan`, `skill`, `ask_user_question`, and delegation). Base
+Code Mode exposes the `fetch` global only. `full_codemode` is opt-in and
+defaults off, matching OpenCode release builds; enabling it pins the file and
+shell tools into the catalog, hides `glob`/`grep`, adds the script
+`timeout`/`background` inputs, and exposes `path` plus
+Bun's `Bun.file`/`Bun.write`/`Bun.Glob`, exactly like OpenCode's full Code
+Mode. `code_mode: "only"` is the execute-only full surface; `hybrid` is the
+base surface; `off` removes `execute`.
+
+`execute` runs the program in a Bun sidecar (`backend-rs/codemode-worker`,
+Bun + `@opencode/codemode` on psychoscript) and is a dispatcher, not a
+writer: nested calls cross back into Rust `dispatch` and pass through the same
+plan, read-only, approval, MCP, cancellation, and output-bound gates as direct
+calls. `fetch` and the Bun file APIs also cross back into Rust for
+`webfetch`/`read`/`edit`/`external_directory` approval and plan/read-only
+guards. MCP tools appear in programs under dotted paths (`github.get_issue`
+for `mcp__github__get_issue`). A direct call to a catalog-only tool is
+transparently repaired into an implicit one-call program and returns a
+`<tool-repair>` note. With `full_codemode`, foreground `execute` blocks up to
+`timeout` (default 2 minutes); slower scripts move to the background, return
+`Script cm_... is still running; ...` with a job ID, and report through
+`<background-result kind="codemode" ...>` follow-ups. OpenCode does not resume
+Code Mode programs across a server restart: a running script becomes
+`Interrupted by server restart.` and the server delivers that notice once at
+boot. Its durable row is deleted only after the notice is queued, so a crash
+before delivery produces it again instead of losing it. The worker is shared by every session in a harness, so each `execute`
+carries its own inventory key; the sidecar caches runtimes per inventory
+(OpenCode's `WeakMap<Inventory, Runtime>` equivalent) instead of letting the
+last `initialize` decide what a concurrent session sees. Because that sidecar
+outlives sessions, it retains the four most recent inventories rather than an
+unbounded set of language runtimes; this is transport-internal and never
+model-visible. A delivered
+background job is removed from memory and disk; no additional age or row cap
+is applied. Like OpenCode, a script that stops yielding is not killed; the
+two-minute foreground block only moves it to the background. Per-agent config
+can set `code_mode` to `off`, `hybrid`, or `only`;
+`off` restores the full direct surface and removes `execute`, while
+`hybrid` keeps the base surface (core tools direct, long-tail through
+`execute`, fetch only, no script timeout/background).
+
+The Code Mode catalog is an instruction source with OpenCode's split
+delivery. The first observation is the chat's frozen epoch baseline: it is
+rendered from the initial catalog, placed in the system prompt, and never
+rewritten. A later `CodeModeInstructions.update`/`removed` delta is rendered
+once and stored as a chronological system message, which the provider lowers
+to OpenCode's XML-escaped `<system-update>` user text (merging into an
+adjacent user message when one is last). The update precedes the user turn,
+matching `InstructionState.prepare` before input promotion. A complete-to-partial
+transition adds the `search` note; a removed tool/namespace gets OpenCode's
+removal line; re-enabling after removal restates the full catalog as an update,
+never as the baseline. A completed compaction advances the epoch like OpenCode's
+`InstructionState.advanceEpoch`: the current catalog becomes the new baseline
+and the in-memory system prompt is rebuilt for the next step, so updates that
+fell out of history are not lost.
+
+While a script runs, the worker publishes throttled `tool_progress` deltas
+(at most one per 100 ms, with a trailing update) carrying the running
+`toolCalls` rows and file diffs. The payload is OpenCode's `context.progress`
+payload; only the transport differs (Stark has a dedicated delta, OpenCode
+attaches the same data to the running tool call's state). The final result
+carries the complete rows and diffs.
+
+Every `execute` result and every background job notice passes through
+OpenCode's `ToolOutput.truncate`: at most 2,000 lines and 50 KiB of UTF-8,
+cut once at the line/byte boundary without splitting a grapheme, followed by
+the exact `[showing lines …; full output saved to …]` marker. The full text
+is spilled under `.deep_agents/tool-output/tool_<identifier>` and swept with
+OpenCode's seven-day, hourly cleanup for that directory. This is the post-tool
+stage OpenCode applies to all normalized tool results; without it a program
+returning a large array would put megabytes into history and the next provider
+request. The absolute directory is the harness data root and the identifier
+carries OpenCode's random 12-hex/14-base62 tail, so fixtures substitute exactly
+`tool-output/tool_FILE` for that one data field and byte-compare the rest of
+the marker. The save-failure variant formats the runtime's OS error text and is
+therefore not fixture-claimed across platforms.
+
+Byte parity with OpenCode v2.4.1 is fixture-proven for the Code Mode surface:
+
+- The catalog baseline, every update/removed block, the search-note
+  transition, and the `<system-update>` wrapper are generated by the real
+  OpenCode source under Bun and replayed against the Rust port
+  (`backend-rs/codemode-worker/test/opencode-parity/`).
+- `execute` and `apply_patch` custom-tool conversion is compared across every
+  freeform format combination. `apply_patch` uses OpenCode's fixed
+  `patch-grammar.txt` bytes when the model advertises Lark; text-only models
+  keep the JSON tool.
+- Freeform parse, exact `// @options:` header replay, malformed-header
+  handling, streamed JSON fragments, and function-call argument normalization
+  are compared with the real `OpenAIFreeform` helpers.
+- `ToolOutput.truncate` is compared with the real source over line, byte,
+  CRLF, and emoji/grapheme boundary cases, including the spill marker.
+
+Not all provider-envelope fields are identical, because they depend on model
+policy outside Code Mode: OpenCode computes `max_tokens` from its
+models.dev output limits and context estimate, while Stark leaves the output
+cap to the provider unless `STARK_MAX_OUTPUT_TOKENS` is set; Stark always sends
+its configured temperature, while OpenCode only sends one the selected
+model/agent sets; cache/store options follow each harness's provider layer.
+Stark omits `tool_choice`, matching OpenCode's normal requests. These fields do
+not change the Code Mode tools, messages, or results.
+
+OpenCode declares `execute` freeform (`{ type: "text", field: "code" }`) and
+uses OpenAI custom tools only when the selected model advertises a freeform
+format. Stark models can declare `"freeform": ["text", "lark"]`; the provider
+then sends `execute` as an OpenAI custom tool: plain text for `{ code }`, and
+for `{ code, timeout, background }` either unconstrained text with the
+`// @options:` first line or the exact Lark grammar when the model advertises
+`lark`. It parses custom tool calls back into the normal JSON arguments and
+replays past calls as custom calls. Models without the capability keep the JSON function
+form, exactly as OpenCode does. The Zen `deepseek-v4.1-flash` model used here
+advertises no freeform format, so it still receives the JSON function tool.
 
 ### Skills
 
@@ -121,6 +247,7 @@ The harness root holds:
 - `.deep_agents/snapshots/` — rewind checkpoints.
 - `.deep_agents/uploads/`, `imports/`, `live_screen/` — retained inputs.
 - `.deep_agents/config/` — providers, agents, MCP, and app configuration.
+- `.deep_agents/secrets/` — saved provider API keys; never exported.
 - `.deep_agents/worktrees/` — isolated agent worktrees.
 
 Rollout ordinals are the durable cursor for the run log. Database snapshots,

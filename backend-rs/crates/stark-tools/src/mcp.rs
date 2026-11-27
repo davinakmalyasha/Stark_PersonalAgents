@@ -53,6 +53,10 @@ pub struct ServerConfig {
     pub http_headers: BTreeMap<String, String>,
     #[serde(default)]
     pub scopes: Vec<String>,
+    /// Expose this server's tools through Code Mode (default true). Set
+    /// `false` to keep them as direct tool calls.
+    #[serde(default)]
+    pub codemode: Option<bool>,
     #[serde(default)]
     pub enabled_tools: Vec<String>,
     #[serde(default)]
@@ -905,6 +909,37 @@ impl McpManager {
     }
 
     pub fn tool_specs_for_scope(&self, scope: &str) -> Vec<Value> {
+        self.tool_specs_for_scope_filtered(scope, false)
+    }
+
+    /// MCP tools exposed through Code Mode (server `codemode` defaults true).
+    pub fn codemode_tool_specs_for_scope(&self, scope: &str) -> Vec<Value> {
+        self.tool_specs_for_scope_filtered(scope, true)
+    }
+
+    /// Whether one `mcp__server__tool` name belongs to a Code Mode server.
+    pub fn is_codemode_tool(&self, name: &str) -> bool {
+        let server_name = name
+            .trim_start_matches("mcp__")
+            .split("__")
+            .next()
+            .unwrap_or("");
+        if server_name.is_empty() {
+            return false;
+        }
+        self.servers
+            .read()
+            .ok()
+            .and_then(|servers| {
+                servers
+                    .iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case(server_name))
+                    .map(|(_, server)| server.config.codemode.unwrap_or(true))
+            })
+            .unwrap_or(false)
+    }
+
+    fn tool_specs_for_scope_filtered(&self, scope: &str, codemode_only: bool) -> Vec<Value> {
         let servers = match self.servers.read() {
             Ok(servers) => servers.values().cloned().collect::<Vec<_>>(),
             Err(_) => return Vec::new(),
@@ -912,6 +947,9 @@ impl McpManager {
         let mut specs = Vec::new();
         for server in servers {
             if server.status() != "connected" || !scope_matches(&server.config.scopes, scope) {
+                continue;
+            }
+            if codemode_only && !server.config.codemode.unwrap_or(true) {
                 continue;
             }
             let enabled: Vec<&str> = server
@@ -1379,6 +1417,18 @@ pub fn tool_specs_for_scope(scope: &str) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+pub fn codemode_tool_specs_for_scope(scope: &str) -> Vec<Value> {
+    McpManager::global()
+        .map(|manager| manager.codemode_tool_specs_for_scope(scope))
+        .unwrap_or_default()
+}
+
+pub fn is_codemode_tool(name: &str) -> bool {
+    McpManager::global()
+        .map(|manager| manager.is_codemode_tool(name))
+        .unwrap_or(false)
+}
+
 /// Rank specs by case-insensitive token match on name + description.
 pub(crate) fn rank_tools(specs: &[Value], query: &str, limit: usize) -> Vec<Value> {
     let limit = limit.clamp(1, 20);
@@ -1664,6 +1714,64 @@ fn truncate(value: &str, cap: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codemode_mcp_partition_respects_server_config() {
+        let manager = McpManager {
+            root: std::path::PathBuf::new(),
+            servers: RwLock::new(BTreeMap::new()),
+        };
+        let mut code = ServerConfig::default();
+        code.scopes = vec!["developer".to_string()];
+        let code = Arc::new(McpServer::new("code".to_string(), code));
+        *code.status.write().unwrap() = "connected".to_string();
+        *code.tools.write().unwrap() = vec![json!({
+            "name": "lookup",
+            "description": "Look something up",
+            "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}
+        })];
+        let mut direct = ServerConfig::default();
+        direct.scopes = vec!["developer".to_string()];
+        direct.codemode = Some(false);
+        let direct = Arc::new(McpServer::new("direct".to_string(), direct));
+        *direct.status.write().unwrap() = "connected".to_string();
+        *direct.tools.write().unwrap() = vec![json!({
+            "name": "plain",
+            "description": "Plain direct tool",
+            "inputSchema": {"type": "object"}
+        })];
+        manager
+            .servers
+            .write()
+            .unwrap()
+            .insert("code".to_string(), code);
+        manager
+            .servers
+            .write()
+            .unwrap()
+            .insert("direct".to_string(), direct);
+
+        let names = |specs: Vec<Value>| -> Vec<String> {
+            specs
+                .into_iter()
+                .filter_map(|spec| {
+                    spec.pointer("/function/name")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .collect()
+        };
+        assert_eq!(
+            names(manager.codemode_tool_specs_for_scope("developer")),
+            vec!["mcp__code__lookup"]
+        );
+        assert_eq!(
+            names(manager.tool_specs_for_scope("developer")),
+            vec!["mcp__code__lookup", "mcp__direct__plain"]
+        );
+        assert!(manager.is_codemode_tool("mcp__code__lookup"));
+        assert!(!manager.is_codemode_tool("mcp__direct__plain"));
+    }
 
     #[test]
     fn transport_failures_are_distinguished_from_tool_errors() {

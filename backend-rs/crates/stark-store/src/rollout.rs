@@ -95,6 +95,8 @@ pub enum ResponseItemPayload {
         call_id: String,
         name: String,
         arguments: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        custom_header: Option<String>,
     },
     FunctionCallOutput {
         call_id: String,

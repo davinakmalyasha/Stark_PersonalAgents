@@ -1,5 +1,5 @@
 {
-  "contract_version": 6,
+  "contract_version": 10,
   "source": "DeepSeek Harness standard core (f3803c9) + Codex multi-agent v2 (79be2e2); Developer Pi-simplified v3 surface; workspace registry v4",
   "tool_count": 49,
   "tools": [
@@ -1834,33 +1834,25 @@
       "doc": "canvas_mode(action?, mode?, targets?, wake_on?, max_actions?, until?, target?, message?) \u2014 Watch agent chats (single/multiple/all) and wake the orchestrator on completion/failure. available lists selectable chats/groups; read returns the work snapshot; message sends follow-up to a watched chat; exit stops watching."
     },
     {
-      "name": "run_code",
-      "description": "Run a short JavaScript program that calls Stark tools directly. Use this for multi-step coding work: read or search several files, compute over the results, edit files, run commands, and return one compact result. Tool calls are synchronous: const text = tools.read_file({file_path: 'src/lib.rs'}); use JSON.parse(text) for structured output. Use search('query') to discover available tools. Programs have no filesystem, network, process, or import access except through tools. Not available in plan mode. Default limits: 30s, 50 tool calls, 32KB result.",
+      "name": "execute",
+      "description": "Run JavaScript in a confined Code Mode runtime to script tool calls and HTTP requests and compose their results. Write plain JavaScript and send it exactly as written: no code fence, and no JSON or other wrapper around it. Each call is a fresh program; nothing carries over from earlier calls. `fetch` is available for HTTP requests. Imports, direct filesystem access, and timers are unavailable: there is no `setTimeout` or sleep. All other external access goes through `tools`. Inside `execute`, the only callable tools are those explicitly listed in the Code Mode catalog instructions or returned by the `search` function. Ignore tools shown outside the Code Mode catalog. They are not available in the Code Mode runtime. Call tools through `tools` using only exact paths and signatures from the catalog. Do not infer or normalize tool names; preserve bracket notation such as `tools.<namespace>[\"tool-name\"](input)`. Prefer an explicit `return`; if omitted, the final top-level expression becomes the result. Await every call whose completion matters; pending calls are interrupted when execution ends. Run independent calls concurrently with `Promise.allSettled`.",
       "parameters": {
         "type": "object",
         "properties": {
           "code": {
-            "type": "string",
-            "description": "JavaScript function body. Use return to send a JSON-serializable result."
-          },
-          "timeout_ms": {
-            "type": "integer",
-            "description": "Execution timeout in milliseconds (default 30000, max 120000)."
-          },
-          "max_tool_calls": {
-            "type": "integer",
-            "description": "Maximum inner tool calls (default 50, max 100)."
+            "type": "string"
           }
         },
         "required": [
           "code"
-        ]
+        ],
+        "additionalProperties": true
       },
       "exposed": true,
       "required": [
         "code"
       ],
-      "doc": "run_code(code, timeout_ms?, max_tool_calls?) \u2014 Run a restricted JavaScript program that calls Stark tools. Use tools.<name>({...}) synchronously and return one compact value."
+      "doc": "execute(code) \u2014 Run a confined JavaScript program that calls Stark tools. Use await tools.<name>({...}); return one compact value."
     },
     {
       "name": "agent",
@@ -2051,25 +2043,8 @@
       "message_agent",
       "wait_agent",
       "interrupt_agent",
-      "close_agent"
-    ],
-    "coder": [
-      "bash",
-      "job",
-      "read",
-      "apply_patch",
-      "edit",
-      "glob",
-      "grep",
-      "update_plan",
-      "ask_user_question",
-      "skill",
-      "spawn_agent",
-      "message_agent",
-      "wait_agent",
-      "interrupt_agent",
       "close_agent",
-      "run_code"
+      "execute"
     ],
     "general": [
       "bash",

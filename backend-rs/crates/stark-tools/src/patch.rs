@@ -37,6 +37,8 @@
 //!   in shell dispatch, not here; no `tree-sitter` dependency.
 //! - No `AppliedPatchDelta` exactness tracking; tool returns text only.
 
+use serde_json::{Value, json};
+
 use crate::paths::resolve_workspace_path;
 use crate::{ToolContext, ToolErrorClass, ToolOutcome};
 
@@ -152,26 +154,32 @@ pub(crate) async fn apply_patch(ctx: &ToolContext, patch: &str) -> ToolOutcome {
     let mut added: Vec<String> = Vec::new();
     let mut modified: Vec<String> = Vec::new();
     let mut deleted: Vec<String> = Vec::new();
+    let mut files_meta: Vec<Value> = Vec::new();
     for hunk in hunks {
         let result = match hunk {
             Hunk::AddFile { path, contents } => add_file(ctx, &path, &contents)
                 .await
-                .map(|path| (path, 'A')),
-            Hunk::DeleteFile { path } => delete_file(ctx, &path).await.map(|path| (path, 'D')),
+                .map(|(path, meta)| (path, 'A', meta)),
+            Hunk::DeleteFile { path } => delete_file(ctx, &path)
+                .await
+                .map(|(path, meta)| (path, 'D', meta)),
             Hunk::UpdateFile {
                 path,
                 move_to,
                 chunks,
             } => update_file(ctx, &path, &chunks, move_to.as_deref())
                 .await
-                .map(|path| (path, 'M')),
+                .map(|(path, meta)| (path, 'M', meta)),
         };
         match result {
-            Ok((path, kind)) => match kind {
-                'A' => added.push(path),
-                'D' => deleted.push(path),
-                _ => modified.push(path),
-            },
+            Ok((path, kind, meta)) => {
+                files_meta.push(meta);
+                match kind {
+                    'A' => added.push(path),
+                    'D' => deleted.push(path),
+                    _ => modified.push(path),
+                }
+            }
             Err(error) => return ToolOutcome::err_class(ToolErrorClass::Tool, error),
         }
     }
@@ -187,7 +195,11 @@ pub(crate) async fn apply_patch(ctx: &ToolContext, patch: &str) -> ToolOutcome {
     for path in &deleted {
         summary.push_str(&format!("D {path}\n"));
     }
-    ToolOutcome::ok(summary)
+    let mut outcome = ToolOutcome::ok(summary);
+    if !files_meta.is_empty() {
+        outcome = outcome.with_metadata(json!({"files": files_meta}));
+    }
+    outcome
 }
 
 async fn validate_hunk(ctx: &ToolContext, hunk: &Hunk) -> Result<(), String> {
@@ -242,7 +254,36 @@ fn resolve_patch_path(ctx: &ToolContext, raw: &str) -> Result<std::path::PathBuf
     resolve_workspace_path(&ctx.workspace, raw)
 }
 
-async fn add_file(ctx: &ToolContext, raw_path: &str, contents: &str) -> Result<String, String> {
+fn diff_meta(raw_path: &str, before: &str, after: &str, status: &str) -> Value {
+    let diff = similar::TextDiff::from_lines(before, after);
+    let mut additions = 0usize;
+    let mut deletions = 0usize;
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            similar::ChangeTag::Insert => additions += 1,
+            similar::ChangeTag::Delete => deletions += 1,
+            similar::ChangeTag::Equal => {}
+        }
+    }
+    let patch = diff
+        .unified_diff()
+        .context_radius(3)
+        .header(&format!("a/{raw_path}"), &format!("b/{raw_path}"))
+        .to_string();
+    json!({
+        "file": raw_path,
+        "status": status,
+        "additions": additions,
+        "deletions": deletions,
+        "patch": patch,
+    })
+}
+
+async fn add_file(
+    ctx: &ToolContext,
+    raw_path: &str,
+    contents: &str,
+) -> Result<(String, Value), String> {
     let path = resolve_patch_path(ctx, raw_path)?;
     if path.exists() {
         return Err(format!(
@@ -257,18 +298,28 @@ async fn add_file(ctx: &ToolContext, raw_path: &str, contents: &str) -> Result<S
     tokio::fs::write(&path, contents)
         .await
         .map_err(|error| format!("Failed to write file {raw_path}: {error}"))?;
-    Ok(raw_path.to_string())
+    Ok((
+        raw_path.to_string(),
+        diff_meta(raw_path, "", contents, "added"),
+    ))
 }
 
-async fn delete_file(ctx: &ToolContext, raw_path: &str) -> Result<String, String> {
+async fn delete_file(ctx: &ToolContext, raw_path: &str) -> Result<(String, Value), String> {
     let path = resolve_patch_path(ctx, raw_path)?;
     if path.is_dir() || !path.exists() {
         return Err(format!("Failed to delete file {raw_path}"));
     }
+    let before = tokio::fs::read(&path)
+        .await
+        .map_err(|error| format!("Failed to read file to delete {raw_path}: {error}"))?;
     tokio::fs::remove_file(&path)
         .await
         .map_err(|error| format!("Failed to delete file {raw_path}: {error}"))?;
-    Ok(raw_path.to_string())
+    let meta = match std::str::from_utf8(&before) {
+        Ok(before) => diff_meta(raw_path, before, "", "deleted"),
+        Err(_) => json!({"file": raw_path, "status": "deleted"}),
+    };
+    Ok((raw_path.to_string(), meta))
 }
 
 async fn update_file(
@@ -276,7 +327,7 @@ async fn update_file(
     raw_path: &str,
     chunks: &[UpdateFileChunk],
     move_to: Option<&str>,
-) -> Result<String, String> {
+) -> Result<(String, Value), String> {
     let path = resolve_patch_path(ctx, raw_path)?;
     let original = tokio::fs::read_to_string(&path)
         .await
@@ -300,16 +351,23 @@ async fn update_file(
             .await
             .map_err(|error| format!("Failed to remove original {raw_path}: {error}"))?;
         // Codex summary spells renames by destination.
-        return Ok(destination
+        let destination_path = destination
             .strip_prefix(&ctx.workspace)
             .map(|relative| relative.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_else(|_| destination.to_string_lossy().to_string()));
+            .unwrap_or_else(|_| destination.to_string_lossy().to_string());
+        return Ok((
+            destination_path.clone(),
+            diff_meta(&destination_path, &original, &updated, "modified"),
+        ));
     }
     tokio::fs::write(&path, &updated)
         .await
         .map_err(|error| format!("Failed to write file {raw_path}: {error}"))?;
 
-    Ok(raw_path.to_string())
+    Ok((
+        raw_path.to_string(),
+        diff_meta(raw_path, &original, &updated, "modified"),
+    ))
 }
 
 fn parse_patch(patch: &str) -> Result<Vec<Hunk>, ParseError> {

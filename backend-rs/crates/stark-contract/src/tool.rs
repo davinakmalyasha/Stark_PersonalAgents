@@ -159,10 +159,10 @@ mod tests {
     fn frozen_contract_loads_and_validates() {
         let file = ToolSpecFile::load(fixture()).expect("tool contract");
 
-        assert_eq!(file.contract_version, 6);
+        assert_eq!(file.contract_version, 10);
         assert_eq!(file.tool_count, 49);
         assert_eq!(file.tools.len(), 49);
-        assert_eq!(file.scope_map.len(), 9);
+        assert_eq!(file.scope_map.len(), 8);
         assert_eq!(file.exposed_tools().count(), 47);
 
         let hidden: BTreeSet<&str> = file
@@ -183,9 +183,8 @@ mod tests {
         assert_eq!(file.orphan_docs, vec!["browser_click", "browser_fill"]);
         assert!(file.tool("propose_plan").is_none());
 
-        assert_eq!(file.scope_map["developer"].len(), 15);
-        assert_eq!(file.scope_map["coder"].len(), 16);
-        assert!(file.scope_map["coder"].contains(&"run_code".to_string()));
+        assert_eq!(file.scope_map["developer"].len(), 16);
+        assert!(file.scope_map["developer"].contains(&"execute".to_string()));
         assert_eq!(file.scope_map["general"].len(), 18);
         assert_eq!(file.scope_map["house"].len(), 12);
         assert_eq!(file.scope_map["dfd"].len(), 9);

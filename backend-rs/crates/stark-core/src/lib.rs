@@ -38,6 +38,7 @@ mod workspaces;
 pub mod worktree;
 pub use agents::{
     AgentSpec, FileAccess, default_access, for_scope as agent_for_scope, resolve_agent,
+    workspace_agents,
 };
 
 pub type JobDoneHook = Arc<dyn Fn(String) + Send + Sync>;
@@ -302,6 +303,31 @@ impl RunContext {
     }
 }
 
+/// Effective Code Mode policy: configured override, then the scope default,
+/// then a contract check so a non-coding scope can never hide all its tools.
+fn code_mode_for(ctx: &RunContext) -> stark_tools::CodeMode {
+    let configured = ctx
+        .config
+        .as_ref()
+        .and_then(|config| config.code_mode.as_deref())
+        .and_then(stark_tools::CodeMode::parse);
+    let mode = configured.unwrap_or_else(|| stark_tools::default_code_mode(&ctx.scope));
+    if mode.enabled() && !stark_tools::scope_supports_code_mode(&ctx.scope) {
+        stark_tools::CodeMode::Off
+    } else {
+        mode
+    }
+}
+
+/// OpenCode `full_codemode`: configured override, then the scope default
+/// (off, matching OpenCode release builds; local/dev can opt in).
+fn full_codemode_for(ctx: &RunContext) -> bool {
+    ctx.config
+        .as_ref()
+        .and_then(|config| config.full_codemode)
+        .unwrap_or(false)
+}
+
 fn session_messages(entries: &[Value]) -> Vec<ChatMessage> {
     let mut messages = Vec::new();
     // Resume from the newest compaction: its summary replaces everything that
@@ -446,6 +472,87 @@ fn is_internal_followup(prompt: &str) -> bool {
         || trimmed.starts_with("[GROUP RESULT]")
 }
 
+/// The full agent system prompt, including the Code Mode epoch baseline.
+/// Rebuilt after a compaction advances the instruction epoch so this turn's
+/// next request carries the new baseline.
+async fn build_system_prompt(
+    ctx: &RunContext,
+    mode: &str,
+    code_mode_catalog: Option<&str>,
+) -> String {
+    let role = ctx.role.as_deref().unwrap_or("a coding agent");
+    if ctx.scope == "developer" {
+        // Developer: stable content first and the volatile runtime snapshot
+        // last so prefix-cache reuse survives plan switches. Memory/worktree
+        // blocks are intentionally absent.
+        let mut prompt = crate::prompt::system_prompt_for_agent(crate::prompt::AgentPrompt {
+            workspace: &ctx.workspace,
+            workspace_id: &ctx.workspace_id,
+            harness_root: ctx.store.harness_root(),
+            model: &ctx.model,
+            mode,
+            depth: ctx.depth,
+            code_mode_catalog,
+            access: ctx.file_access.as_str(),
+            skills: ctx
+                .config
+                .as_ref()
+                .and_then(|config| config.skills.as_deref()),
+        })
+        .await;
+        if let Some(custom) = ctx
+            .config
+            .as_ref()
+            .and_then(|config| config.system_prompt.as_deref())
+        {
+            prompt.push_str("\n\n# Agent instructions\n");
+            prompt.push_str(custom);
+        }
+        prompt
+    } else {
+        let preamble = ctx
+            .config
+            .as_ref()
+            .and_then(|config| config.system_prompt.clone())
+            .unwrap_or_else(|| match agent_for_scope(&ctx.scope) {
+                Some(agent) => agent.instructions.to_string(),
+                None => format!("You are Stark, {role}."),
+            });
+        let mut prompt = format!(
+            "{preamble} Use the provided tools to inspect and change files. Read before editing. \
+             Never invent tool results. Persist until the task is resolved: if a tool fails, read \
+             the error, fix the arguments or try an alternative tool, and continue. Keep the final answer concise.\n\n{}",
+            workspace_state::render(ctx.store.harness_root(), &ctx.workspace_id, &ctx.workspace)
+        );
+        prompt.push('\n');
+        prompt.push_str(workspace_state::USAGE_HINT);
+        if ctx.file_access.is_read_only() {
+            prompt.push_str(
+                " You are READ-ONLY in this task. Do not edit files, run mutating commands, or call write tools. \
+                 Inspect with the read-only tools available to your scope (read/grep/glob, read-only bash, files_changed) and memory. \
+                 If the task needs writes, delegate it to a workspace agent instead of doing it yourself.",
+            );
+        }
+        if let Some(instructions) = instructions::load(ctx.store.harness_root(), &ctx.workspace) {
+            prompt.push_str("\n\n");
+            prompt.push_str(&instructions);
+        }
+        if let Some(memory) =
+            crate::prompt::memory_block(ctx.store.harness_root(), &ctx.workspace_id).await
+        {
+            prompt.push_str("\n\n");
+            prompt.push_str(&memory);
+        }
+        if mode == "plan" {
+            prompt.push_str(
+                " You are in PLAN mode: inspect and plan only. Use update_plan to maintain the plan. \
+                 Do not edit files, spawn subagents, or run commands with side effects.",
+            );
+        }
+        prompt
+    }
+}
+
 async fn run_agent_inner(
     ctx: RunContext,
     prompt: String,
@@ -580,6 +687,35 @@ async fn run_agent_inner(
         .plan_state(&ctx.chat_id)
         .await
         .unwrap_or_default();
+    let code_mode = code_mode_for(&ctx);
+    // `Only` is OpenCode's execute-only full surface, so it always implies
+    // full; `Hybrid` is base unless the flag promotes it.
+    let full_codemode = code_mode.enabled()
+        && (matches!(code_mode, stark_tools::CodeMode::Only) || full_codemode_for(&ctx));
+    // OpenCode `InstructionState.prepare` runs before input promotion: the
+    // rendered update is a chronological system message placed ahead of the
+    // user turn, and the epoch baseline is all the system prompt carries.
+    let code_mode_instructions = if code_mode.enabled() {
+        stark_tools::render_code_mode_instructions_for_chat(
+            ctx.store.harness_root(),
+            &ctx.chat_id,
+            &mode,
+            &ctx.scope,
+            ctx.file_access.as_str(),
+            ctx.config
+                .as_ref()
+                .and_then(|config| config.tools.as_deref()),
+            ctx.config.as_ref().and_then(|config| config.mcp.as_deref()),
+            full_codemode,
+        )
+    } else {
+        stark_tools::remove_code_mode_instructions_for_chat(ctx.store.harness_root(), &ctx.chat_id)
+    };
+    if let Some(update) = code_mode_instructions.update.as_deref()
+        && let Some(writer) = rollout.as_mut()
+    {
+        rollout_trace::record_system(&ctx.store, writer, &ctx.chat_id, update).await;
+    }
     if !is_internal_followup(&prompt) {
         let user_message_id = ctx
             .store
@@ -602,78 +738,8 @@ async fn run_agent_inner(
     }
 
     let workspace_label = ctx.workspace.to_string_lossy().to_string();
-    let role = ctx.role.as_deref().unwrap_or("a coding agent");
-    let system_prompt = if ctx.scope == "developer" || ctx.scope == "coder" {
-        // Developer: stable content first and the volatile runtime snapshot
-        // last so prefix-cache reuse survives plan switches. Memory/worktree
-        // blocks are intentionally absent. Coder shares the shape and adds the
-        // program-tool-calling section.
-        let mut prompt = crate::prompt::system_prompt_for_agent(crate::prompt::AgentPrompt {
-            workspace: &ctx.workspace,
-            workspace_id: &ctx.workspace_id,
-            harness_root: ctx.store.harness_root(),
-            model: &ctx.model,
-            mode: &mode,
-            depth: ctx.depth,
-            code_mode: ctx.scope == "coder",
-            access: ctx.file_access.as_str(),
-            skills: ctx
-                .config
-                .as_ref()
-                .and_then(|config| config.skills.as_deref()),
-        })
-        .await;
-        if let Some(custom) = ctx
-            .config
-            .as_ref()
-            .and_then(|config| config.system_prompt.as_deref())
-        {
-            prompt.push_str("\n\n# Agent instructions\n");
-            prompt.push_str(custom);
-        }
-        prompt
-    } else {
-        let preamble = ctx
-            .config
-            .as_ref()
-            .and_then(|config| config.system_prompt.clone())
-            .unwrap_or_else(|| match agent_for_scope(&ctx.scope) {
-                Some(agent) => agent.instructions.to_string(),
-                None => format!("You are Stark, {role}."),
-            });
-        let mut prompt = format!(
-            "{preamble} Use the provided tools to inspect and change files. Read before editing. \
-             Never invent tool results. Persist until the task is resolved: if a tool fails, read \
-             the error, fix the arguments or try an alternative tool, and continue. Keep the final answer concise.\n\n{}",
-            workspace_state::render(ctx.store.harness_root(), &ctx.workspace_id, &ctx.workspace)
-        );
-        prompt.push('\n');
-        prompt.push_str(workspace_state::USAGE_HINT);
-        if ctx.file_access.is_read_only() {
-            prompt.push_str(
-                " You are READ-ONLY in this task. Do not edit files, run mutating commands, or call write tools. \
-                 Inspect with the read-only tools available to your scope (read/grep/glob, read-only bash, files_changed) and memory. \
-                 If the task needs writes, delegate it to a workspace agent instead of doing it yourself.",
-            );
-        }
-        if let Some(instructions) = instructions::load(ctx.store.harness_root(), &ctx.workspace) {
-            prompt.push_str("\n\n");
-            prompt.push_str(&instructions);
-        }
-        if let Some(memory) =
-            crate::prompt::memory_block(ctx.store.harness_root(), &ctx.workspace_id).await
-        {
-            prompt.push_str("\n\n");
-            prompt.push_str(&memory);
-        }
-        if mode == "plan" {
-            prompt.push_str(
-                " You are in PLAN mode: inspect and plan only. Use update_plan to maintain the plan. \
-                 Do not edit files, spawn subagents, or run commands with side effects.",
-            );
-        }
-        prompt
-    };
+    let system_prompt =
+        build_system_prompt(&ctx, &mode, code_mode_instructions.initial.as_deref()).await;
     let mut messages = vec![ChatMessage::system(system_prompt)];
     // Rollout is canonical when present; legacy JSONL/SQLite is the fallback.
     let rollout_lines = rollout
@@ -699,9 +765,9 @@ async fn run_agent_inner(
     } else {
         messages.extend(session_messages(&session_entries));
     }
-    // Codex parity: every executing scope, including Developer/Coder, sees the
-    // current plan progress. Excluding them let the two main coding agents
-    // drift from the plan they were asked to maintain.
+    // Codex parity: every executing scope, including Developer, sees the
+    // current plan progress. Excluding the coding agent let it drift from the
+    // plan it was asked to maintain.
     if let Ok(block) = plan_store.progress_block(&ctx.chat_id, &ctx.scope).await
         && !block.is_empty()
     {
@@ -715,6 +781,7 @@ async fn run_agent_inner(
     let affinity = ctx.affinity().await;
     maybe_compact(
         &ctx,
+        &mode,
         &mut messages,
         &affinity,
         None,
@@ -744,9 +811,18 @@ async fn run_agent_inner(
     )
     .with_plan_store(Arc::new(plan_store))
     .with_harness_root(ctx.store.harness_root().to_path_buf())
+    // One worker per harness in production; tests get a disposable one so the
+    // sidecar does not keep the test process alive.
+    .with_worker_manager(if cfg!(test) {
+        stark_tools::WorkerManager::local(ctx.store.harness_root())
+    } else {
+        stark_tools::WorkerManager::for_root(ctx.store.harness_root())
+    })
     .with_workspace_id(ctx.workspace_id.clone())
     .with_scope(ctx.scope.clone())
     .with_access(ctx.file_access.as_str())
+    .with_code_mode(code_mode)
+    .with_full_codemode(full_codemode)
     .with_mode(mode.clone())
     .with_depth(ctx.depth)
     .with_allowed_tools(ctx.config.as_ref().and_then(|config| config.tools.clone()))
@@ -760,6 +836,13 @@ async fn run_agent_inner(
         let agent = agent_label.clone();
         tools = tools.with_code_delta(Arc::new(move |delta| {
             let _ = tx.send(ServerEvent::new("delta", delta.with_agent(agent.clone())));
+        }));
+        // Background `execute` scripts report through the run's job hook so
+        // their `<background-result>` arrives as a follow-up turn, exactly
+        // like OpenCode's synthetic session message.
+        tools = tools.with_background_hook(ctx.on_job_done.clone().map(|hook| {
+            let hook: crate::JobDoneHook = hook;
+            Arc::new(move |message: String| hook(message)) as stark_tools::BackgroundHook
         }));
     }
     let mut last_continuous_screen: Option<Instant> = None;
@@ -824,7 +907,7 @@ async fn run_agent_inner(
             .lock()
             .map(|set| set.clone())
             .unwrap_or_default();
-        let tool_specs = stark_tools::tool_specs_for_run(
+        let tool_specs = stark_tools::tool_specs_for_run_with_code_mode_full(
             &mode,
             &ctx.scope,
             ctx.file_access.as_str(),
@@ -833,6 +916,8 @@ async fn run_agent_inner(
                 .as_ref()
                 .and_then(|config| config.tools.as_deref()),
             ctx.config.as_ref().and_then(|config| config.mcp.as_deref()),
+            code_mode,
+            full_codemode,
         );
         if previous_tool_count.is_some_and(|previous| previous != tool_specs.len()) {
             timing.record_tools_change();
@@ -1049,6 +1134,27 @@ async fn run_agent_inner(
                             Some(cost),
                         )
                         .await;
+                    }
+                }
+                Ok(ProviderEvent::CustomTool { .. }) => {}
+                Ok(ProviderEvent::ToolCallFinal {
+                    index,
+                    id,
+                    name,
+                    arguments,
+                    header,
+                }) => {
+                    timing.record_first_token();
+                    let call = calls.entry(index).or_default();
+                    if let Some(id) = id {
+                        call.id = Some(id);
+                    }
+                    if let Some(name) = name {
+                        call.name = Some(name);
+                    }
+                    call.arguments = arguments;
+                    if header.is_some() {
+                        call.custom_header = header;
                     }
                 }
                 Ok(ProviderEvent::ToolCall {
@@ -1430,6 +1536,7 @@ async fn run_agent_inner(
                     call.name.unwrap_or_default(),
                     call.arguments,
                 )
+                .with_custom_header(call.custom_header.as_deref())
             })
             .collect();
         // Parse arguments once, before any batch planning or dispatch. A
@@ -1539,6 +1646,7 @@ async fn run_agent_inner(
                     &call.id,
                     &call.function.name,
                     &call.function.arguments,
+                    call.custom_header.as_deref(),
                 )
                 .await;
             }
@@ -1877,17 +1985,19 @@ async fn run_agent_inner(
                 started.elapsed().as_millis() as u64
             };
             let preview: String = outcome.content.chars().take(300).collect();
-            ctx.emit_delta(
-                Delta::tool_finished(
-                    &call.function.name,
-                    &args_text,
-                    !outcome.is_error,
-                    elapsed,
-                    preview,
-                )
-                .with_agent(agent_label.clone())
-                .with_children(outcome.children.clone()),
-            );
+            let mut delta = Delta::tool_finished(
+                &call.function.name,
+                &args_text,
+                !outcome.is_error,
+                elapsed,
+                preview,
+            )
+            .with_agent(agent_label.clone())
+            .with_children(outcome.children.clone());
+            if let Some(metadata) = &outcome.metadata {
+                delta = delta.with_metadata(metadata.clone());
+            }
+            ctx.emit_delta(delta);
             if let Some(plan) = &outcome.plan {
                 state.plan = Some(plan.clone());
                 ctx.emit_state(&mut state);
@@ -1999,6 +2109,7 @@ async fn run_agent_inner(
         }
         maybe_compact(
             &ctx,
+            &mode,
             &mut messages,
             &affinity,
             measured_tokens,
@@ -2290,6 +2401,7 @@ async fn force_compact(
 
 async fn maybe_compact(
     ctx: &RunContext,
+    mode: &str,
     messages: &mut Vec<ChatMessage>,
     affinity: &str,
     measured_tokens: Option<usize>,
@@ -2348,6 +2460,21 @@ async fn maybe_compact(
         return;
     }
     *messages = outcome.messages;
+    // OpenCode advances the instruction epoch with a completed compaction:
+    // the current catalog becomes the baseline because earlier updates are no
+    // longer in history.
+    stark_tools::rebase_code_mode_instructions_for_chat(ctx.store.harness_root(), &ctx.chat_id);
+    // OpenCode reloads the context after a completed compaction, so the next
+    // request's system prompt carries the new epoch baseline. Rebuild it here;
+    // the old baseline may describe updates that are no longer in history.
+    let baseline = stark_tools::code_mode_instructions_baseline_for_chat(
+        ctx.store.harness_root(),
+        &ctx.chat_id,
+    );
+    let prompt = build_system_prompt(ctx, mode, baseline.as_deref()).await;
+    if let Some(first) = messages.first_mut() {
+        *first = ChatMessage::system(prompt);
+    }
     if let Err(error) = ctx
         .store
         .append_message_with_metadata(
@@ -2415,6 +2542,7 @@ struct PartialCall {
     id: Option<String>,
     name: Option<String>,
     arguments: String,
+    custom_header: Option<String>,
 }
 
 async fn finish_aborted(
@@ -3032,6 +3160,14 @@ mod tests {
     use stark_providers::ProviderConfig;
     use stark_providers::ProviderError;
 
+    /// Opt-in OpenCode `full_codemode` surface for tests that exercise the
+    /// execute-only catalog. Production Developer defaults to base mode.
+    fn full_codemode_agent() -> Arc<stark_config::EffectiveAgent> {
+        let mut effective = stark_config::builtin_effective("default");
+        effective.full_codemode = Some(true);
+        Arc::new(effective)
+    }
+
     #[test]
     fn repair_hints_name_the_class_and_escalate_repeats() {
         let mut last = None;
@@ -3280,6 +3416,71 @@ mod tests {
             .unwrap()
     }
 
+    #[derive(Clone)]
+    struct FreeformState {
+        counter: Arc<AtomicUsize>,
+        requests: Arc<Mutex<Vec<Value>>>,
+    }
+
+    async fn mock_freeform_provider(
+        axum::extract::State(state): axum::extract::State<FreeformState>,
+        Json(body): Json<Value>,
+    ) -> Response {
+        state.requests.lock().unwrap().push(body);
+        let turn = state.counter.fetch_add(1, Ordering::SeqCst);
+        let input = r#"// @options: { "timeout" : 120000}
+return await tools.read({ file_path: "a.txt" })"#;
+        let payload = if turn == 0 {
+            vec![
+                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"custom","custom":{"name":"execute","input":input}}]}}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+            ]
+        } else {
+            vec![
+                json!({"choices":[{"delta":{"content":"Done"}}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            ]
+        };
+        let mut body = String::new();
+        for item in payload {
+            body.push_str("data: ");
+            body.push_str(&item.to_string());
+            body.push('\n');
+            body.push('\n');
+        }
+        body.push_str("data: [DONE]\n\n");
+        Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[derive(Clone)]
+    struct TextState {
+        requests: Arc<Mutex<Vec<Value>>>,
+    }
+
+    async fn mock_text_provider(
+        axum::extract::State(state): axum::extract::State<TextState>,
+        Json(body): Json<Value>,
+    ) -> Response {
+        state.requests.lock().unwrap().push(body);
+        let mut body = String::new();
+        for item in [
+            json!({"choices":[{"delta":{"content":"Done"}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+        ] {
+            body.push_str("data: ");
+            body.push_str(&item.to_string());
+            body.push_str("\n\n");
+        }
+        body.push_str("data: [DONE]\n\n");
+        Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
     async fn mock_plan_provider(
         axum::extract::State(counter): axum::extract::State<Arc<AtomicUsize>>,
         Json(_body): Json<Value>,
@@ -3336,15 +3537,15 @@ mod tests {
             .unwrap()
     }
 
-    async fn mock_coder_provider(
+    async fn mock_developer_provider(
         axum::extract::State(counter): axum::extract::State<Arc<AtomicUsize>>,
         Json(_body): Json<Value>,
     ) -> Response {
         let turn = counter.fetch_add(1, Ordering::SeqCst);
-        let code = "const t = tools.read({ file_path: \"a.txt\" }); tools.edit({ file_path: \"a.txt\", old_string: \"hello\", new_string: \"bye\" }); return { done: t.includes(\"hello\") };";
+        let code = "const t = await tools.read({ file_path: \"a.txt\" }); await tools.edit({ file_path: \"a.txt\", old_string: \"hello\", new_string: \"bye\" }); return { done: t.includes(\"hello\") };";
         let payload = if turn == 0 {
             vec![
-                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"run_code","arguments": serde_json::to_string(&json!({"code": code})).unwrap()}}]},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"execute","arguments": serde_json::to_string(&json!({"code": code})).unwrap()}}]},"finish_reason":null}]}),
                 json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
             ]
         } else {
@@ -3546,8 +3747,8 @@ mod tests {
             chat_id: "truncated-chat".to_string(),
             workspace_id: "_general".to_string(),
             workspace: dir.path().to_path_buf(),
-            role: Some("Coder".to_string()),
-            scope: "coder".to_string(),
+            role: Some("Developer".to_string()),
+            scope: "developer".to_string(),
             depth: 0,
             file_access: crate::FileAccess::Write,
             model: "mock".to_string(),
@@ -3683,8 +3884,8 @@ mod tests {
             chat_id: "parallel-chat".to_string(),
             workspace_id: "_general".to_string(),
             workspace: dir.path().to_path_buf(),
-            role: Some("Coder".to_string()),
-            scope: "coder".to_string(),
+            role: Some("Developer".to_string()),
+            scope: "developer".to_string(),
             depth: 0,
             file_access: crate::FileAccess::Write,
             model: "mock".to_string(),
@@ -3801,8 +4002,8 @@ mod tests {
             chat_id: "write-batch".to_string(),
             workspace_id: "_general".to_string(),
             workspace: dir.path().to_path_buf(),
-            role: Some("Coder".to_string()),
-            scope: "coder".to_string(),
+            role: Some("Developer".to_string()),
+            scope: "developer".to_string(),
             depth: 0,
             file_access: crate::FileAccess::Write,
             model: "mock".to_string(),
@@ -3837,12 +4038,233 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn coder_turn_completes_multistep_work_in_one_program() {
+    async fn freeform_stream_preserves_header_and_replays_custom_call() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = FreeformState {
+            counter: Arc::new(AtomicUsize::new(0)),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let requests = state.requests.clone();
+        let app = Router::new()
+            .route("/chat/completions", post(mock_freeform_provider))
+            .with_state(state);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        let provider = Provider::new(ProviderConfig {
+            mode: "opencode".to_string(),
+            base_url: format!("http://{address}"),
+            api_key: "test".to_string(),
+            model: "mock".to_string(),
+        })
+        .unwrap()
+        .with_freeform(vec!["text".to_string(), "lark".to_string()]);
+        let (tx, mut rx) = broadcast::channel(512);
+        let latest = Arc::new(Mutex::new(None));
+        let ctx = RunContext {
+            chat_id: "freeform-core".to_string(),
+            workspace_id: "_general".to_string(),
+            workspace: dir.path().to_path_buf(),
+            role: Some("Developer".to_string()),
+            scope: "developer".to_string(),
+            depth: 0,
+            file_access: crate::FileAccess::Write,
+            model: "mock".to_string(),
+            temperature: 0.0,
+            images: Vec::new(),
+            provider,
+            store: store.clone(),
+            questions: Arc::new(QuestionBroker::new()),
+            tx,
+            latest,
+            steering: Arc::new(Mutex::new(VecDeque::new())),
+            follow_up: Arc::new(Mutex::new(VecDeque::new())),
+            checkpoint: None,
+            cancel: CancellationToken::new(),
+            config: Some(full_codemode_agent()),
+            on_job_done: None,
+        };
+        run_agent(ctx, "run it".to_string()).await.unwrap();
+
+        let bodies = requests.lock().unwrap().clone();
+        assert!(bodies.len() >= 2, "{bodies:#?}");
+        let execute_tool = bodies[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| {
+                tool["function"]["name"] == "execute" || tool["custom"]["name"] == "execute"
+            })
+            .expect("execute tool");
+        assert_eq!(execute_tool["type"], json!("custom"));
+        assert_eq!(execute_tool["custom"]["format"]["type"], json!("grammar"));
+        let replayed = bodies[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|message| message["tool_calls"].as_array())
+            .and_then(|calls| calls.first())
+            .expect("replayed tool call");
+        assert_eq!(replayed["type"], json!("custom"));
+        let input = replayed["custom"]["input"].as_str().unwrap_or_default();
+        assert_eq!(
+            input.lines().next(),
+            Some(r#"// @options: { "timeout" : 120000}"#)
+        );
+        assert!(
+            input.ends_with("return await tools.read({ file_path: \"a.txt\" })"),
+            "{input}"
+        );
+        let tool_content = bodies[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .and_then(|message| message["content"].as_str())
+            .unwrap_or_default();
+        assert!(tool_content.contains("hello"), "{tool_content}");
+
+        let mut progress = false;
+        while let Ok(event) = rx.try_recv() {
+            if event.event == "delta" && event.data["kind"] == "tool_progress" {
+                progress = true;
+            }
+        }
+        assert!(progress, "no tool_progress delta");
+    }
+
+    #[tokio::test]
+    async fn catalog_updates_are_chronological_system_messages() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = TextState {
+            requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let requests = state.requests.clone();
+        let app = Router::new()
+            .route("/chat/completions", post(mock_text_provider))
+            .with_state(state);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        let provider = Provider::new(ProviderConfig {
+            mode: "opencode".to_string(),
+            base_url: format!("http://{address}"),
+            api_key: "test".to_string(),
+            model: "mock".to_string(),
+        })
+        .unwrap();
+        let context = |tools: &[&str]| {
+            let mut effective = stark_config::builtin_effective("default");
+            effective.tools = Some(tools.iter().map(|tool| tool.to_string()).collect());
+            effective.full_codemode = Some(true);
+            let (tx, _) = broadcast::channel(64);
+            RunContext {
+                chat_id: "instructions-chat".to_string(),
+                workspace_id: "_general".to_string(),
+                workspace: dir.path().to_path_buf(),
+                role: Some("Developer".to_string()),
+                scope: "developer".to_string(),
+                depth: 0,
+                file_access: crate::FileAccess::Write,
+                model: "mock".to_string(),
+                temperature: 0.0,
+                images: Vec::new(),
+                provider: provider.clone(),
+                store: store.clone(),
+                questions: Arc::new(QuestionBroker::new()),
+                tx,
+                latest: Arc::new(Mutex::new(None)),
+                steering: Arc::new(Mutex::new(VecDeque::new())),
+                follow_up: Arc::new(Mutex::new(VecDeque::new())),
+                checkpoint: None,
+                cancel: CancellationToken::new(),
+                config: Some(Arc::new(effective)),
+                on_job_done: None,
+            }
+        };
+        run_agent(context(&["execute", "read"]), "first".to_string())
+            .await
+            .unwrap();
+        run_agent(context(&["execute", "read", "edit"]), "second".to_string())
+            .await
+            .unwrap();
+        run_agent(context(&["execute", "read", "edit"]), "third".to_string())
+            .await
+            .unwrap();
+
+        let bodies = requests.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 3, "{bodies:#?}");
+        let system = bodies[1]["messages"][0]["content"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(system.contains("# Code Mode"), "{system}");
+        assert!(system.contains("tools.read"), "{system}");
+        assert!(!system.contains("New tools are available"), "{system}");
+        assert!(!system.contains("tools.edit("), "{system}");
+        let messages = bodies[1]["messages"].as_array().unwrap();
+        let update = messages
+            .iter()
+            .position(|message| {
+                message["role"] == "user"
+                    && message["content"]
+                        .as_str()
+                        .is_some_and(|content| content.contains("<system-update>"))
+            })
+            .expect("chronological system update");
+        let text = messages[update]["content"].as_str().unwrap();
+        assert!(text.starts_with("<system-update>\n"), "{text}");
+        assert!(text.ends_with("\n</system-update>"), "{text}");
+        assert!(text.contains("tools.edit"), "{text}");
+        assert_eq!(text.matches("<system-update>").count(), 1, "{text}");
+        assert_eq!(messages[update + 1]["content"], json!("second"));
+
+        let updates = bodies[2]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| {
+                message["role"] == "user"
+                    && message["content"]
+                        .as_str()
+                        .is_some_and(|content| content.contains("<system-update>"))
+            })
+            .count();
+        assert_eq!(updates, 1);
+
+        let path =
+            stark_store::rollout::find_rollout(store.harness_root(), "instructions-chat").unwrap();
+        let lines = stark_store::rollout::read_rollout(&path);
+        let systems = lines
+            .iter()
+            .filter_map(|line| match &line.item {
+                stark_store::rollout::RolloutItem::ResponseItem {
+                    payload:
+                        stark_store::rollout::ResponseItemPayload::Message { role, content, .. },
+                    ..
+                } if role == "system" => content.as_str().map(str::to_string),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(systems.len(), 1, "{systems:#?}");
+        assert!(systems[0].contains("tools.edit"), "{}", systems[0]);
+    }
+
+    #[tokio::test]
+    async fn developer_turn_completes_multistep_work_in_one_program() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let counter = Arc::new(AtomicUsize::new(0));
         let app = Router::new()
-            .route("/chat/completions", post(mock_coder_provider))
+            .route("/chat/completions", post(mock_developer_provider))
             .with_state(counter.clone());
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
@@ -3861,11 +4283,11 @@ mod tests {
         let (tx, _rx) = broadcast::channel(256);
         let latest = Arc::new(Mutex::new(None));
         let ctx = RunContext {
-            chat_id: "coder-chat".to_string(),
+            chat_id: "developer-chat".to_string(),
             workspace_id: "_general".to_string(),
             workspace: dir.path().to_path_buf(),
-            role: Some("Coder".to_string()),
-            scope: "coder".to_string(),
+            role: Some("Developer".to_string()),
+            scope: "developer".to_string(),
             depth: 0,
             file_access: crate::FileAccess::Write,
             model: "mock".to_string(),
@@ -3880,7 +4302,7 @@ mod tests {
             follow_up: Arc::new(Mutex::new(VecDeque::new())),
             checkpoint: None,
             cancel: CancellationToken::new(),
-            config: None,
+            config: Some(full_codemode_agent()),
             on_job_done: None,
         };
         run_agent(ctx, "rename hello to bye".to_string())
@@ -4082,13 +4504,18 @@ mod tests {
     }
 
     #[test]
-    fn internal_followups_are_never_user_visible() {
+    fn delegation_and_group_followups_are_internal() {
         assert!(is_internal_followup("[DELEGATION RESULT] job done"));
         assert!(is_internal_followup(
             "[AGENT RESULT] workspace:_general:dev · Developer · completed chat: del-1 4 Review the child result and continue."
         ));
         assert!(is_internal_followup(
             "[GROUP RESULT] project=p item=i (t) status=completed\n\nreport"
+        ));
+        // OpenCode stores the background notice as a synthetic user message,
+        // so it must survive into history rather than stay one-shot.
+        assert!(!is_internal_followup(
+            "<background-result kind=\"codemode\" id=\"cm_1\" state=\"completed\">\ndone\n</background-result>"
         ));
         assert!(!is_internal_followup("Hello"));
         assert!(!is_internal_followup("[TASK] something"));
@@ -4100,12 +4527,20 @@ mod tests {
             json!({"type": "message", "role": "user", "content": "do the math"}),
             json!({"type": "message", "role": "user", "content": "[AGENT RESULT] workspace:_general:developer · Developer · completed chat: del-1 4 Review the child result and continue."}),
             json!({"type": "message", "role": "user", "content": "[GROUP RESULT] project=p item=i (t) status=completed\n\nreport"}),
+            json!({"type": "message", "role": "user", "content": "<background-result kind=\"codemode\" id=\"cm_1\" state=\"completed\">\ndone\n</background-result>"}),
             json!({"type": "message", "role": "assistant", "content": "done"}),
         ];
         let messages = session_messages(&entries);
-        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].content.as_deref(), Some("do the math"));
-        assert_eq!(messages[1].content.as_deref(), Some("done"));
+        assert!(
+            messages[1]
+                .content
+                .as_deref()
+                .unwrap()
+                .starts_with("<background-result")
+        );
+        assert_eq!(messages[2].content.as_deref(), Some("done"));
     }
 
     #[test]
@@ -4353,6 +4788,142 @@ mod tests {
         assert!(status.get("sampling_request_count").is_some());
         assert!(status.get("tool_blocking_ms").is_some());
         assert!(status.get("total_ms").is_some());
+    }
+
+    async fn mock_capture_request(
+        axum::extract::State(requests): axum::extract::State<Arc<Mutex<Vec<Value>>>>,
+        Json(body): Json<Value>,
+    ) -> Response {
+        requests.lock().unwrap().push(body);
+        let payload = [
+            json!({"choices":[{"delta":{"content":"ok"}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+        ];
+        let mut body = String::new();
+        for item in payload {
+            body.push_str(&format!("data: {item}\n\n"));
+        }
+        body.push_str("data: [DONE]\n\n");
+        Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn developer_request_defaults_to_base_codemode() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/chat/completions", post(mock_capture_request))
+            .with_state(requests.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        let provider = Provider::new(ProviderConfig {
+            mode: "deepseek".to_string(),
+            base_url: format!("http://{address}"),
+            api_key: "test".to_string(),
+            model: "mock".to_string(),
+        })
+        .unwrap();
+        let (tx, _rx) = broadcast::channel(256);
+        let ctx = RunContext {
+            chat_id: "dev-codemode".to_string(),
+            workspace_id: "_general".to_string(),
+            workspace: dir.path().to_path_buf(),
+            role: Some("Developer".to_string()),
+            scope: "developer".to_string(),
+            depth: 0,
+            file_access: crate::FileAccess::Write,
+            model: "mock".to_string(),
+            temperature: 0.0,
+            images: Vec::new(),
+            provider,
+            store: store.clone(),
+            questions: Arc::new(QuestionBroker::new()),
+            tx,
+            latest: Arc::new(Mutex::new(None)),
+            steering: Arc::new(Mutex::new(VecDeque::new())),
+            follow_up: Arc::new(Mutex::new(VecDeque::new())),
+            checkpoint: None,
+            cancel: CancellationToken::new(),
+            config: None,
+            on_job_done: None,
+        };
+        run_agent(ctx, "say hi".to_string()).await.unwrap();
+
+        let requests = requests.lock().unwrap().clone();
+        let first = requests.first().expect("provider request");
+        let tool_names: Vec<&str> = first["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect();
+        assert!(tool_names.contains(&"execute"), "{tool_names:?}");
+        for core in ["read", "edit", "bash", "glob", "grep"] {
+            assert!(
+                tool_names.contains(&core),
+                "base lost {core}: {tool_names:?}"
+            );
+        }
+        assert_eq!(tool_names.last(), Some(&"execute"), "{tool_names:?}");
+        let execute = first["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| {
+                tool["function"]["name"] == "execute" || tool["custom"]["name"] == "execute"
+            })
+            .expect("execute definition");
+        assert_eq!(
+            execute["function"]["description"],
+            stark_tools::code_mode_execute_description(false)
+        );
+        assert!(
+            execute["function"]["parameters"]["properties"]
+                .get("timeout")
+                .is_none()
+        );
+        assert!(
+            execute["function"]["parameters"]["properties"]
+                .get("background")
+                .is_none()
+        );
+        assert!(
+            execute["function"]["parameters"]["properties"]
+                .get("max_tool_calls")
+                .is_none()
+        );
+
+        let system = first["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .filter(|message| message["role"] == "system")
+            .filter_map(|message| message["content"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Base mode keeps core tools direct, so the catalog must not repeat
+        // their signatures; the long-tail catalog may still be present.
+        for expression in [
+            "tools.read(",
+            "tools.edit(",
+            "tools.bash(",
+            "tools.glob(",
+            "tools.grep(",
+        ] {
+            assert!(
+                !system.contains(expression),
+                "{expression} leaked: {system}"
+            );
+        }
     }
 
     async fn mock_empty_tool_call_then_done(

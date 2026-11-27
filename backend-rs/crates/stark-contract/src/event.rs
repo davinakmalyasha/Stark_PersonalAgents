@@ -24,6 +24,9 @@ pub struct Delta {
     pub ms: Option<u64>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub children: Vec<Value>,
+    /// Structured tool metadata (file diffs, code-mode call rows, …).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
     /// Out-of-band run state (compaction, context warnings, …). Kept in the
     /// delta stream so every client folds it through the same path.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -43,6 +46,25 @@ impl Delta {
         Self::new("usage", text)
     }
 
+    /// A running Code Mode `execute` progress publication: call rows and
+    /// file diffs. Mirrors OpenCode's `context.progress` metadata.
+    pub fn tool_progress(metadata: Value) -> Self {
+        Self {
+            kind: "tool_progress".to_string(),
+            text: String::new(),
+            agent: None,
+            model: None,
+            ts: None,
+            tool: Some("execute".to_string()),
+            args: None,
+            ok: None,
+            ms: None,
+            children: Vec::new(),
+            metadata: Some(metadata),
+            status: None,
+        }
+    }
+
     pub fn end(text: impl Into<String>) -> Self {
         Self::new("end", text)
     }
@@ -59,6 +81,7 @@ impl Delta {
             ok: None,
             ms: None,
             children: Vec::new(),
+            metadata: None,
             status: None,
         }
     }
@@ -81,6 +104,7 @@ impl Delta {
             ok: Some(ok),
             ms: Some(ms),
             children: Vec::new(),
+            metadata: None,
             status: None,
         }
     }
@@ -101,6 +125,11 @@ impl Delta {
         self
     }
 
+    pub fn with_metadata(mut self, metadata: Value) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+
     fn new(kind: &str, text: impl Into<String>) -> Self {
         Self {
             kind: kind.to_string(),
@@ -113,6 +142,7 @@ impl Delta {
             ok: None,
             ms: None,
             children: Vec::new(),
+            metadata: None,
             status: None,
         }
     }

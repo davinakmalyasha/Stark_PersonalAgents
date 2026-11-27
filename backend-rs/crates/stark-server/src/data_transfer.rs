@@ -46,6 +46,7 @@ const DURABLE: &[&str] = &[
 /// exactly what a backup leaves behind.
 const EXCLUDED: &[&str] = &[
     ".env",
+    ".deep_agents/secrets",
     ".deep_agents/jobs.db",
     ".deep_agents/backups",
     ".deep_agents/exports",
@@ -557,6 +558,10 @@ mod tests {
         std::fs::write(harness.join(".env"), "OPENCODE_API_KEY=secret").unwrap();
         for (path, body) in [
             (".deep_agents/config/providers.json", "{\"providers\":{}}"),
+            (
+                ".deep_agents/secrets/provider_keys.json",
+                "{\"providers\":{\"opencode\":{\"active\":\"k\",\"keys\":[{\"id\":\"k\",\"secret\":\"oc_secret\"}]}}}",
+            ),
             (".deep_agents/AGENTS.md", "global rules"),
             (".deep_agents/tasks/task_chat.json", "{\"plan\":[]}"),
             (".deep_agents/skills/review/SKILL.md", "review skill"),
@@ -605,6 +610,10 @@ mod tests {
         assert!(
             !names.iter().any(|name| name.ends_with(".env")),
             "export must never contain .env: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name.contains("provider_keys")),
+            "export must never contain the provider key store: {names:?}"
         );
         assert!(
             !names.iter().any(|name| name.ends_with("jobs.db")),

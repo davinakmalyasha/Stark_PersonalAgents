@@ -1,10 +1,12 @@
 //! Harness disk retention: bounded cleanup of files the harness generates.
 //!
-//! Stark writes disposable artifacts in three places:
+//! Stark writes disposable artifacts in four places:
 //!
 //! - `scratch/*.log`, `scratch/*.txt`, `scratch/*.png` — full tool output
 //!   spilled next to a truncated result, grep/glob overflow, and browser
 //!   screenshots.
+//! - `.deep_agents/tool-output/tool_*` — Code Mode's OpenCode-shaped
+//!   `ToolOutput` spill; cleaned hourly by age, exactly like OpenCode.
 //! - `<workspace>/.deep_agents/snapshots/<chat>/<run>/` — pre-edit file bytes
 //!   for rewind (`checkpoint::Checkpoint`). Snapshots live in the project
 //!   workspace, not in the harness root, so every registered workspace has to
@@ -142,6 +144,59 @@ fn is_scratch_file(path: &Path) -> bool {
             path.extension().and_then(|ext| ext.to_str()),
             Some("log" | "txt" | "png")
         )
+}
+
+/// OpenCode `ToolOutput.DIRECTORY`: `tool-output` beside the harness data.
+fn tool_output_dir(root: &Path) -> PathBuf {
+    root.join(".deep_agents").join("tool-output")
+}
+
+/// OpenCode's cleanup regex is `^tool_[0-9a-f]{12}`, not the full identifier:
+/// the 14-character random tail may contain any base62 character.
+fn is_tool_output_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(rest) = name.strip_prefix("tool_") else {
+        return false;
+    };
+    rest.len() >= 12
+        && rest.as_bytes()[..12]
+            .iter()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// OpenCode deletes tool-output files older than seven days, once an hour.
+fn sweep_tool_output(root: &Path, now: SystemTime) -> (usize, u64) {
+    let directory = tool_output_dir(root);
+    let Ok(entries) = std::fs::read_dir(&directory) else {
+        return (0, 0);
+    };
+    let mut removed = 0usize;
+    let mut freed = 0u64;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !is_tool_output_file(&path) {
+            continue;
+        }
+        let age = now.duration_since(modified(&path)).unwrap_or_default();
+        if age <= Duration::from_secs(7 * 24 * 60 * 60) {
+            continue;
+        }
+        let size = entry
+            .metadata()
+            .ok()
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        if std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+            freed += size;
+        }
+    }
+    (removed, freed)
 }
 
 /// Newest-first ordering that stays deterministic when timestamps tie: path
@@ -395,6 +450,9 @@ pub fn sweep_harness(
 ) -> RetentionReport {
     let now = SystemTime::now();
     let (scratch_removed, scratch_bytes) = sweep_scratch(root, policy, now);
+    // OpenCode's ToolOutput layer does this independently of its scratch-like
+    // artifacts: ten-to-the-hour sweep, seven-day age, no count/byte cap.
+    let _ = sweep_tool_output(root, now);
     let mut roots = vec![root.to_path_buf()];
     roots.extend(workspaces.iter().cloned());
     let (snapshot_runs_removed, snapshot_bytes) = sweep_snapshot_roots(&roots, policy, now);
@@ -539,6 +597,26 @@ mod tests {
         let (removed, _) = sweep_scratch(dir.path(), &policy, now);
         assert_eq!(removed, 3);
         assert!(names(&scratch_dir(dir.path())).is_empty());
+    }
+
+    #[test]
+    fn tool_output_sweep_matches_opencode_prefix_and_age() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = tool_output_dir(dir.path());
+        std::fs::create_dir_all(&output).unwrap();
+        std::fs::write(output.join("tool_0123456789ab"), "old").unwrap();
+        std::fs::write(output.join("tool_0123456789g0"), "not hex").unwrap();
+        std::fs::write(output.join("notes.txt"), "foreign").unwrap();
+
+        let (removed, _) = sweep_tool_output(dir.path(), SystemTime::now());
+        assert_eq!(removed, 0, "seven days have not passed");
+
+        let now = SystemTime::now() + Duration::from_secs(86_400 * 8);
+        let (removed, _) = sweep_tool_output(dir.path(), now);
+        assert_eq!(removed, 1);
+        assert!(!output.join("tool_0123456789ab").exists());
+        assert!(output.join("tool_0123456789g0").exists());
+        assert!(output.join("notes.txt").exists());
     }
 
     #[test]

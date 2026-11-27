@@ -1,0 +1,609 @@
+{
+  "source": "opencode v2.4.1 (dev 9964772) packages/ai/src/protocols/openai-freeform.ts",
+  "prefix": "// @options:",
+  "parse": [
+    {
+      "name": "options_and_code",
+      "custom": "full",
+      "raw": "// @options: {\"timeout\": 1}\nlet x",
+      "input": "{\"timeout\":1,\"code\":\"let x\"}",
+      "header": "// @options: {\"timeout\": 1}"
+    },
+    {
+      "name": "spaced_options",
+      "custom": "full",
+      "raw": "// @options: { \"background\" : true }\nx",
+      "input": "{\"background\":true,\"code\":\"x\"}",
+      "header": "// @options: { \"background\" : true }"
+    },
+    {
+      "name": "crlf_options",
+      "custom": "full",
+      "raw": "// @options:{\"background\" :false,\"timeout\":2}\r\nx",
+      "input": "{\"background\":false,\"timeout\":2,\"code\":\"x\"}",
+      "header": "// @options:{\"background\" :false,\"timeout\":2}\r"
+    },
+    {
+      "name": "no_newline",
+      "custom": "full",
+      "raw": "// @options: {\"timeout\": 1}",
+      "input": "{\"code\":\"// @options: {\\\"timeout\\\": 1}\"}"
+    },
+    {
+      "name": "malformed_options",
+      "custom": "full",
+      "raw": "// @options: {timeout: 1}\nx",
+      "input": "// @options: {timeout: 1}\nx"
+    },
+    {
+      "name": "array_options",
+      "custom": "full",
+      "raw": "// @options: [1]\nx",
+      "input": "// @options: [1]\nx"
+    },
+    {
+      "name": "plain_code",
+      "custom": "full",
+      "raw": "plain code",
+      "input": "{\"code\":\"plain code\"}"
+    },
+    {
+      "name": "plain_custom",
+      "custom": "plain",
+      "raw": "// @options: {\"timeout\": 1}\nx",
+      "input": "{\"code\":\"// @options: {\\\"timeout\\\": 1}\\nx\"}"
+    },
+    {
+      "name": "undeclared_custom",
+      "custom": "none",
+      "raw": "// @options: {\"timeout\": 1}\nx",
+      "input": "{\"input\":\"// @options: {\\\"timeout\\\": 1}\\nx\"}"
+    }
+  ],
+  "replay": [
+    {
+      "name": "exact_header",
+      "input": {
+        "code": "x",
+        "timeout": 1
+      },
+      "header": "// @options: { \"timeout\" : 1}",
+      "raw": "// @options: { \"timeout\" : 1}\nx"
+    },
+    {
+      "name": "same_values_new_layout",
+      "input": {
+        "code": "x",
+        "timeout": 1
+      },
+      "header": "// @options: {\"timeout\":1}",
+      "raw": "// @options: {\"timeout\":1}\nx"
+    },
+    {
+      "name": "changed_value",
+      "input": {
+        "code": "x",
+        "timeout": 2
+      },
+      "header": "// @options: {\"timeout\":1}",
+      "raw": "// @options: {\"timeout\":2}\nx"
+    },
+    {
+      "name": "options_without_header",
+      "input": {
+        "code": "x",
+        "background": true
+      },
+      "raw": "// @options: {\"background\":true}\nx"
+    },
+    {
+      "name": "code_only",
+      "input": {
+        "code": "x"
+      },
+      "raw": "x"
+    },
+    {
+      "name": "non_string_code",
+      "input": {
+        "code": 3
+      },
+      "raw": "{\"code\":3}"
+    }
+  ],
+  "stream": [
+    {
+      "name": "two_chunks",
+      "chunks": [
+        "let ",
+        "x = 1"
+      ],
+      "fragments": [
+        "{\"code\":\"let ",
+        "x = 1",
+        "\"}"
+      ]
+    },
+    {
+      "name": "empty_chunk",
+      "chunks": [
+        ""
+      ],
+      "fragments": [
+        "{\"code\":\"",
+        "\"}"
+      ]
+    },
+    {
+      "name": "escapes",
+      "chunks": [
+        "a\"b\\c\n",
+        "<x>"
+      ],
+      "fragments": [
+        "{\"code\":\"a\\\"b\\\\c\\n",
+        "<x>",
+        "\"}"
+      ]
+    }
+  ],
+  "json": [
+    {
+      "raw": "{\"file_path\":\"a.txt\", \"limit\": 2}",
+      "normalized": "{\"file_path\":\"a.txt\",\"limit\":2}"
+    },
+    {
+      "raw": "{\"text\":\"a\\/b\\u00e9\"}",
+      "normalized": "{\"text\":\"a/bé\"}"
+    },
+    {
+      "raw": "{\"n\":1.0}",
+      "normalized": "{\"n\":1}"
+    },
+    {
+      "raw": "{\"n\":1e2}",
+      "normalized": "{\"n\":100}"
+    },
+    {
+      "raw": "{\"n\":1.5e-3}",
+      "normalized": "{\"n\":0.0015}"
+    },
+    {
+      "raw": "{\"n\":1e21}",
+      "normalized": "{\"n\":1e+21}"
+    },
+    {
+      "raw": "{\"n\":-0.0}",
+      "normalized": "{\"n\":0}"
+    },
+    {
+      "raw": "{\"b\":true,\"a\":false}",
+      "normalized": "{\"b\":true,\"a\":false}"
+    },
+    {
+      "raw": "{\"nested\":[1,{\"x\":\"y\"}],\"empty\":{}}",
+      "normalized": "{\"nested\":[1,{\"x\":\"y\"}],\"empty\":{}}"
+    },
+    {
+      "raw": "{\"ctrl\":\"\\u0001\\n\"}",
+      "normalized": "{\"ctrl\":\"\\u0001\\n\"}"
+    }
+  ],
+  "tools": [
+    {
+      "name": "text_and_lark",
+      "formats": [
+        "text",
+        "lark"
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "execute",
+            "description": "desc",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "code": {
+                  "type": "string"
+                },
+                "timeout": {
+                  "type": "integer",
+                  "maximum": 9007199254740991,
+                  "exclusiveMinimum": 0,
+                  "description": "Optional time in milliseconds to wait for the script before moving it to the background (default 120000). The script keeps running in the background after that; it is never stopped. With `background: true` the call returns immediately instead."
+                },
+                "background": {
+                  "type": "boolean",
+                  "description": "Run the script in the background and return immediately with its job ID (useful for long-running work). You will be notified when it completes. DO NOT poll for completion."
+                }
+              },
+              "required": [
+                "code"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "apply_patch",
+            "description": "Apply a unified patch.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "input": {
+                  "type": "string",
+                  "description": "Patch text. Start with *** Begin Patch and end with *** End Patch."
+                }
+              },
+              "required": [
+                "input"
+              ]
+            }
+          }
+        }
+      ],
+      "expected": [
+        {
+          "type": "custom",
+          "custom": {
+            "name": "execute",
+            "description": "desc\n\nTo set the parameters below, start with a `// @options:` line holding a JSON object of them, then write `code` from the next line. Leave the line out to use the defaults.\n- `timeout` (integer): Optional time in milliseconds to wait for the script before moving it to the background (default 120000). The script keeps running in the background after that; it is never stopped. With `background: true` the call returns immediately instead.\n- `background` (boolean): Run the script in the background and return immediately with its job ID (useful for long-running work). You will be notified when it completes. DO NOT poll for completion.\nFor example:\n// @options: {\"background\": true}\n<code>",
+            "format": {
+              "type": "grammar",
+              "grammar": {
+                "syntax": "lark",
+                "definition": "start: ff_line ff_body | ff_plain\nff_line: \"// @options:\" \" \"* \"{\" \" \"* ff_pair (\" \"* \",\" \" \"* ff_pair)* \" \"* \"}\" \"\\n\"\nff_pair: \"\\\"timeout\\\"\" \" \"* \":\" \" \"* /[1-9][0-9]*/ | \"\\\"background\\\"\" \" \"* \":\" \" \"* (\"true\" | \"false\")\nff_body: /[\\s\\S]+/\nff_plain: /(?:[^\\/]|\\/[^\\/]|\\/\\/[^ ]|\\/\\/ [^@]|\\/\\/ @[^o]|\\/\\/ @o[^p]|\\/\\/ @op[^t]|\\/\\/ @opt[^i]|\\/\\/ @opti[^o]|\\/\\/ @optio[^n]|\\/\\/ @option[^s]|\\/\\/ @options[^:])[\\s\\S]*|\\/|\\/\\/|\\/\\/ |\\/\\/ @|\\/\\/ @o|\\/\\/ @op|\\/\\/ @opt|\\/\\/ @opti|\\/\\/ @optio|\\/\\/ @option|\\/\\/ @options/"
+              }
+            }
+          }
+        },
+        {
+          "type": "custom",
+          "custom": {
+            "name": "apply_patch",
+            "description": "Apply a unified patch.",
+            "format": {
+              "type": "grammar",
+              "grammar": {
+                "syntax": "lark",
+                "definition": "start: begin_patch hunk+ end_patch\nbegin_patch: \"*** Begin Patch\" LF\nend_patch: \"*** End Patch\" LF?\n\nhunk: add_hunk | delete_hunk | update_hunk\nadd_hunk: \"*** Add File: \" filename LF add_line+\ndelete_hunk: \"*** Delete File: \" filename LF\nupdate_hunk: \"*** Update File: \" filename LF change_move? change?\n\nfilename: /(.+)/\nadd_line: \"+\" /(.*)/ LF -> line\n\nchange_move: \"*** Move to: \" filename LF\nchange: (change_context | change_line)+ eof_line?\nchange_context: (\"@@\" | \"@@ \" /(.+)/) LF\nchange_line: (\"+\" | \"-\" | \" \") /(.*)/ LF\neof_line: \"*** End of File\" LF\n\n%import common.LF\n"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "text_only",
+      "formats": [
+        "text"
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "execute",
+            "description": "desc",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "code": {
+                  "type": "string"
+                },
+                "timeout": {
+                  "type": "integer",
+                  "maximum": 9007199254740991,
+                  "exclusiveMinimum": 0,
+                  "description": "Optional time in milliseconds to wait for the script before moving it to the background (default 120000). The script keeps running in the background after that; it is never stopped. With `background: true` the call returns immediately instead."
+                },
+                "background": {
+                  "type": "boolean",
+                  "description": "Run the script in the background and return immediately with its job ID (useful for long-running work). You will be notified when it completes. DO NOT poll for completion."
+                }
+              },
+              "required": [
+                "code"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "apply_patch",
+            "description": "Apply a unified patch.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "input": {
+                  "type": "string",
+                  "description": "Patch text. Start with *** Begin Patch and end with *** End Patch."
+                }
+              },
+              "required": [
+                "input"
+              ]
+            }
+          }
+        }
+      ],
+      "expected": [
+        {
+          "type": "custom",
+          "custom": {
+            "name": "execute",
+            "description": "desc\n\nTo set the parameters below, start with a `// @options:` line holding a JSON object of them, then write `code` from the next line. Leave the line out to use the defaults.\n- `timeout` (integer): Optional time in milliseconds to wait for the script before moving it to the background (default 120000). The script keeps running in the background after that; it is never stopped. With `background: true` the call returns immediately instead.\n- `background` (boolean): Run the script in the background and return immediately with its job ID (useful for long-running work). You will be notified when it completes. DO NOT poll for completion.\nFor example:\n// @options: {\"background\": true}\n<code>",
+            "format": {
+              "type": "text"
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "apply_patch",
+            "description": "Apply a unified patch.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "input": {
+                  "type": "string",
+                  "description": "Patch text. Start with *** Begin Patch and end with *** End Patch."
+                }
+              },
+              "required": [
+                "input"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "lark_only",
+      "formats": [
+        "lark"
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "execute",
+            "description": "desc",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "code": {
+                  "type": "string"
+                },
+                "timeout": {
+                  "type": "integer",
+                  "maximum": 9007199254740991,
+                  "exclusiveMinimum": 0,
+                  "description": "Optional time in milliseconds to wait for the script before moving it to the background (default 120000). The script keeps running in the background after that; it is never stopped. With `background: true` the call returns immediately instead."
+                },
+                "background": {
+                  "type": "boolean",
+                  "description": "Run the script in the background and return immediately with its job ID (useful for long-running work). You will be notified when it completes. DO NOT poll for completion."
+                }
+              },
+              "required": [
+                "code"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "apply_patch",
+            "description": "Apply a unified patch.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "input": {
+                  "type": "string",
+                  "description": "Patch text. Start with *** Begin Patch and end with *** End Patch."
+                }
+              },
+              "required": [
+                "input"
+              ]
+            }
+          }
+        }
+      ],
+      "expected": [
+        {
+          "type": "function",
+          "function": {
+            "name": "execute",
+            "description": "desc",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "code": {
+                  "type": "string"
+                },
+                "timeout": {
+                  "type": "integer",
+                  "maximum": 9007199254740991,
+                  "exclusiveMinimum": 0,
+                  "description": "Optional time in milliseconds to wait for the script before moving it to the background (default 120000). The script keeps running in the background after that; it is never stopped. With `background: true` the call returns immediately instead."
+                },
+                "background": {
+                  "type": "boolean",
+                  "description": "Run the script in the background and return immediately with its job ID (useful for long-running work). You will be notified when it completes. DO NOT poll for completion."
+                }
+              },
+              "required": [
+                "code"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        {
+          "type": "custom",
+          "custom": {
+            "name": "apply_patch",
+            "description": "Apply a unified patch.",
+            "format": {
+              "type": "grammar",
+              "grammar": {
+                "syntax": "lark",
+                "definition": "start: begin_patch hunk+ end_patch\nbegin_patch: \"*** Begin Patch\" LF\nend_patch: \"*** End Patch\" LF?\n\nhunk: add_hunk | delete_hunk | update_hunk\nadd_hunk: \"*** Add File: \" filename LF add_line+\ndelete_hunk: \"*** Delete File: \" filename LF\nupdate_hunk: \"*** Update File: \" filename LF change_move? change?\n\nfilename: /(.+)/\nadd_line: \"+\" /(.*)/ LF -> line\n\nchange_move: \"*** Move to: \" filename LF\nchange: (change_context | change_line)+ eof_line?\nchange_context: (\"@@\" | \"@@ \" /(.+)/) LF\nchange_line: (\"+\" | \"-\" | \" \") /(.*)/ LF\neof_line: \"*** End of File\" LF\n\n%import common.LF\n"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "json_only",
+      "formats": [],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "execute",
+            "description": "desc",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "code": {
+                  "type": "string"
+                },
+                "timeout": {
+                  "type": "integer",
+                  "maximum": 9007199254740991,
+                  "exclusiveMinimum": 0,
+                  "description": "Optional time in milliseconds to wait for the script before moving it to the background (default 120000). The script keeps running in the background after that; it is never stopped. With `background: true` the call returns immediately instead."
+                },
+                "background": {
+                  "type": "boolean",
+                  "description": "Run the script in the background and return immediately with its job ID (useful for long-running work). You will be notified when it completes. DO NOT poll for completion."
+                }
+              },
+              "required": [
+                "code"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "apply_patch",
+            "description": "Apply a unified patch.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "input": {
+                  "type": "string",
+                  "description": "Patch text. Start with *** Begin Patch and end with *** End Patch."
+                }
+              },
+              "required": [
+                "input"
+              ]
+            }
+          }
+        }
+      ],
+      "expected": [
+        {
+          "type": "function",
+          "function": {
+            "name": "execute",
+            "description": "desc",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "code": {
+                  "type": "string"
+                },
+                "timeout": {
+                  "type": "integer",
+                  "maximum": 9007199254740991,
+                  "exclusiveMinimum": 0,
+                  "description": "Optional time in milliseconds to wait for the script before moving it to the background (default 120000). The script keeps running in the background after that; it is never stopped. With `background: true` the call returns immediately instead."
+                },
+                "background": {
+                  "type": "boolean",
+                  "description": "Run the script in the background and return immediately with its job ID (useful for long-running work). You will be notified when it completes. DO NOT poll for completion."
+                }
+              },
+              "required": [
+                "code"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "apply_patch",
+            "description": "Apply a unified patch.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "input": {
+                  "type": "string",
+                  "description": "Patch text. Start with *** Begin Patch and end with *** End Patch."
+                }
+              },
+              "required": [
+                "input"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "execute_schema": {
+    "base": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code"
+      ],
+      "additionalProperties": false
+    },
+    "full": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "timeout": {
+          "type": "integer",
+          "maximum": 9007199254740991,
+          "exclusiveMinimum": 0,
+          "description": "Optional time in milliseconds to wait for the script before moving it to the background (default 120000). The script keeps running in the background after that; it is never stopped. With `background: true` the call returns immediately instead."
+        },
+        "background": {
+          "type": "boolean",
+          "description": "Run the script in the background and return immediately with its job ID (useful for long-running work). You will be notified when it completes. DO NOT poll for completion."
+        }
+      },
+      "required": [
+        "code"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

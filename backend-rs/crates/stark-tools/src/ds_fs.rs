@@ -24,7 +24,7 @@ use nucleo::{
     pattern::{AtomKind, CaseMatching, Normalization, Pattern},
 };
 use regex::RegexBuilder;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::paths::{relative_display, resolve_workspace_path};
 use crate::{ToolContext, ToolErrorClass, ToolOutcome};
@@ -263,14 +263,38 @@ pub async fn edit(ctx: &ToolContext, args: &Value) -> ToolOutcome {
     } else {
         content.replacen(old_string, new_string, 1)
     };
-    if let Err(error) = tokio::fs::write(&path, updated).await {
+    if let Err(error) = tokio::fs::write(&path, &updated).await {
         return ToolOutcome::err_class(ToolErrorClass::Tool, format!("Error: {raw}: {error}"));
     }
+    let diff = similar::TextDiff::from_lines(&content, &updated);
+    let mut additions = 0usize;
+    let mut deletions = 0usize;
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            similar::ChangeTag::Insert => additions += 1,
+            similar::ChangeTag::Delete => deletions += 1,
+            similar::ChangeTag::Equal => {}
+        }
+    }
+    let patch = diff
+        .unified_diff()
+        .context_radius(3)
+        .header(&format!("a/{raw}"), &format!("b/{raw}"))
+        .to_string();
     ToolOutcome::ok(format!(
         "[OK] Edited {raw} ({} replacement{})",
         count,
         if count == 1 { "" } else { "s" }
     ))
+    .with_metadata(json!({
+        "files": [{
+            "file": raw,
+            "status": "modified",
+            "additions": additions,
+            "deletions": deletions,
+            "patch": patch,
+        }]
+    }))
 }
 
 /// Stark's explosion guard: the denylist from the old `codex_walk` prune.

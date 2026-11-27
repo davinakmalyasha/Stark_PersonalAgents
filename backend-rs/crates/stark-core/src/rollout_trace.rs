@@ -67,6 +67,13 @@ pub fn messages_from_rollout(lines: &[RolloutLine]) -> Vec<ChatMessage> {
                     let text = content_text(content);
                     if role == "user" {
                         messages.push(ChatMessage::user(text));
+                    } else if role == "system" {
+                        // Chronological instruction update: OpenCode stores
+                        // these as system messages and the provider lowers
+                        // them to `<system-update>` user text.
+                        if !text.is_empty() {
+                            messages.push(ChatMessage::system(text));
+                        }
                     } else if role == "assistant" {
                         if !text.trim().is_empty() {
                             messages.push(ChatMessage::assistant(&text));
@@ -82,15 +89,19 @@ pub fn messages_from_rollout(lines: &[RolloutLine]) -> Vec<ChatMessage> {
                     call_id,
                     name,
                     arguments,
+                    custom_header,
                     ..
                 } => {
                     messages.push(ChatMessage::assistant_tool_calls(
                         None,
-                        vec![stark_providers::ToolCall::function(
-                            call_id.clone(),
-                            name.clone(),
-                            arguments.clone(),
-                        )],
+                        vec![
+                            stark_providers::ToolCall::function(
+                                call_id.clone(),
+                                name.clone(),
+                                arguments.clone(),
+                            )
+                            .with_custom_header(custom_header.as_deref()),
+                        ],
                     ));
                 }
                 ResponseItemPayload::FunctionCallOutput {
@@ -297,6 +308,33 @@ pub async fn record_user(
     .await;
 }
 
+/// Chronological instruction update. Replayed as a system message and lowered
+/// by the provider to OpenCode's `<system-update>` user wrapper.
+pub async fn record_system(
+    store: &stark_store::ChatStore,
+    writer: &mut RolloutWriter,
+    chat_id: &str,
+    content: &str,
+) {
+    record(
+        store,
+        writer,
+        chat_id,
+        RolloutItem::ResponseItem {
+            payload: ResponseItemPayload::Message {
+                id: None,
+                role: "system".to_string(),
+                content: Value::String(content.to_string()),
+                provider: None,
+                model: None,
+                stop_reason: None,
+            },
+            metadata: None,
+        },
+    )
+    .await;
+}
+
 pub async fn record_assistant(
     store: &stark_store::ChatStore,
     writer: &mut RolloutWriter,
@@ -361,6 +399,7 @@ pub async fn record_function_call(
     call_id: &str,
     name: &str,
     arguments: &str,
+    custom_header: Option<&str>,
 ) {
     record(
         store,
@@ -372,6 +411,7 @@ pub async fn record_function_call(
                 call_id: call_id.to_string(),
                 name: name.to_string(),
                 arguments: arguments.to_string(),
+                custom_header: custom_header.map(str::to_string),
             },
             metadata: None,
         },
@@ -721,6 +761,28 @@ mod tests {
     }
 
     #[test]
+    fn custom_header_survives_rollout_replay() {
+        let mut call = call_line("call-1", "execute");
+        if let RolloutItem::ResponseItem {
+            payload: ResponseItemPayload::FunctionCall { custom_header, .. },
+            ..
+        } = &mut call.item
+        {
+            *custom_header = Some("// @options: { \"timeout\" : 1}".to_string());
+        }
+        let messages = messages_from_rollout(&[call, output_line("call-1", "execute", "ok")]);
+        let calls = messages
+            .iter()
+            .flat_map(|message| message.tool_calls.iter().flatten())
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].custom_header.as_deref(),
+            Some("// @options: { \"timeout\" : 1}")
+        );
+    }
+
+    #[test]
     fn dangling_tool_call_is_resumable() {
         let call = RolloutLine {
             timestamp: "t0".to_string(),
@@ -731,6 +793,7 @@ mod tests {
                     call_id: "call-1".to_string(),
                     name: "read_file".to_string(),
                     arguments: "{}".to_string(),
+                    custom_header: None,
                 },
                 metadata: None,
             },
@@ -767,6 +830,7 @@ mod tests {
                     call_id: "call-2".to_string(),
                     name: "read_file".to_string(),
                     arguments: "{}".to_string(),
+                    custom_header: None,
                 },
                 metadata: None,
             },
@@ -797,6 +861,7 @@ mod tests {
                     call_id: call_id.to_string(),
                     name: name.to_string(),
                     arguments: "{}".to_string(),
+                    custom_header: None,
                 },
                 metadata: None,
             },

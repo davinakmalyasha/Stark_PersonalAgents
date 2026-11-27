@@ -20,12 +20,14 @@ use crate::shell::ShellState;
 
 /// The native overlay is larger than any state it draws: the pill grows into
 /// it without a native resize, and the clear area stays click-through. The
-/// chat surface sets the ceiling (552 × 616 plus breathing room).
-pub const ISLAND_WINDOW: (f32, f32) = (620.0, 720.0);
+/// chat surface sets the ceiling (552 × 480 plus breathing room).
+pub const ISLAND_WINDOW: (f32, f32) = (620.0, 560.0);
 
 const SHELF_W: f32 = 456.0;
 const CHAT_W: f32 = 552.0;
-const CHAT_H: f32 = 616.0;
+/// Compact on purpose: a scanner + composer, not a full-page chat. Longer
+/// transcripts scroll inside the body.
+const CHAT_H: f32 = 480.0;
 
 const HAIRLINE: &str = "#ffffff14";
 const TEXT: &str = "#f4f4f5";
@@ -1677,17 +1679,20 @@ fn add_layer(s: &IslandState, model: &IslandModel, width: f32) -> El {
                 if s.add_menu == AddMenu::Closed {
                     s.add_menu = AddMenu::Radial;
                 }
-            } else if s.add_menu == AddMenu::Radial {
+            } else {
+                // Leaving the fan/chooser always drops back to the shelf and
+                // lifts the scrim, as if the menu were never opened.
                 s.add_menu = AddMenu::Closed;
             }
         });
-    let plus_x = layer_w - 34.0;
+    // Pinned to the fan's right edge, not placed from its width: the fan
+    // grows leftward, and the plus must stay exactly under the pointer.
     let mut plus = el()
         .key("island-add")
         .role("button")
         .focusable(true)
         .label(if open { "Close add menu" } else { "Add" })
-        .absolute(plus_x, 0.0)
+        .pin(None, Some(0.0), Some(4.0), None)
         .size(30.0, 30.0)
         .radius(15.0)
         .center()
@@ -1763,6 +1768,25 @@ fn add_layer(s: &IslandState, model: &IslandModel, width: f32) -> El {
         }
     }
     layer
+}
+
+/// The dim + blur behind the add menu. It sits over the shelf, while the add
+/// layer is painted after it; a press on the blurred area closes the menu,
+/// and moving the pointer off the layer does the same on hover. No `modal`:
+/// a modal child makes the pointer look like it left the notch, which would
+/// collapse the whole shelf under the menu.
+fn add_scrim() -> El {
+    el().key("island-add-scrim")
+        .absolute(0.0, 0.0)
+        .w_full()
+        .h_full()
+        .fill(rgba(0.0, 0.0, 0.0, 0.34))
+        .backdrop_blur(5.0)
+        .corners([0.0, 0.0, 18.0, 18.0])
+        .clip_corners([0.0, 0.0, 18.0, 18.0])
+        .role("button")
+        .label("Close add menu")
+        .on_press(|s: &mut IslandState| s.add_menu = AddMenu::Closed)
 }
 
 fn tab_row(s: &IslandState) -> El {
@@ -2350,10 +2374,13 @@ pub fn island_view(s: &IslandState, _cx: &mut Cx<IslandState>) -> El {
     if let Some(target) = chat_open {
         notch = notch.child(chat_surface(s, &model, target));
     } else if shelf_open {
-        notch = notch
-            .child(shelf_header(&model))
-            .child(shelf_body(&model))
-            .child(add_layer(s, &model, w));
+        notch = notch.child(shelf_header(&model)).child(shelf_body(&model));
+        if s.add_menu != AddMenu::Closed {
+            notch = notch.child(add_scrim());
+        }
+        // The floating add layer is a sibling after the scrim, so it stays
+        // above the dim/blur and keeps its own hover + press area.
+        notch = notch.child(add_layer(s, &model, w));
     } else {
         let header_h = if listening {
             34.0

@@ -41,23 +41,32 @@ The native app is also a background desktop surface:
 
 - **Stark Island** (`island.rs`) is a Rune overlay at the top-center of the
   primary display. It is transparent, topmost and skipped from the taskbar;
-  only the notch itself is an input region, so the rest of its 620×720 window
+  only the notch itself is an input region, so the rest of its 620×560 window
   is click-through. The island exists only in live mode, and arming alone
   raises it: the prompt-dock mic warms the speech models and shows the idle
   island (104×24 mark + status dot, white hairline, no glow), while only the
   island's mic — or `Ctrl+Space` while armed — starts capture.
-  Hover expands the **activity shelf**: running chats, active group projects
-  and cloud runs, three rows at a time with the rest scrolling. The top-right
-  add control fans into Chat / Group / Cloud; each offers a new item or picks
-  an existing one. Choosing a chat opens a pinned in-overlay chat (compact
-  prompt dock with mic and send, up to three tabs for concurrent work),
-  backed by the same markdown renderer as the main transcript. Chat is the
-  only screen that opts into keyboard focus: on Windows the overlay window is
-  otherwise `WS_EX_NOACTIVATE` and becomes activatable only while that screen
-  is up (`OverlayHandle::set_activatable`), and it captures the whole surface
-  so a click can never leak through to the app underneath. Turning the dock
-  off disarms every bus, releases the models and hides the island. A hidden
-  island releases its GPU surface after 20s.
+  Hover opens the **Live / Work** shell on the active thread. Live is the
+  default and replaces the old status line with a two-seat mode rail:
+  - **Live** is the active chat with a voice stage. With the mic off it shows
+    the conversation (or the “The mic is yours, Boss” hero when empty) above a
+    real prompt dock with text send and mic. The mic starts the existing STT;
+    while listening the surface clears to the live orb and interim transcript,
+    and the dock returns when capture stops. Finals use the same draft /
+    auto-send path as the rest of the app. Live watches the active chat and
+    opts into keyboard activation (`OverlayHandle::set_activatable`) so its
+    dock can take keys; the window style alone never steals focus.
+  - **Work** is the activity shelf: running chats, active group projects and
+    cloud runs, three rows at a time with the rest scrolling. The top-right
+    add control fans into Chat / Group / Cloud; each offers a new item or picks
+    an existing one. Choosing a chat opens a pinned in-overlay chat (compact
+    prompt dock with mic and send, up to three tabs for concurrent work),
+    backed by the same markdown renderer as the main transcript. The chat
+    surface captures the whole overlay so a click can never leak through.
+  Switching to Work stops capture and releases the Live watch; a fresh hover
+  starts in Live again. Turning the dock off disarms every bus, releases the
+  models and hides the island. A hidden island releases its GPU surface after
+  20s.
 - **Background lifetime** (`presence.rs`, `shell.rs`) uses `keep_running`:
   closing the main window hides it and stops capture but keeps live mode
   armed — agents, the tray and the idle island stay alive. `--background`

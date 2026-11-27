@@ -20,7 +20,8 @@ use crate::shell::ShellState;
 
 /// The native overlay is larger than any state it draws: the pill grows into
 /// it without a native resize, and the clear area stays click-through. The
-/// chat surface sets the ceiling (552 × 480 plus breathing room).
+/// chat surface sets the width ceiling (552) and Live / chat share the height
+/// ceiling (480), plus breathing room.
 pub const ISLAND_WINDOW: (f32, f32) = (620.0, 560.0);
 
 const SHELF_W: f32 = 456.0;
@@ -28,12 +29,19 @@ const CHAT_W: f32 = 552.0;
 /// Compact on purpose: a scanner + composer, not a full-page chat. Longer
 /// transcripts scroll inside the body.
 const CHAT_H: f32 = 480.0;
+/// Live is a chat with a voice stage. It shares the chat's height ceiling so
+/// neither surface reaches down into the app's prompt dock.
+const LIVE_H: f32 = 480.0;
+const MODE_RAIL_W: f32 = 158.0;
+const MODE_TAB_W: f32 = 76.0;
 
 const HAIRLINE: &str = "#ffffff14";
 const TEXT: &str = "#f4f4f5";
 const MUTED: &str = "#8a8a93";
 const RED: &str = "#f87171";
 const SPRING: rune::Spring = rune::Spring::new(0.36, 0.16);
+const MODE_PILL: rune::Spring = rune::Spring::new(0.38, 0.22);
+const ORB_FLIGHT: rune::Spring = rune::Spring::new(0.46, 0.12);
 
 fn ink(hex: &'static str) -> rune::Color {
     rune::color::hex(hex).unwrap_or(rune::Color::BLACK)
@@ -81,6 +89,15 @@ pub enum IslandKind {
     Chat,
     Project,
     Cloud,
+}
+
+/// The expanded island has two rooms. Live is the voice-first chat surface;
+/// Work is the activity shelf. Live is the default whenever the island opens.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IslandPane {
+    #[default]
+    Live,
+    Work,
 }
 
 /// One row in the activity shelf or in the add menu's existing list. The
@@ -297,9 +314,25 @@ pub struct IslandState {
     pub shared: Arc<IslandShared>,
     pub hovered: bool,
     pub collapse_at: Option<f64>,
+    /// Live | Work. Every fresh expansion starts on Live.
+    pub pane: IslandPane,
     /// The chat surface is open and pinned: a pointer leave must not collapse
     /// it while the user reads or types.
     pub open_chat: Option<IslandTarget>,
+    /// Live's watched chat. The shell publishes its compact transcript while
+    /// the Live surface is visible.
+    pub live_target: Option<IslandTarget>,
+    /// Live stays open after an interaction (typing, sending, speaking), so a
+    /// pointer leave does not pull the surface out from under the user.
+    pub live_pinned: bool,
+    /// Keyboard activation is on while Live is visible and off in Work. The
+    /// style itself does not activate the window; the click does.
+    keys_on: bool,
+    /// A compact attention card is a direct-action surface. If one appeared
+    /// while the island was collapsed, hover must not grow the pane and move
+    /// its Send/Dismiss button.
+    attention_hold: bool,
+    seen_attention: Option<IslandAttention>,
     /// Recently opened chats, newest last (capped at three). Tabs let the
     /// overlay switch between concurrent work without going back to the list.
     pub tabs: Vec<IslandTarget>,
@@ -321,7 +354,13 @@ impl IslandState {
             shared,
             hovered: false,
             collapse_at: None,
+            pane: IslandPane::Live,
             open_chat: None,
+            live_target: None,
+            live_pinned: false,
+            keys_on: false,
+            attention_hold: false,
+            seen_attention: None,
             tabs: Vec::new(),
             composers: HashMap::new(),
             add_menu: AddMenu::Closed,
@@ -335,6 +374,108 @@ impl IslandState {
 
     pub fn composer(&mut self, key: &str) -> &mut TextEdit {
         self.composers.entry(key.to_string()).or_default()
+    }
+
+    /// Bind Live to the active thread immediately, before the next poll. The
+    /// first click on the dock always has a target to send or speak to.
+    pub fn bind_live(&mut self) {
+        if self.open_chat.is_some() {
+            return;
+        }
+        let Ok(model) = self.shared.model.lock() else {
+            return;
+        };
+        let target = model.target.clone();
+        if self
+            .live_target
+            .as_ref()
+            .is_some_and(|live| live.thread_key == target.thread_key)
+        {
+            return;
+        }
+        self.live_target = Some(target.clone());
+        self.shared.push(IslandCommand::WatchChat(target));
+        self.seeded_draft = None;
+        self.seen_draft_rev = None;
+        self.last_chat_draft.clear();
+    }
+
+    /// The mode rail. Entering Live never starts capture; leaving Live always
+    /// stops it. Work drops the watched chat and keyboard activation because
+    /// it is a pointer-only shelf.
+    pub fn set_pane(&mut self, pane: IslandPane, listening: bool) {
+        if self.pane == pane {
+            return;
+        }
+        self.pane = pane;
+        self.add_menu = AddMenu::Closed;
+        if pane == IslandPane::Live {
+            self.bind_live();
+        } else if pane == IslandPane::Work {
+            self.live_pinned = false;
+            if listening {
+                self.shared.push(IslandCommand::StopListen);
+            }
+            if self.open_chat.is_none() && self.live_target.take().is_some() {
+                self.shared.push(IslandCommand::UnwatchChat);
+            }
+            self.set_keys(false);
+        }
+    }
+
+    /// Live is a chat surface: sending typed text and speaking both pin it.
+    pub fn send_live(&mut self, running: bool) {
+        let Some(target) = self.live_target.clone() else {
+            return;
+        };
+        self.live_pinned = true;
+        if running {
+            self.shared.push(IslandCommand::StopRun(target.thread_key));
+            return;
+        }
+        let text = self
+            .composers
+            .get(&target.thread_key)
+            .map(|edit| edit.text.trim().to_string())
+            .unwrap_or_default();
+        if text.is_empty() {
+            return;
+        }
+        if let Some(edit) = self.composers.get_mut(&target.thread_key) {
+            edit.text.clear();
+            edit.anchor = 0;
+            edit.focus = 0;
+        }
+        self.shared.push(IslandCommand::SendPrompt { target, text });
+    }
+
+    /// Close Live back to the compact island. Like the chat surface's X, this
+    /// stops a running capture first so closing never leaves a hot mic.
+    pub fn close_live(&mut self, listening: bool) {
+        if listening {
+            self.shared.push(IslandCommand::StopListen);
+        }
+        self.live_pinned = false;
+        self.pane = IslandPane::Live;
+        self.hovered = false;
+        self.collapse_at = None;
+        self.add_menu = AddMenu::Closed;
+        if self.open_chat.is_none() {
+            self.live_target = None;
+            self.shared.push(IslandCommand::UnwatchChat);
+        }
+        self.set_keys(false);
+    }
+
+    /// Keep the window style in step with the visible surface. The style alone
+    /// never steals focus: the next click activates the overlay, which is what
+    /// lets the Live prompt dock take keys.
+    pub fn set_keys(&mut self, on: bool) {
+        if self.keys_on == on {
+            return;
+        }
+        self.keys_on = on;
+        self.shared.push(IslandCommand::SetActivatable(on));
     }
 
     /// Open a chat and pin the surface. Watching is a shell round-trip: the
@@ -351,7 +492,10 @@ impl IslandState {
                 self.tabs.remove(0);
             }
         }
+        self.pane = IslandPane::Work;
         self.open_chat = Some(target.clone());
+        self.live_target = None;
+        self.live_pinned = false;
         self.add_menu = AddMenu::Closed;
         self.composer(&target.thread_key);
         self.seeded_draft = None;
@@ -361,6 +505,9 @@ impl IslandState {
         self.shared.push(IslandCommand::FocusKeys);
         self.shared.push(IslandCommand::SetActivatable(true));
         self.shared.push(IslandCommand::SetFullInput(true));
+        // The chat surface owns activation now; keep the poll from pushing a
+        // second style change while it is up.
+        self.keys_on = true;
     }
 
     pub fn leave_chat(&mut self) {
@@ -371,6 +518,7 @@ impl IslandState {
         self.shared.push(IslandCommand::UnwatchChat);
         self.shared.push(IslandCommand::SetActivatable(false));
         self.shared.push(IslandCommand::SetFullInput(false));
+        self.keys_on = false;
     }
 
     pub fn switch_chat(&mut self, target: IslandTarget) {
@@ -488,6 +636,36 @@ pub fn island_poll(s: &mut IslandState, _clock: f64, tx: &mut Tx) -> bool {
         s.seen_revision = revision;
         changed = true;
     }
+    // Compact attention cards must not grow under the pointer: that would
+    // move their Send/Dismiss button between press and release. An attention
+    // that arrives while the pane is actually open is different — the pane
+    // keeps it inline (Live) or in the shelf (Work).
+    if s.seen_attention.as_ref() != model.attention.as_ref() {
+        let was_expanded =
+            s.open_chat.is_some() || s.live_pinned || (s.hovered && !s.attention_hold);
+        s.attention_hold = model.attention.is_some() && !was_expanded;
+        s.seen_attention = model.attention.clone();
+        changed = true;
+    }
+    // Arming owns the island. Once the dock is off and no capture is live,
+    // a pinned Live surface is no longer something the user is looking at.
+    if !model.armed && !model.listening && s.open_chat.is_none() && s.live_pinned {
+        s.live_pinned = false;
+        changed = true;
+    }
+    // Capture that starts outside Live keeps the compact listening card until
+    // the pointer opens the surface; once the Live surface has been seen
+    // during a capture, it stays pinned so the orb is not pulled away.
+    if model.listening
+        && s.open_chat.is_none()
+        && s.pane == IslandPane::Live
+        && s.hovered
+        && !s.attention_hold
+        && !s.live_pinned
+    {
+        s.live_pinned = true;
+        changed = true;
+    }
     // A new chat created from the add menu comes back as a focus target.
     if model.focus_seq != s.seen_focus {
         s.seen_focus = model.focus_seq;
@@ -535,19 +713,82 @@ pub fn island_poll(s: &mut IslandState, _clock: f64, tx: &mut Tx) -> bool {
             changed = true;
         }
     }
+    // Live is the default room and owns one watched chat: the active thread.
+    // Work is a shelf, so it releases the watch and the keyboard activation.
+    let live_visible = s.open_chat.is_none()
+        && s.pane == IslandPane::Live
+        && (s.hovered || s.live_pinned)
+        && !(model.attention.is_some() && s.attention_hold);
+    if s.open_chat.is_none() {
+        if live_visible {
+            let target = model.target.clone();
+            let bind = s.live_target.is_none()
+                || (!s.live_pinned
+                    && s.live_target
+                        .as_ref()
+                        .is_some_and(|live| live.thread_key != target.thread_key));
+            if bind {
+                s.live_target = Some(target.clone());
+                s.shared.push(IslandCommand::WatchChat(target));
+                s.seeded_draft = None;
+                s.seen_draft_rev = None;
+                s.last_chat_draft.clear();
+                changed = true;
+            }
+            // A chat's title follows its first message, exactly as it does in
+            // the full chat surface.
+            if let (Some(live), Some(chat)) = (s.live_target.as_mut(), model.chat.as_ref()) {
+                if chat.target.thread_key == live.thread_key && chat.target.title != live.title {
+                    *live = chat.target.clone();
+                    changed = true;
+                }
+            }
+            // A fresh chat gets its real server key after the first send. The
+            // chat surface adopts that rekey; Live must carry its composer and
+            // watched target across too, or the first Live message would land
+            // in a thread the surface no longer recognises.
+            if s.live_pinned {
+                if let (Some(live), Some(chat)) = (s.live_target.clone(), model.chat.as_ref()) {
+                    if chat.target.thread_key != live.thread_key {
+                        let new = chat.target.clone();
+                        if let Some(edit) = s.composers.remove(&live.thread_key) {
+                            s.composers.entry(new.thread_key.clone()).or_insert(edit);
+                        }
+                        s.live_target = Some(new);
+                        s.seeded_draft = None;
+                        s.seen_draft_rev = None;
+                        s.last_chat_draft.clear();
+                        changed = true;
+                    }
+                }
+            }
+        } else if s.live_target.take().is_some() {
+            s.shared.push(IslandCommand::UnwatchChat);
+            changed = true;
+        }
+        s.set_keys(live_visible);
+    }
+
     // Seed the overlay composer with the shell thread's draft once per open,
-    // then follow voice finals that replace that draft while the chat is up.
-    if let Some(open) = s.open_chat.clone() {
+    // then follow voice finals that replace that draft while the surface is up.
+    let surface = s.open_chat.clone().or_else(|| {
+        if live_visible {
+            s.live_target.clone()
+        } else {
+            None
+        }
+    });
+    if let Some(surface) = surface {
         if let Some(chat) = model
             .chat
             .as_ref()
-            .filter(|chat| chat.target.thread_key == open.thread_key)
+            .filter(|chat| chat.target.thread_key == surface.thread_key)
         {
-            let first = s.seeded_draft.as_deref() != Some(open.thread_key.as_str());
+            let first = s.seeded_draft.as_deref() != Some(surface.thread_key.as_str());
             let fresh = first || s.seen_draft_rev != Some(chat.draft_rev);
             if fresh {
                 let last = s.last_chat_draft.clone();
-                let edit = s.composer(&open.thread_key);
+                let edit = s.composer(&surface.thread_key);
                 // Replace an untouched voice draft; never clobber words the
                 // user typed over it.
                 if edit.text.is_empty() || edit.text == last {
@@ -555,7 +796,7 @@ pub fn island_poll(s: &mut IslandState, _clock: f64, tx: &mut Tx) -> bool {
                     edit.anchor = edit.text.len();
                     edit.focus = edit.text.len();
                 }
-                s.seeded_draft = Some(open.thread_key.clone());
+                s.seeded_draft = Some(surface.thread_key.clone());
                 s.seen_draft_rev = Some(chat.draft_rev);
                 s.last_chat_draft = chat.draft.clone();
                 changed = true;
@@ -615,11 +856,31 @@ fn island_key(s: &mut IslandState, key: &rune::KeyEvent, _tx: &mut Tx) -> bool {
         s.leave_chat();
         return true;
     }
+    if s.pane == IslandPane::Live && (s.live_pinned || s.hovered) {
+        let listening = s
+            .shared
+            .model
+            .lock()
+            .map(|model| model.listening)
+            .unwrap_or(false);
+        if listening {
+            s.shared.push(IslandCommand::StopListen);
+            return true;
+        }
+        s.close_live(false);
+        return true;
+    }
     false
 }
 
 fn hover_handler(s: &mut IslandState, inside: bool, tx: &mut Tx) {
     if inside {
+        // Every fresh expansion begins in Live. The user can still switch to
+        // Work while the pane stays open.
+        if !s.hovered && s.open_chat.is_none() {
+            s.pane = IslandPane::Live;
+            s.bind_live();
+        }
         s.hovered = true;
         s.collapse_at = None;
     } else if s.hovered {
@@ -749,6 +1010,10 @@ fn pulse_dot(size: f32, color: rune::Color, animate: bool) -> El {
 }
 
 fn waveform(model: &IslandModel, width: f32, height: f32) -> El {
+    waveform_colored(model, width, height, ink(TEXT))
+}
+
+fn waveform_colored(model: &IslandModel, width: f32, height: f32, color: rune::Color) -> El {
     let now = model.tick_ms as f32 / 1000.0;
     // While listening, keep a visible idle wave even before the first level
     // packet: the island should read as alive, not as a dead dotted line.
@@ -783,7 +1048,7 @@ fn waveform(model: &IslandModel, width: f32, height: f32) -> El {
             el().key(format!("island-wave-bar-{i}"))
                 .size(3.0, bar_h)
                 .radius(1.5)
-                .fill(ink(TEXT).alpha(dim))
+                .fill(color.alpha(dim))
                 .looping(rune::LoopSpec::opacity(
                     1.15 + i as f64 * 0.06,
                     i as f64 * 0.11,
@@ -1208,41 +1473,149 @@ fn attention_shelf_row(attention: &IslandAttention) -> El {
     row
 }
 
-fn shelf_header(model: &IslandModel) -> El {
-    let active = model
-        .shelf
-        .iter()
-        .filter(|item| item.running || item.waiting > 0)
-        .count();
-    let copy = if model.shelf.is_empty() {
-        "Quiet".to_string()
-    } else if active > 0 {
-        format!("{active} active")
-    } else {
-        format!("{} open", model.shelf.len())
-    };
-    row()
-        .key("island-shelf-header")
+/// The old `1 active` line is now the mode chooser itself: Live and Work,
+/// nothing else. The active chip is a frosted lozenge that flies between the
+/// two labels on a matched spring.
+fn mode_header(s: &IslandState, model: &IslandModel) -> El {
+    let listening = model.listening;
+    let mut head = row()
+        .key("island-mode-header")
         .w_full()
         .h(44.0)
-        .px(14.0)
+        .pl(14.0)
+        .pr(8.0)
         .items_center()
-        .gap(8.0)
-        .child(pulse_dot(
-            5.0,
-            ink(if active > 0 { TEXT } else { "#5a5a62" }),
-            active > 0,
-        ))
-        .child(tiny_label(
-            "island-shelf-status",
-            &copy,
-            11.0,
-            600.0,
-            ink(if active > 0 { TEXT } else { MUTED }),
-        ))
-        .child(rune::el().grow(1.0))
+        .child(
+            row()
+                .key("island-mode-rail")
+                .w(MODE_RAIL_W)
+                .h(30.0)
+                .px(3.0)
+                .py(3.0)
+                .radius(9.0)
+                .fill(ink("#141418"))
+                .border(1.0, ink("#ffffff12"))
+                .border_layout()
+                .child(mode_tab(
+                    "island-mode-live",
+                    "Live",
+                    s.pane == IslandPane::Live,
+                    mode_live_glyph(
+                        11.0,
+                        ink(if s.pane == IslandPane::Live {
+                            TEXT
+                        } else {
+                            "#7d7d87"
+                        }),
+                    ),
+                    move |s| s.set_pane(IslandPane::Live, listening),
+                ))
+                .child(mode_tab(
+                    "island-mode-work",
+                    "Work",
+                    s.pane == IslandPane::Work,
+                    mode_work_glyph(
+                        11.0,
+                        ink(if s.pane == IslandPane::Work {
+                            TEXT
+                        } else {
+                            "#7d7d87"
+                        }),
+                    ),
+                    move |s| s.set_pane(IslandPane::Work, listening),
+                )),
+        )
+        .child(rune::el().grow(1.0));
+    if s.pane == IslandPane::Live {
+        head = head.child(icon_button(
+            "island-live-close",
+            "Close live",
+            30.0,
+            ink("#232328"),
+            x_glyph(13.0, ink(MUTED)),
+            move |s| s.close_live(listening),
+        ));
+    } else {
         // The add control floats above this corner; reserve its hit area.
-        .child(rune::el().size(30.0, 30.0).inert())
+        head = head.child(rune::el().size(30.0, 30.0).inert());
+    }
+    head
+}
+
+fn mode_tab(
+    key: &str,
+    label: &str,
+    active: bool,
+    glyph: El,
+    press: impl Fn(&mut IslandState) + 'static,
+) -> El {
+    let mut tab = row()
+        .key(key.to_string())
+        .role("button")
+        .focusable(true)
+        .label(format!("{label} mode"))
+        .w(MODE_TAB_W)
+        .h(24.0)
+        .radius(7.0)
+        .items_center()
+        .justify_center()
+        .gap(5.0)
+        .hover(rgba(1.0, 1.0, 1.0, if active { 0.025 } else { 0.04 }))
+        .on_press(press)
+        .press_scale(0.97);
+    if active {
+        tab = tab.child(
+            el().key(format!("{key}-pill"))
+                .absolute(0.0, 0.0)
+                .w_full()
+                .h_full()
+                .radius(7.0)
+                .fill(rgba(1.0, 1.0, 1.0, 0.10))
+                .border(1.0, rgba(1.0, 1.0, 1.0, 0.16))
+                .border_layout()
+                .matched("island-mode-pill")
+                .motion(MODE_PILL)
+                .inert(),
+        );
+    }
+    tab.child(glyph).child(
+        text(label.to_string())
+            .font(rune::tok::TextStyle::new(10.5, 650.0))
+            .color(ink(if active { TEXT } else { "#7d7d87" })),
+    )
+}
+
+fn mode_live_glyph(size: f32, color: rune::Color) -> El {
+    let mut glyph = row()
+        .key("island-mode-live-glyph")
+        .w(size)
+        .h(size)
+        .items_center()
+        .justify_center()
+        .gap(1.5)
+        .inert();
+    for h in [5.0, 9.0, 6.5] {
+        glyph = glyph.child(el().w(1.8).h(h).radius(0.9).fill(color));
+    }
+    glyph
+}
+
+fn mode_work_glyph(size: f32, color: rune::Color) -> El {
+    let mut grid = col()
+        .key("island-mode-work-glyph")
+        .w(size)
+        .h(size)
+        .justify_center()
+        .gap(2.0)
+        .inert();
+    for _ in 0..2 {
+        let mut line = row().items_center().gap(2.0);
+        for _ in 0..2 {
+            line = line.child(el().size(4.4, 4.4).radius(1.2).fill(color));
+        }
+        grid = grid.child(line);
+    }
+    grid
 }
 
 fn shelf_body(model: &IslandModel) -> El {
@@ -1285,8 +1658,15 @@ fn shelf_body(model: &IslandModel) -> El {
             .scroll(rune::ScrollSpec {
                 stick_bottom: false,
             });
-        for item in &model.shelf {
-            list = list.child(shelf_row(item));
+        let stagger = rune::Stagger::new(0.02);
+        for (i, item) in model.shelf.iter().enumerate() {
+            list = list.child(
+                shelf_row(item)
+                    .transition(
+                        rune::Transition::offset(0.0, 5.0).combined(rune::Transition::opacity()),
+                    )
+                    .enter_delay(stagger.delay(i, model.shelf.len())),
+            );
         }
         body = body.child(list);
         let more = model.shelf.len().saturating_sub(3);
@@ -2315,6 +2695,460 @@ fn listening_body(model: &IslandModel) -> El {
         ))
 }
 
+/// Live is the active chat with a voice stage. With the mic off it behaves
+/// like a normal chat: conversation when there is one, the hero when empty,
+/// and the prompt dock underneath. With the mic on the surface clears to the
+/// orb and the live transcript.
+fn live_surface(s: &IslandState, model: &IslandModel) -> El {
+    let target = s
+        .live_target
+        .clone()
+        .unwrap_or_else(|| model.target.clone());
+    let mut surface = col().key("island-live").w_full().grow(1.0).min_h(0.0);
+    if model.listening {
+        surface = surface
+            .child(live_listening(model, &target).transition(rune::Transition::blur_replace()));
+    } else {
+        surface = surface
+            .child(live_idle(s, model, &target).transition(rune::Transition::blur_replace()));
+    }
+    surface
+}
+
+fn live_idle(s: &IslandState, model: &IslandModel, target: &IslandTarget) -> El {
+    let chat = model
+        .chat
+        .as_ref()
+        .filter(|chat| chat.target.thread_key == target.thread_key);
+    let running = chat.is_some_and(|chat| chat.live);
+    let body = match chat {
+        Some(chat) if !chat.rows.is_empty() => live_chat_body(chat),
+        _ => live_hero(model, target, chat),
+    };
+    col()
+        .key("island-live-idle")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .child(body)
+        .child(live_composer(s, model, target, running))
+}
+
+fn live_chat_body(chat: &IslandChat) -> El {
+    let mut body = col()
+        .key("island-live-chat-body")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .gap(9.0)
+        .px(14.0)
+        .py(10.0)
+        .scroll(rune::ScrollSpec { stick_bottom: true });
+    for row in &chat.rows {
+        body = body.child(chat_bubble(row));
+    }
+    body
+}
+
+fn live_hero(model: &IslandModel, target: &IslandTarget, chat: Option<&IslandChat>) -> El {
+    let running = chat.is_some_and(|chat| chat.live);
+    let mut hero = col()
+        .key("island-live-hero")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .items_center()
+        .justify_center()
+        .gap(3.0)
+        .child(live_orb_stage(model, target, 84.0, false))
+        .child(
+            text("The mic is yours, Boss".to_string())
+                .key("island-live-title")
+                .truncate()
+                .max_w(380.0)
+                .font(rune::tok::TextStyle::new(24.5, 500.0))
+                .color(ink(TEXT)),
+        );
+    hero = if running {
+        hero.child(
+            row()
+                .items_center()
+                .gap(6.0)
+                .child(pulse_dot(4.5, ink(TEXT), true))
+                .child(tiny_label(
+                    "island-live-subtitle",
+                    "Stark is working…",
+                    10.5,
+                    400.0,
+                    ink(MUTED),
+                )),
+        )
+    } else {
+        hero.child(tiny_label(
+            "island-live-subtitle",
+            "Tap the orb to speak.",
+            11.0,
+            400.0,
+            ink(MUTED),
+        ))
+    };
+    hero
+}
+
+fn live_listening(model: &IslandModel, target: &IslandTarget) -> El {
+    let spoken = model.voice_text.trim().to_string();
+    let mut slot = col()
+        .key("island-live-transcript")
+        .w(380.0)
+        .h(66.0)
+        .items_center()
+        .justify_center();
+    if !spoken.is_empty() {
+        slot = slot.child(
+            text(spoken)
+                .max_w(360.0)
+                .max_lines(3)
+                .font(rune::tok::TextStyle::new(13.5, 400.0))
+                .color(ink("#e4e4e7")),
+        );
+    }
+    col()
+        .key("island-live-listening")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .items_center()
+        .justify_center()
+        .gap(4.0)
+        .child(live_orb_stage(model, target, 120.0, true))
+        .child(slot)
+}
+
+/// The five-bar mark inside the white disc. Unlike the wide compact waveform,
+/// this one keeps a clear resting silhouette and grows with the mic level.
+fn live_orb_bars(model: &IslandModel, size: f32, color: rune::Color) -> El {
+    let amount = if model.listening {
+        model.level.clamp(0.0, 1.0).max(0.22)
+    } else {
+        0.0
+    };
+    let now = model.tick_ms as f32 / 1000.0;
+    const BASE: [f32; 5] = [0.24, 0.42, 0.62, 0.36, 0.52];
+    let mut bars = row()
+        .key("island-live-orb-bars")
+        .h(size * 0.52)
+        .items_center()
+        .justify_center()
+        .gap(size * 0.034)
+        .inert();
+    for (i, base) in BASE.iter().enumerate() {
+        let phase = (now * 6.0 + i as f32 * 1.1).sin() * 0.5 + 0.5;
+        let h = size * (base * 0.64 + amount * 0.52 * (0.5 + 0.5 * phase)).clamp(0.09, 0.72);
+        bars = bars.child(
+            el().key(format!("island-live-orb-bar-{i}"))
+                .w(size * 0.046)
+                .h(h)
+                .radius(size * 0.023)
+                .fill(color)
+                .looping(rune::LoopSpec::opacity(1.3, i as f64 * 0.1, 0.62, 1.0))
+                .inert(),
+        );
+    }
+    bars
+}
+
+/// The dock's white disc, enlarged. Its matched id lets it fly from the hero
+/// position into the centre of the listening stage and back.
+fn live_orb_stage(model: &IslandModel, target: &IslandTarget, size: f32, listening: bool) -> El {
+    let key = target.thread_key.clone();
+    let stage = size + 64.0;
+    let halo = stage;
+    let ring = size + 24.0;
+    let orbit = size + 12.0;
+    let disc = el()
+        .key("island-live-orb")
+        .role("button")
+        .focusable(true)
+        .label(if listening {
+            "Stop listening"
+        } else {
+            "Start listening"
+        })
+        .size(size, size)
+        .radius(size / 2.0)
+        .center()
+        .fill(ink("#f7f7f8"))
+        .radial_gradient(
+            [size * 0.34, size * 0.28],
+            size * 0.85,
+            [
+                (0.0, ink("#ffffff")),
+                (0.66, ink("#f6f6f8")),
+                (1.0, ink("#d6d6dd")),
+            ],
+        )
+        .border(1.0, rgba(0.0, 0.0, 0.0, 0.12))
+        .box_shadow(rune::Shadow {
+            x: 0.0,
+            y: 8.0,
+            blur: 26.0,
+            spread: -2.0,
+            color: rgba(0.0, 0.0, 0.0, 0.48),
+            inset: false,
+        })
+        .on_press(move |s: &mut IslandState| {
+            s.live_pinned = true;
+            s.shared.push(IslandCommand::ToggleVoice(key.clone()));
+        })
+        .press_scale(0.97)
+        .matched("island-live-orb-flight")
+        .motion(ORB_FLIGHT)
+        .child(live_orb_bars(model, size, ink("#111113")));
+    el().key("island-live-orb-stage")
+        .size(stage, stage)
+        .center()
+        .child(
+            el().key("island-live-orb-halo")
+                .absolute(0.0, 0.0)
+                .size(halo, halo)
+                .radius(halo / 2.0)
+                .radial_gradient(
+                    [halo / 2.0, halo / 2.0],
+                    halo / 2.0,
+                    [
+                        (0.0, rgba(1.0, 1.0, 1.0, 0.10)),
+                        (0.55, rgba(1.0, 1.0, 1.0, 0.035)),
+                        (1.0, rgba(1.0, 1.0, 1.0, 0.0)),
+                    ],
+                )
+                .looping(rune::LoopSpec::opacity(
+                    if listening { 1.6 } else { 3.6 },
+                    0.0,
+                    0.55,
+                    1.0,
+                ))
+                .inert(),
+        )
+        .child(
+            el().key("island-live-orb-ring")
+                .absolute((stage - ring) / 2.0, (stage - ring) / 2.0)
+                .size(ring, ring)
+                .radius(ring / 2.0)
+                .border(1.0, rgba(1.0, 1.0, 1.0, 0.08))
+                .border_layout()
+                .inert(),
+        )
+        .child(
+            el().key("island-live-orb-orbit")
+                .absolute((stage - orbit) / 2.0, (stage - orbit) / 2.0)
+                .size(orbit, orbit)
+                .radius(orbit / 2.0)
+                .border(1.2, rgba(1.0, 1.0, 1.0, 0.16))
+                .border_layout()
+                .border_dash(size * 0.34, size * 0.72)
+                .looping(rune::LoopSpec::border_sweep(if listening {
+                    2.2
+                } else {
+                    3.4
+                }))
+                .inert(),
+        )
+        .child(disc)
+}
+
+fn live_composer(s: &IslandState, model: &IslandModel, target: &IslandTarget, running: bool) -> El {
+    let key = target.thread_key.clone();
+    let edit_key = key.clone();
+    let submit_key = key.clone();
+    let empty = TextEdit::new("");
+    let edit = s.composers.get(&key).unwrap_or(&empty);
+    let input = rune::text_input(edit, {
+        let mut style = rune::tok::TextStyle::new(12.5, 400.0);
+        style.line_height = 19.0;
+        style
+    })
+    .key("island-live-input")
+    .w_full()
+    .min_h(34.0)
+    .max_h(68.0)
+    .pt(2.0)
+    .pb(2.0)
+    .placeholder("Type or speak…", ink("#74747d"))
+    .caret(ink("#f2f2f4"), crate::motion::TEXT_SELECTION)
+    .on_edit(move |s: &mut IslandState| {
+        // Typing pins the surface exactly like clicking the mic does, so a
+        // pointer drift cannot fold the dock while the user is composing.
+        s.live_pinned = true;
+        s.composer(&edit_key)
+    })
+    .on_input_key(
+        move |s: &mut IslandState, key: &rune::KeyEvent, _tx: &mut Tx| {
+            if key.key != rune::Key::Enter || key.mods.shift {
+                return false;
+            }
+            if s.composers
+                .get(&submit_key)
+                .is_some_and(|edit| edit.preedit.is_some())
+            {
+                return false;
+            }
+            s.send_live(running);
+            true
+        },
+    )
+    .on_submit(move |s: &mut IslandState, _tx: &mut Tx| s.send_live(running));
+
+    let has_text = s
+        .composers
+        .get(&key)
+        .is_some_and(|edit| !edit.text.trim().is_empty());
+    let mut send = el()
+        .key("island-live-send")
+        .role("button")
+        .focusable(true)
+        .label(if running { "Stop run" } else { "Send" })
+        .size(32.0, 32.0)
+        .radius(16.0)
+        .center()
+        .fill(if running || has_text {
+            ink("#ffffff")
+        } else {
+            ink("#29292f")
+        })
+        .on_press(move |s: &mut IslandState| s.send_live(running));
+    if running || has_text {
+        send = send.hover(ink("#ededf1"));
+    }
+    send = send.child(if running {
+        stop_glyph(9.0, ink("#0b0b0d"))
+    } else {
+        send_glyph(13.0, ink(if has_text { "#0b0b0d" } else { "#71717a" }))
+    });
+
+    let mut card = col()
+        .key("island-live-composer")
+        .w_full()
+        .radius(14.0)
+        .fill(ink("#111114"))
+        .border(1.0, ink("#ffffff14"))
+        .border_layout()
+        .px(10.0)
+        .pt(8.0)
+        .pb(8.0)
+        .gap(4.0);
+    if let Some(attention) = &model.attention {
+        let microphone = attention.title == "Microphone";
+        let mine = attention.target.thread_key.is_empty()
+            || attention.target.thread_key == target.thread_key;
+        if microphone && mine {
+            let note_key = attention.target.thread_key.clone();
+            card = card.child(
+                row()
+                    .key("island-live-mic-error")
+                    .w_full()
+                    .items_center()
+                    .gap(6.0)
+                    .px(2.0)
+                    .child(alert_glyph(11.0, ink(RED)))
+                    .child(
+                        tiny_label(
+                            "island-live-mic-error-text",
+                            &attention.body,
+                            9.5,
+                            400.0,
+                            ink(RED),
+                        )
+                        .max_w(370.0),
+                    )
+                    .child(rune::el().grow(1.0))
+                    .child(icon_button(
+                        "island-live-mic-error-x",
+                        "Dismiss microphone error",
+                        20.0,
+                        rgba(1.0, 1.0, 1.0, 0.0),
+                        x_glyph(10.0, ink(MUTED)),
+                        move |s| {
+                            s.shared
+                                .push(IslandCommand::DismissVoiceNote(note_key.clone()))
+                        },
+                    )),
+            );
+        }
+    }
+    card = card.child(input).child(
+        row()
+            .w_full()
+            .items_center()
+            .gap(8.0)
+            .child(live_mic_button(model, target))
+            .child(rune::el().grow(1.0))
+            .child(send),
+    );
+
+    col()
+        .key("island-live-dock")
+        .w_full()
+        .px(10.0)
+        .pb(10.0)
+        .child(card)
+}
+
+fn live_mic_button(model: &IslandModel, target: &IslandTarget) -> El {
+    let key = target.thread_key.clone();
+    let listening = model.listening && model.voice_thread == target.thread_key;
+    let mut button = el()
+        .key("island-live-mic")
+        .role("button")
+        .focusable(true)
+        .label(if listening {
+            "Stop listening"
+        } else {
+            "Start listening"
+        })
+        .size(30.0, 30.0)
+        .radius(15.0)
+        .center()
+        .fill(if listening {
+            ink("#ffffff")
+        } else {
+            ink("#232328")
+        })
+        .border(
+            1.0,
+            if listening {
+                ink("#ffffff")
+            } else {
+                ink("#ffffff1f")
+            },
+        )
+        .hover(if listening {
+            ink("#ffffff")
+        } else {
+            ink("#2d2d34")
+        })
+        .on_press(move |s: &mut IslandState| {
+            s.live_pinned = true;
+            s.shared.push(IslandCommand::ToggleVoice(key.clone()));
+        });
+    if listening {
+        let mut bars = row().h(13.0).items_center().gap(1.8).inert();
+        const BAR_H: [f32; 5] = [5.0, 9.0, 13.0, 8.0, 11.0];
+        for (i, h) in BAR_H.iter().enumerate() {
+            bars = bars.child(
+                el().size(1.8, *h)
+                    .radius(0.9)
+                    .fill(ink("#111113"))
+                    .looping(rune::LoopSpec::opacity(1.2, i as f64 * 0.13, 0.35, 1.0))
+                    .inert(),
+            );
+        }
+        button = button.child(bars);
+    } else {
+        button = button.child(mic_glyph(13.0, ink(TEXT)));
+    }
+    button
+}
+
 pub fn island_view(s: &IslandState, _cx: &mut Cx<IslandState>) -> El {
     let model = s
         .shared
@@ -2325,15 +3159,19 @@ pub fn island_view(s: &IslandState, _cx: &mut Cx<IslandState>) -> El {
     let listening = model.listening;
     let attention = model.attention.as_ref();
     let chat_open = s.open_chat.as_ref();
-    // Attention cards are direct-action surfaces. Expanding them on hover
-    // would move their X/Send button out from under the pointer, so they stay
-    // compact until acted on or dismissed.
-    let shelf_open = chat_open.is_none() && s.hovered && !listening && attention.is_none();
+    // A compact attention card keeps its direct-action button under the
+    // pointer. Only a pane that was already open grows with a new card.
+    let held = attention.is_some() && s.attention_hold;
+    let expanded = chat_open.is_none() && (s.hovered || s.live_pinned) && !held;
+    let live_open = expanded && s.pane == IslandPane::Live;
+    let work_open = expanded && s.pane == IslandPane::Work;
     let runs = model.runs.len();
 
     let (w, h) = if chat_open.is_some() {
         (CHAT_W, CHAT_H)
-    } else if shelf_open {
+    } else if live_open {
+        (SHELF_W, LIVE_H)
+    } else if work_open {
         (SHELF_W, shelf_height(&model, s.add_menu))
     } else if listening {
         (376.0, 80.0)
@@ -2370,17 +3208,41 @@ pub fn island_view(s: &IslandState, _cx: &mut Cx<IslandState>) -> El {
             color: rgba(0.0, 0.0, 0.0, 0.58),
             inset: false,
         });
+    if live_open {
+        // A quiet top light, still strictly white/grey. The Work shelf keeps
+        // the flat notch; switching rooms springs between the two.
+        notch = notch.linear_gradient(
+            std::f32::consts::PI,
+            [
+                (0.0, ink("#141418")),
+                (0.55, ink("#0d0d10")),
+                (1.0, ink("#09090b")),
+            ],
+        );
+    }
 
     if let Some(target) = chat_open {
         notch = notch.child(chat_surface(s, &model, target));
-    } else if shelf_open {
-        notch = notch.child(shelf_header(&model)).child(shelf_body(&model));
-        if s.add_menu != AddMenu::Closed {
-            notch = notch.child(add_scrim());
+    } else if expanded {
+        notch = notch.child(mode_header(s, &model));
+        if live_open {
+            notch =
+                notch.child(live_surface(s, &model).transition(rune::Transition::blur_replace()));
+        } else if work_open {
+            notch = notch.child(
+                col()
+                    .key("island-pane-work")
+                    .w_full()
+                    .transition(rune::Transition::blur_replace())
+                    .child(shelf_body(&model)),
+            );
+            if s.add_menu != AddMenu::Closed {
+                notch = notch.child(add_scrim());
+            }
+            // The floating add layer is a sibling after the scrim, so it stays
+            // above the dim/blur and keeps its own hover + press area.
+            notch = notch.child(add_layer(s, &model, w));
         }
-        // The floating add layer is a sibling after the scrim, so it stays
-        // above the dim/blur and keeps its own hover + press area.
-        notch = notch.child(add_layer(s, &model, w));
     } else {
         let header_h = if listening {
             34.0
@@ -2505,26 +3367,289 @@ mod tests {
     }
 
     #[test]
-    fn running_pill_shows_the_count_and_hover_opens_the_shelf() {
+    fn running_pill_opens_live_and_work_keeps_the_shelf() {
         let compact = render(model(false, 2), false);
         assert!(compact.find("island-run-count").is_some());
         assert!(compact.find("island-shelf").is_none());
+        assert!(compact.find("island-live").is_none());
 
-        let open = render(model(false, 2), true);
-        assert!(open.find("island-shelf").is_some());
-        assert!(open.find("island-shelf-chat:ws:c0").is_some());
-        assert!(open.find("island-add").is_some());
+        let live = render(model(false, 2), true);
+        assert!(live.find("island-live").is_some());
+        assert!(live.find("island-mode-live").is_some());
+        assert!(live.find("island-mode-work").is_some());
+        assert!(live.find("island-shelf").is_none(), "Live is the default");
+        assert!(live.find("island-live-orb").is_some());
+        assert!(live.find("island-live-input").is_some());
+        assert!(live.find("island-live-mic").is_some());
+        assert!(live.find("island-live-send").is_some());
+        assert!(live.find("island-live-title").is_some());
+        // No prompt chips and no status-count copy in the new header.
+        assert!(live.find("island-shelf-status").is_none());
+        assert!(live.find("island-live-prompt").is_none());
+
+        let work = render_with(model(false, 2), |state| {
+            state.hovered = true;
+            state.pane = IslandPane::Work;
+        });
+        assert!(work.find("island-shelf").is_some());
+        assert!(work.find("island-shelf-chat:ws:c0").is_some());
+        assert!(work.find("island-add").is_some());
+        assert!(work.find("island-live").is_none());
+        assert!(work.find("island-shelf-status").is_none());
         // The old footer is gone: no mic, shortcut text, open arrow or brand.
-        assert!(open.find("island-mic").is_none());
-        assert!(open.find("island-shortcut").is_none());
-        assert!(open.find("island-open").is_none());
-        assert!(open.find("island-brand").is_none());
+        assert!(work.find("island-mic").is_none());
+        assert!(work.find("island-shortcut").is_none());
+        assert!(work.find("island-open").is_none());
+        assert!(work.find("island-brand").is_none());
+    }
+
+    #[test]
+    fn switching_to_work_stops_capture_and_drops_the_live_watch() {
+        let shared = Arc::new(IslandShared::new(None));
+        *shared.model.lock().unwrap() = model(true, 0);
+        let mut state = IslandState::new(shared.clone());
+        state.hovered = true;
+        state.bind_live();
+        let mut rt = Runtime::new(state, island_view, ISLAND_WINDOW, Env::new(true, 1.0));
+        rt.frame(0.0);
+        let (x, y) = rt.find("island-mode-work").expect("Work tab");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        let commands = shared.take_commands();
+        assert!(
+            commands.contains(&IslandCommand::StopListen),
+            "leaving Live stops the mic: {commands:?}"
+        );
+        assert!(
+            commands.contains(&IslandCommand::UnwatchChat),
+            "leaving Live releases the watch: {commands:?}"
+        );
+    }
+
+    #[test]
+    fn live_orb_and_prompt_dock_mic_start_capture() {
+        let shared = Arc::new(IslandShared::new(None));
+        *shared.model.lock().unwrap() = model(false, 0);
+        let mut state = IslandState::new(shared.clone());
+        state.hovered = true;
+        state.bind_live();
+        let mut rt = Runtime::new(state, island_view, ISLAND_WINDOW, Env::new(true, 1.0));
+        rt.frame(0.0);
+        let (x, y) = rt.find("island-live-orb").expect("orb");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.live_pinned, "the orb pins the surface");
+        let commands = shared.take_commands();
+        assert!(
+            commands.iter().any(|cmd| matches!(
+                cmd,
+                IslandCommand::ToggleVoice(key) if key == "chat:ws:c1"
+            )),
+            "orb starts capture: {commands:?}"
+        );
+
+        let (x, y) = rt.find("island-live-mic").expect("dock mic");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(2.0 / 60.0);
+        let commands = shared.take_commands();
+        assert!(
+            commands.iter().any(|cmd| matches!(
+                cmd,
+                IslandCommand::ToggleVoice(key) if key == "chat:ws:c1"
+            )),
+            "dock mic starts capture: {commands:?}"
+        );
+    }
+
+    #[test]
+    fn live_prompt_dock_sends_and_clears_the_draft() {
+        let shared = Arc::new(IslandShared::new(None));
+        *shared.model.lock().unwrap() = model(false, 0);
+        let mut state = IslandState::new(shared.clone());
+        state.hovered = true;
+        state.bind_live();
+        state.composer("chat:ws:c1").text = "summarise the run".to_string();
+        let mut rt = Runtime::new(state, island_view, ISLAND_WINDOW, Env::new(true, 1.0));
+        rt.frame(0.0);
+        let (x, y) = rt.find("island-live-send").expect("send");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.composer("chat:ws:c1").text.is_empty());
+        assert!(rt.state.live_pinned);
+        let commands = shared.take_commands();
+        assert!(
+            commands.iter().any(|cmd| matches!(
+                cmd,
+                IslandCommand::SendPrompt { target, text }
+                    if target.thread_key == "chat:ws:c1" && text == "summarise the run"
+            )),
+            "Live send reaches the shell: {commands:?}"
+        );
+    }
+
+    #[test]
+    fn live_listening_is_just_the_orb_and_transcript() {
+        let shared = Arc::new(IslandShared::new(None));
+        *shared.model.lock().unwrap() = model(true, 0);
+        let mut state = IslandState::new(shared);
+        state.hovered = true;
+        state.bind_live();
+        let mut rt = Runtime::new(state, island_view, ISLAND_WINDOW, Env::new(true, 1.0));
+        rt.frame(0.0);
+        assert!(rt.find("island-live-listening").is_some());
+        assert!(rt.find("island-live-orb").is_some());
+        assert!(rt.find("island-live-transcript").is_some());
+        assert!(rt.find("island-live-composer").is_none());
+        assert!(rt.find("island-live-title").is_none());
+        assert!(rt.find("island-shelf").is_none());
+    }
+
+    #[test]
+    fn live_chat_replaces_the_hero_when_messages_exist() {
+        let mut m = model(false, 0);
+        let mut target = m.target.clone();
+        target.title = "Writer".to_string();
+        m.chat = Some(IslandChat {
+            target: target.clone(),
+            rows: vec![IslandChatRow {
+                key: "u0".to_string(),
+                role: "user".to_string(),
+                body: "ship the island".to_string(),
+                agent: "Stark".to_string(),
+                ..IslandChatRow::default()
+            }],
+            live: false,
+            status: "Ready".to_string(),
+            draft: String::new(),
+            draft_rev: 0,
+        });
+        let shared = Arc::new(IslandShared::new(None));
+        *shared.model.lock().unwrap() = m;
+        let mut state = IslandState::new(shared);
+        state.hovered = true;
+        state.bind_live();
+        let mut rt = Runtime::new(state, island_view, ISLAND_WINDOW, Env::new(true, 1.0));
+        rt.frame(0.0);
+        assert!(rt.find("island-live-chat-body").is_some());
+        assert!(rt.find("island-chat-row-u0").is_some());
+        assert!(rt.find("island-live-title").is_none());
+        assert!(rt.find("island-live-input").is_some());
+    }
+
+    #[test]
+    fn a_compact_attention_card_does_not_grow_under_the_pointer() {
+        let mut m = model(false, 0);
+        m.attention = Some(IslandAttention {
+            kind: IslandAttentionKind::Question,
+            title: "Needs you".to_string(),
+            body: "Approve the deployment?".to_string(),
+            target: m.target.clone(),
+            expires_ms: 0,
+        });
+        let shared = Arc::new(IslandShared::new(None));
+        *shared.model.lock().unwrap() = m;
+        let mut state = IslandState::new(shared);
+        let mut tx = Tx::default();
+        // The card arrives while the island is compact.
+        island_poll(&mut state, 0.0, &mut tx);
+        state.hovered = true;
+        let mut rt = Runtime::new(state, island_view, ISLAND_WINDOW, Env::new(true, 1.0));
+        rt.frame(0.0);
+        assert!(rt.find("island-attention-title").is_some());
+        assert!(rt.find("island-live").is_none());
+    }
+
+    #[test]
+    fn seeing_live_during_capture_pins_the_orb_surface() {
+        let mut m = model(true, 0);
+        m.armed = true;
+        let shared = Arc::new(IslandShared::new(None));
+        *shared.model.lock().unwrap() = m;
+        let mut state = IslandState::new(shared);
+        state.hovered = true;
+        let mut tx = Tx::default();
+        island_poll(&mut state, 0.0, &mut tx);
+        assert!(state.live_pinned, "watching a capture pins Live");
+        state.hovered = false;
+        island_poll(&mut state, 0.0, &mut tx);
+        assert!(state.live_pinned, "the pin survives the pointer leaving");
+    }
+
+    #[test]
+    fn live_adopts_the_rekeyed_chat_and_carries_its_composer() {
+        let mut m = model(false, 0);
+        m.armed = true;
+        let draft = IslandTarget {
+            thread_key: "draft:new".to_string(),
+            title: "New Chat".to_string(),
+            ..IslandTarget::default()
+        };
+        m.chat = Some(IslandChat {
+            target: m.target.clone(),
+            rows: Vec::new(),
+            live: false,
+            status: "Ready".to_string(),
+            draft: String::new(),
+            draft_rev: 0,
+        });
+        let shared = Arc::new(IslandShared::new(None));
+        *shared.model.lock().unwrap() = m;
+        let mut state = IslandState::new(shared);
+        state.hovered = true;
+        state.live_pinned = true;
+        state.live_target = Some(draft.clone());
+        state.composer(&draft.thread_key).text = "first live message".to_string();
+        let mut tx = Tx::default();
+        island_poll(&mut state, 0.0, &mut tx);
+        assert_eq!(
+            state.live_target.as_ref().map(|t| t.thread_key.as_str()),
+            Some("chat:ws:c1")
+        );
+        assert_eq!(
+            state.composer("chat:ws:c1").text,
+            "first live message",
+            "the composer follows the real key"
+        );
+        assert!(state.composer(&draft.thread_key).text.is_empty());
+    }
+
+    #[test]
+    fn live_visibility_watches_the_chat_and_enables_keys() {
+        let mut m = model(false, 0);
+        m.armed = true;
+        let shared = Arc::new(IslandShared::new(None));
+        *shared.model.lock().unwrap() = m;
+        let mut state = IslandState::new(shared.clone());
+        state.hovered = true;
+        let mut tx = Tx::default();
+        island_poll(&mut state, 0.0, &mut tx);
+        assert_eq!(
+            state.live_target.as_ref().map(|t| t.thread_key.as_str()),
+            Some("chat:ws:c1")
+        );
+        let commands = shared.take_commands();
+        assert!(commands.iter().any(|cmd| matches!(
+            cmd,
+            IslandCommand::WatchChat(target) if target.thread_key == "chat:ws:c1"
+        )));
+        assert!(commands.contains(&IslandCommand::SetActivatable(true)));
+
+        state.hovered = false;
+        island_poll(&mut state, 0.0, &mut tx);
+        let commands = shared.take_commands();
+        assert!(commands.contains(&IslandCommand::UnwatchChat));
+        assert!(commands.contains(&IslandCommand::SetActivatable(false)));
     }
 
     #[test]
     fn add_menu_fans_out_into_new_and_existing() {
         let rt = render_with(model(false, 1), |state| {
             state.hovered = true;
+            state.pane = IslandPane::Work;
             state.add_menu = AddMenu::Radial;
         });
         assert!(rt.find("island-radial-chat").is_some());
@@ -2533,6 +3658,7 @@ mod tests {
 
         let chooser = render_with(model(false, 1), |state| {
             state.hovered = true;
+            state.pane = IslandPane::Work;
             state.add_menu = AddMenu::Type(IslandKind::Chat);
         });
         assert!(chooser.find("island-add-new").is_some());
@@ -2540,6 +3666,7 @@ mod tests {
 
         let existing = render_with(model(false, 1), |state| {
             state.hovered = true;
+            state.pane = IslandPane::Work;
             state.add_menu = AddMenu::Existing(IslandKind::Chat);
         });
         assert!(existing.find("island-add-row-chat:ws:c0").is_some());

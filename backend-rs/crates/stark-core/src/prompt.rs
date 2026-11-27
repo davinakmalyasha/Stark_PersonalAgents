@@ -100,6 +100,13 @@ pub struct AgentPrompt<'a> {
     pub code_mode_catalog: Option<&'a str>,
     pub access: &'a str,
     pub skills: Option<&'a [String]>,
+    /// `coding` uses the Developer composer; `general` uses the generic one.
+    pub profile: &'a str,
+    /// Built-in domain instructions for the general profile.
+    pub base_instructions: Option<&'a str>,
+    /// Additive persona from the agent definition.
+    pub persona: Option<&'a str>,
+    pub display: &'a str,
 }
 
 #[cfg(test)]
@@ -121,6 +128,10 @@ pub async fn system_prompt(
         code_mode_catalog: code_mode.then_some(CODEMODE_SECTION),
         access: "write",
         skills: None,
+        profile: "coding",
+        base_instructions: None,
+        persona: None,
+        display: "Developer",
     })
     .await
 }
@@ -137,11 +148,33 @@ pub async fn system_prompt_for_agent(context: AgentPrompt<'_>) -> String {
         code_mode_catalog,
         access,
         skills,
+        profile,
+        base_instructions,
+        persona,
+        display,
     } = context;
+    let persona = persona.map(str::trim).filter(|value| !value.is_empty());
     // Stable first: identity, persona, project instructions, skills, workspace.
-    let mut prompt = format!(
-        "{IDENTITY}\n\nYou are a coding agent powered by the {model} model, helping the user accomplish their software engineering goals.\n\n{HARNESS}\n\n{COMMUNICATION}\n\n{WORKING_IN_CODEBASES}"
-    );
+    let mut prompt = if profile == "coding" {
+        format!(
+            "{IDENTITY}\n\nYou are a coding agent powered by the {model} model, helping the user accomplish their software engineering goals.\n\n{HARNESS}\n\n{COMMUNICATION}\n\n{WORKING_IN_CODEBASES}"
+        )
+    } else {
+        let base = base_instructions
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("You are {display}, a helpful agent powered by Stark."));
+        format!(
+            "{base} Use the provided tools to inspect and change files. Read before editing. \
+             Never invent tool results. Persist until the task is resolved: if a tool fails, read \
+             the error, fix the arguments or try an alternative tool, and continue. Keep the final answer concise."
+        )
+    };
+    if let Some(persona) = persona {
+        prompt.push_str("\n\n# Agent instructions\n");
+        prompt.push_str(persona);
+    }
     if let Some(instructions) = instructions::load(harness_root, workspace) {
         prompt.push_str("\n\n");
         prompt.push_str(&instructions);
@@ -160,6 +193,13 @@ pub async fn system_prompt_for_agent(context: AgentPrompt<'_>) -> String {
     ));
     prompt.push('\n');
     prompt.push_str(workspace_state::USAGE_HINT);
+    if access == "read" {
+        prompt.push_str(
+            " You are READ-ONLY in this task. Do not edit files, run mutating commands, or call write tools. \
+             Inspect with the read-only tools available to your scope (read/grep/glob, read-only bash, files_changed) and memory. \
+             If the task needs writes, delegate it to a workspace agent instead of doing it yourself.",
+        );
+    }
     if let Some(memory) = memory_block(harness_root, workspace_id).await {
         prompt.push_str("\n\n");
         prompt.push_str(&memory);
@@ -264,6 +304,10 @@ mod tests {
             code_mode_catalog: None,
             access: "read",
             skills: None,
+            profile: "coding",
+            base_instructions: None,
+            persona: None,
+            display: "Developer",
         })
         .await;
         assert!(

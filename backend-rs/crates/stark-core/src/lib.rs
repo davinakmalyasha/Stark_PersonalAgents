@@ -18,8 +18,9 @@ use thiserror::Error;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
+pub mod agent_registry;
 mod agent_tools;
-pub mod agents;
+mod agents;
 mod agents_tools;
 pub mod canvas;
 mod compaction;
@@ -36,9 +37,13 @@ mod turn_timing;
 mod workspace_state;
 mod workspaces;
 pub mod worktree;
+pub use agent_registry::{
+    AgentRegistry, DefinitionCheck, access_for as agent_access_for, resolve_definition,
+    root_access, spawned_access, validate_definition,
+};
 pub use agents::{
-    AgentSpec, FileAccess, default_access, for_scope as agent_for_scope, resolve_agent,
-    workspace_agents,
+    AgentSpec, FileAccess, access_from_str, default_access, for_scope as agent_for_scope,
+    resolve_agent, workspace_agents,
 };
 
 pub type JobDoneHook = Arc<dyn Fn(String) + Send + Sync>;
@@ -278,8 +283,11 @@ impl RunContext {
     }
 
     fn agent_label(&self) -> String {
-        agent_for_scope(&self.scope)
-            .map(|agent| agent.display.to_string())
+        self.config
+            .as_ref()
+            .map(|agent| agent.display.clone())
+            .filter(|display| !display.trim().is_empty())
+            .or_else(|| agent_for_scope(&self.scope).map(|agent| agent.display.to_string()))
             .or_else(|| self.role.clone())
             .unwrap_or_else(|| "Stark".to_string())
     }
@@ -480,77 +488,117 @@ async fn build_system_prompt(
     mode: &str,
     code_mode_catalog: Option<&str>,
 ) -> String {
-    let role = ctx.role.as_deref().unwrap_or("a coding agent");
-    if ctx.scope == "developer" {
-        // Developer: stable content first and the volatile runtime snapshot
-        // last so prefix-cache reuse survives plan switches. Memory/worktree
-        // blocks are intentionally absent.
-        let mut prompt = crate::prompt::system_prompt_for_agent(crate::prompt::AgentPrompt {
-            workspace: &ctx.workspace,
-            workspace_id: &ctx.workspace_id,
-            harness_root: ctx.store.harness_root(),
-            model: &ctx.model,
-            mode,
-            depth: ctx.depth,
-            code_mode_catalog,
-            access: ctx.file_access.as_str(),
-            skills: ctx
-                .config
-                .as_ref()
-                .and_then(|config| config.skills.as_deref()),
-        })
-        .await;
-        if let Some(custom) = ctx
-            .config
-            .as_ref()
-            .and_then(|config| config.system_prompt.as_deref())
-        {
-            prompt.push_str("\n\n# Agent instructions\n");
-            prompt.push_str(custom);
-        }
-        prompt
+    let profile = ctx
+        .config
+        .as_ref()
+        .map(|config| config.prompt_profile.as_str())
+        .filter(|profile| !profile.trim().is_empty())
+        .unwrap_or(if ctx.scope == "developer" {
+            "coding"
+        } else {
+            "general"
+        });
+    let base_instructions = if profile == "coding" {
+        None
     } else {
-        let preamble = ctx
+        agent_for_scope(&ctx.scope).map(|agent| agent.instructions)
+    };
+    let persona = ctx
+        .config
+        .as_ref()
+        .and_then(|config| config.persona.as_deref());
+    let display = ctx
+        .config
+        .as_ref()
+        .map(|config| config.display.as_str())
+        .filter(|display| !display.trim().is_empty())
+        .or(ctx.role.as_deref())
+        .unwrap_or("Stark");
+    crate::prompt::system_prompt_for_agent(crate::prompt::AgentPrompt {
+        workspace: &ctx.workspace,
+        workspace_id: &ctx.workspace_id,
+        harness_root: ctx.store.harness_root(),
+        model: &ctx.model,
+        mode,
+        depth: ctx.depth,
+        code_mode_catalog,
+        access: ctx.file_access.as_str(),
+        skills: ctx
             .config
             .as_ref()
-            .and_then(|config| config.system_prompt.clone())
-            .unwrap_or_else(|| match agent_for_scope(&ctx.scope) {
-                Some(agent) => agent.instructions.to_string(),
-                None => format!("You are Stark, {role}."),
-            });
-        let mut prompt = format!(
-            "{preamble} Use the provided tools to inspect and change files. Read before editing. \
-             Never invent tool results. Persist until the task is resolved: if a tool fails, read \
-             the error, fix the arguments or try an alternative tool, and continue. Keep the final answer concise.\n\n{}",
-            workspace_state::render(ctx.store.harness_root(), &ctx.workspace_id, &ctx.workspace)
-        );
-        prompt.push('\n');
-        prompt.push_str(workspace_state::USAGE_HINT);
-        if ctx.file_access.is_read_only() {
-            prompt.push_str(
-                " You are READ-ONLY in this task. Do not edit files, run mutating commands, or call write tools. \
-                 Inspect with the read-only tools available to your scope (read/grep/glob, read-only bash, files_changed) and memory. \
-                 If the task needs writes, delegate it to a workspace agent instead of doing it yourself.",
-            );
+            .and_then(|config| config.skills.as_deref()),
+        profile,
+        base_instructions,
+        persona,
+        display,
+    })
+    .await
+}
+
+/// Compose the exact system prompt an agent would receive. The preview API and
+/// the run loop share this function so what the builder shows is what runs.
+pub async fn preview_system_prompt(
+    agent: &stark_config::EffectiveAgent,
+    workspace: &std::path::Path,
+    workspace_id: &str,
+    harness_root: &std::path::Path,
+    mode: &str,
+) -> String {
+    let profile = if agent.prompt_profile.trim().is_empty() {
+        if agent.key == "developer" {
+            "coding"
+        } else {
+            "general"
         }
-        if let Some(instructions) = instructions::load(ctx.store.harness_root(), &ctx.workspace) {
-            prompt.push_str("\n\n");
-            prompt.push_str(&instructions);
-        }
-        if let Some(memory) =
-            crate::prompt::memory_block(ctx.store.harness_root(), &ctx.workspace_id).await
-        {
-            prompt.push_str("\n\n");
-            prompt.push_str(&memory);
-        }
-        if mode == "plan" {
-            prompt.push_str(
-                " You are in PLAN mode: inspect and plan only. Use update_plan to maintain the plan. \
-                 Do not edit files, spawn subagents, or run commands with side effects.",
-            );
-        }
-        prompt
-    }
+    } else {
+        agent.prompt_profile.as_str()
+    };
+    let base_instructions = if profile == "coding" {
+        None
+    } else {
+        agent_for_scope(&agent.key).map(|spec| spec.instructions)
+    };
+    let code_mode = agent
+        .code_mode
+        .as_deref()
+        .and_then(stark_tools::CodeMode::parse)
+        .unwrap_or_else(|| stark_tools::default_code_mode(&agent.key));
+    let full = code_mode.enabled()
+        && (matches!(code_mode, stark_tools::CodeMode::Only)
+            || agent.full_codemode.unwrap_or(false));
+    let code_mode_catalog = if code_mode.enabled() {
+        Some(stark_tools::render_code_mode_catalog_full(
+            mode,
+            &agent.key,
+            &agent.access,
+            agent.tools.as_deref(),
+            agent.mcp.as_deref(),
+            full,
+        ))
+    } else {
+        None
+    };
+    crate::prompt::system_prompt_for_agent(crate::prompt::AgentPrompt {
+        workspace,
+        workspace_id,
+        harness_root,
+        model: &agent.model,
+        mode,
+        depth: 0,
+        code_mode_catalog: code_mode_catalog.as_deref(),
+        access: &agent.access,
+        skills: agent.skills.as_deref(),
+        profile,
+        base_instructions,
+        persona: agent.persona.as_deref(),
+        display: &agent.display,
+    })
+    .await
+}
+
+pub fn estimate_prompt_tokens(text: &str) -> usize {
+    // Same conservative ~3.6 chars/token estimate the compaction engine uses.
+    (text.len() * 10).div_ceil(36) + 12
 }
 
 async fn run_agent_inner(
@@ -580,6 +628,9 @@ async fn run_agent_inner(
             &prompt,
         )
         .await?;
+    // Snapshot the resolved agent on the chat so follow-up turns and the
+    // picker keep the custom agent instead of re-deriving Developer/General.
+    ctx.store.set_chat_agent(&ctx.chat_id, &ctx.scope).await?;
 
     // Canonical trace: one rollout file per chat. Open (or resume) first so
     // every subsequent event is recorded, even when the provider fails.
@@ -1893,7 +1944,9 @@ async fn run_agent_inner(
                     | "close_agent"
                     | "resume_agent"
             ) {
-                if let Some(reason) =
+                if ctx.config.as_ref().is_some_and(|config| !config.can_spawn) {
+                    ToolOutcome::err("this agent is not allowed to manage child agents")
+                } else if let Some(reason) =
                     stark_tools::plan_mode_denial(&mode, &call.function.name, &args)
                 {
                     ToolOutcome::err(reason)
@@ -1917,7 +1970,13 @@ async fn run_agent_inner(
                     workspaces::workspace(&ctx, &args).await
                 }
             } else if call.function.name == "delegate" {
-                if let Some(reason) =
+                if ctx
+                    .config
+                    .as_ref()
+                    .is_some_and(|config| !config.can_delegate)
+                {
+                    ToolOutcome::err("this agent is not allowed to delegate work")
+                } else if let Some(reason) =
                     stark_tools::plan_mode_denial(&mode, &call.function.name, &args)
                 {
                     ToolOutcome::err(reason)
@@ -1953,7 +2012,15 @@ async fn run_agent_inner(
             } else if call.function.name == "canvas_mode" {
                 canvas::handle(&ctx, &args).await
             } else if call.function.name == "agent" {
-                agents_tools::handle(&ctx, &args).await
+                if ctx
+                    .config
+                    .as_ref()
+                    .is_some_and(|config| !config.can_spawn && !config.can_delegate)
+                {
+                    ToolOutcome::err("this agent is not allowed to manage child agents")
+                } else {
+                    agents_tools::handle(&ctx, &args).await
+                }
             } else if call.function.name == "ask_user_question" {
                 // Plan-review approval (replaces exit_plan_mode): when the
                 // tool result carries [PLAN APPROVED], flip plan -> build.

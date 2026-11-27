@@ -393,7 +393,7 @@ impl WorkerManager {
         };
         ctx_emit(
             ctx,
-            stark_contract::Delta::tool_started(&dispatch_name, &args.to_string()),
+            stark_contract::Delta::tool_started(&dispatch_name, args.to_string()),
         );
         let started = Instant::now();
         // Cancel-safe tools race the run token; file mutations run to
@@ -416,7 +416,7 @@ impl WorkerManager {
             ctx,
             stark_contract::Delta::tool_finished(
                 &dispatch_name,
-                &args.to_string(),
+                args.to_string(),
                 !outcome.is_error,
                 started.elapsed().as_millis() as u64,
                 preview,

@@ -10,7 +10,7 @@ use stark_store::{AgentRecord, AgentStore};
 use stark_tools::ToolOutcome;
 use tokio_util::sync::CancellationToken;
 
-use crate::{RunContext, agent_for_scope};
+use crate::{AgentRegistry, RunContext, agent_access_for};
 
 const MAX_DEPTH: i64 = 2;
 
@@ -60,7 +60,11 @@ pub(crate) async fn current_agent(
             ),
         )
     };
-    let access = crate::default_access(&ctx.scope, ctx.depth, false);
+    let access = ctx
+        .config
+        .as_ref()
+        .map(|agent| agent_access_for(agent, ctx.depth, false))
+        .unwrap_or_else(|| crate::default_access(&ctx.scope, ctx.depth, false));
     let agent = store
         .create_agent(
             kind,
@@ -90,6 +94,16 @@ async fn spawn(ctx: &RunContext, store: &AgentStore, args: &Value) -> Result<Str
         .get("kind")
         .and_then(Value::as_str)
         .unwrap_or("subagent");
+    if let Some(config) = &ctx.config {
+        let allowed = match kind {
+            "workspace" => config.can_delegate,
+            "subagent" => config.can_spawn,
+            _ => false,
+        };
+        if !allowed {
+            return Err(format!("this agent is not allowed to spawn {kind} agents"));
+        }
+    }
     let task = args
         .get("task")
         .and_then(Value::as_str)
@@ -101,8 +115,18 @@ async fn spawn(ctx: &RunContext, store: &AgentStore, args: &Value) -> Result<Str
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim();
-    let spec = agent_for_scope(requested)
-        .or_else(|| agent_for_scope("general"))
+    let registry = AgentRegistry::open(ctx.store.harness_root());
+    let spec = registry
+        .get(requested)
+        .cloned()
+        .or_else(|| {
+            registry
+                .list()
+                .iter()
+                .find(|agent| agent.display.eq_ignore_ascii_case(requested))
+                .cloned()
+        })
+        .or_else(|| registry.get("general").cloned())
         .ok_or_else(|| "unknown agent".to_string())?;
     let title = args
         .get("title")
@@ -133,8 +157,15 @@ async fn spawn(ctx: &RunContext, store: &AgentStore, args: &Value) -> Result<Str
 
     let (agent, created) = match kind {
         "workspace" => {
-            if current.kind != "orchestrator" {
-                return Err("only the orchestrator can spawn workspace agents".to_string());
+            let delegated = ctx
+                .config
+                .as_ref()
+                .is_some_and(|config| config.can_delegate);
+            if current.kind != "orchestrator" && !delegated {
+                return Err(
+                    "only the orchestrator or an agent with delegation.can_delegate can spawn workspace agents"
+                        .to_string(),
+                );
             }
             // Codex parity: parallel fan-out needs one independent agent per
             // job. The durable singleton is only for sequential follow-ups to
@@ -143,13 +174,13 @@ async fn spawn(ctx: &RunContext, store: &AgentStore, args: &Value) -> Result<Str
             let mut reused: Option<stark_store::AgentRecord> = None;
             if !fresh_requested
                 && let Some(existing) = store
-                    .workspace_agent(&workspace_id, spec.key)
+                    .workspace_agent(&workspace_id, &spec.key)
                     .await
                     .map_err(|error| error.to_string())?
             {
                 // Reuse the durable workspace agent. If its previous worktree
                 // is terminal or missing, isolate a fresh one.
-                let access = requested_access(args, spec.key, current.depth + 1);
+                let access = requested_access(args, &spec, current.depth + 1);
                 if access == crate::FileAccess::Worktree
                     && (existing.worktree_state == "merged"
                         || existing.worktree_state == "discarded"
@@ -191,15 +222,15 @@ async fn spawn(ctx: &RunContext, store: &AgentStore, args: &Value) -> Result<Str
                         Some(&current.id),
                         &chat_id,
                         &workspace_id,
-                        spec.key,
-                        spec.display,
+                        &spec.key,
+                        &spec.display,
                         &title,
                         &ctx.model,
                         current.depth + 1,
                     )
                     .await
                     .map_err(|error| error.to_string())?;
-                let access = requested_access(args, spec.key, current.depth + 1);
+                let access = requested_access(args, &spec, current.depth + 1);
                 if access == crate::FileAccess::Worktree {
                     let _ = attach_worktree(ctx, store, &agent, &workspace_path).await;
                 } else {
@@ -256,15 +287,15 @@ async fn spawn(ctx: &RunContext, store: &AgentStore, args: &Value) -> Result<Str
                     Some(&current.id),
                     &chat_id,
                     &ctx.workspace_id,
-                    spec.key,
-                    spec.display,
+                    &spec.key,
+                    &spec.display,
                     &title,
                     &ctx.model,
                     current.depth + 1,
                 )
                 .await
                 .map_err(|error| error.to_string())?;
-            let access = requested_access(args, spec.key, current.depth + 1);
+            let access = requested_access(args, &spec, current.depth + 1);
             if access == crate::FileAccess::Worktree {
                 let _ = attach_worktree(ctx, store, &agent, &parent_workspace).await;
             } else {
@@ -405,22 +436,24 @@ fn format_agent(agent: &AgentRecord) -> String {
     text
 }
 
-fn requested_access(args: &Value, scope: &str, depth: i64) -> crate::FileAccess {
-    let mut access = crate::default_access(scope, depth.max(0) as u32, true);
-    if args
-        .get("write_access")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-        && access.is_read_only()
-    {
-        access = crate::FileAccess::Worktree;
-    }
-    if args
+fn requested_access(
+    args: &Value,
+    agent: &stark_config::EffectiveAgent,
+    depth: i64,
+) -> crate::FileAccess {
+    // The agent's spawned cap is the hard ceiling. `write_access` can select a
+    // worktree for a write-capable agent, but it can never turn a read-only
+    // agent into a writer.
+    let mut access = agent_access_for(agent, depth.max(0) as u32, true);
+    let wants_isolated = args
         .get("isolate")
         .and_then(Value::as_bool)
         .unwrap_or(false)
-        && !access.is_read_only()
-    {
+        || args
+            .get("write_access")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    if wants_isolated && !access.is_read_only() {
         access = crate::FileAccess::Worktree;
     }
     access

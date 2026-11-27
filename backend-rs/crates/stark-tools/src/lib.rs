@@ -78,6 +78,7 @@ pub fn sandbox_prompt_line_for(workspace: &Path, access: &str) -> String {
 pub fn sandbox_status(workspace: &Path) -> String {
     SandboxProfile::from_env(workspace).prompt_line()
 }
+pub use mcp::configured_servers;
 pub use mcp::{McpManager, ServerConfig as McpServerConfig, init as init_mcp, search_tools};
 pub use plan::{PlanError, PlanStore, update_plan};
 pub use processes::{ProcessManager, ProcessStatus};
@@ -86,7 +87,7 @@ pub use retention::{RetentionPolicy, RetentionReport, free_bytes, sweep_harness}
 pub use screen::{
     PendingImage, ScreenBridge, drain_images, latest_continuous_image, queue_image, screen_bridge,
 };
-pub use skills::{catalog_block_for, catalog_block_for_agent};
+pub use skills::{catalog_block_for, catalog_block_for_agent, skill_names};
 pub use verify::{AcceptanceVerdict, CriterionStatus, CriterionVerdict, evaluate_acceptance};
 
 /// Tool membership and guard flags live in [`inventory`]: one `ToolMeta`
@@ -656,7 +657,9 @@ fn visible_specs_for_run(
     allowed_tools: Option<&[String]>,
     mcp_servers: Option<&[String]>,
 ) -> Vec<Value> {
-    let scope = scope.trim().to_lowercase();
+    // Compatibility aliases ("coder", "dev", ...) resolve to the canonical
+    // built-in before the contract lookup.
+    let scope = canonical_code_mode_scope(scope.trim()).to_ascii_lowercase();
     let allowed = contract().scope_map.get(&scope);
     let agent_allowed: Option<HashSet<String>> = allowed_tools.map(|names| {
         names
@@ -681,7 +684,10 @@ fn visible_specs_for_run(
         .tools
         .iter()
         .filter(|tool| {
-            tool.exposed
+            // A custom scope only has tools through its explicit ACL. Never
+            // fall through to the whole inventory when that ACL is missing.
+            (allowed.is_some() || agent_allowed.is_some() || scope == "agent")
+                && tool.exposed
                 && is_implemented(tool.name.as_str())
                 && allowed.is_none_or(|names| names.contains(&tool.name))
                 && agent_allowed
@@ -916,6 +922,7 @@ pub fn tool_specs_for_run_with_code_mode(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn tool_specs_for_run_with_code_mode_full(
     mode: &str,
     scope: &str,
@@ -1042,10 +1049,10 @@ fn code_mode_spec(mut spec: Value) -> Value {
                 "Optional timeout in milliseconds (default 600000). When it expires, a foreground command moves to the background and a background command is stopped."
             );
         }
-        if let Some(parameters) = parameters.as_object_mut() {
-            if let Some(required) = parameters.get_mut("required").and_then(Value::as_array_mut) {
-                required.retain(|value| value.as_str() != Some("run_in_background"));
-            }
+        if let Some(parameters) = parameters.as_object_mut()
+            && let Some(required) = parameters.get_mut("required").and_then(Value::as_array_mut)
+        {
+            required.retain(|value| value.as_str() != Some("run_in_background"));
         }
     }
     spec
@@ -1076,6 +1083,7 @@ pub fn program_specs_for_context(ctx: &ToolContext) -> Vec<Value> {
 /// the system prompt plus, when the catalog changed, the chronological update
 /// OpenCode stores as a system message. Persisted under
 /// `.deep_agents/codemode/instructions`.
+#[allow(clippy::too_many_arguments)]
 pub fn render_code_mode_instructions_for_chat(
     harness_root: &std::path::Path,
     chat_id: &str,
@@ -1381,29 +1389,43 @@ pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcom
     // Enforce the frozen scope contract at dispatch, not only when
     // advertising. Without this a hallucinated legacy name (read_file,
     // run_command, ...) skipped the v2 permission gates.
-    if !name.starts_with("mcp__")
-        && let Some(allowed) = contract().scope_map.get(&ctx.scope)
-        && !allowed.iter().any(|tool| tool == name)
-    {
-        // A name that is not in the frozen contract at all is a hallucination,
-        // not a policy denial: say so, and list what exists.
-        if contract().tool(name).is_none() {
+    if !name.starts_with("mcp__") {
+        let contract_scope = canonical_code_mode_scope(&ctx.scope).to_ascii_lowercase();
+        if let Some(allowed) = contract().scope_map.get(&contract_scope) {
+            if !allowed.iter().any(|tool| tool == name) {
+                // A name that is not in the frozen contract at all is a
+                // hallucination, not a policy denial: say so, and list what
+                // exists.
+                if contract().tool(name).is_none() {
+                    return ToolOutcome::err_class(
+                        ToolErrorClass::Unknown,
+                        format!(
+                            "Error: tool '{name}' does not exist in this harness. Use tool_search to find MCP tools, or one of: {}",
+                            allowed.join(", ")
+                        ),
+                    );
+                }
+                return ToolOutcome::err_class(
+                    ToolErrorClass::Blocked,
+                    format!(
+                        "[BLOCKED] Tool '{name}' is not in the '{}' scope contract. Use one of: {}",
+                        ctx.scope,
+                        allowed.join(", ")
+                    ),
+                );
+            }
+        } else if ctx.scope != "agent" && ctx.allowed_tools.is_none() {
+            // Custom agents have no frozen scope entry. Without an explicit
+            // closed ACL they must fail closed, not fall through to every
+            // built-in tool.
             return ToolOutcome::err_class(
-                ToolErrorClass::Unknown,
+                ToolErrorClass::Blocked,
                 format!(
-                    "Error: tool '{name}' does not exist in this harness. Use tool_search to find MCP tools, or one of: {}",
-                    allowed.join(", ")
+                    "[BLOCKED] Agent scope '{}' has no tool contract. Refusing to run '{name}'.",
+                    ctx.scope
                 ),
             );
         }
-        return ToolOutcome::err_class(
-            ToolErrorClass::Blocked,
-            format!(
-                "[BLOCKED] Tool '{name}' is not in the '{}' scope contract. Use one of: {}",
-                ctx.scope,
-                allowed.join(", ")
-            ),
-        );
     }
     if ctx.depth > 0 && matches!(name, "ask_user_question" | "ask_user") {
         return ToolOutcome::err_class(
@@ -3079,5 +3101,46 @@ mod code_mode_policy_tests {
         );
         assert!(!catalog.contains("tools.glob("), "{catalog}");
         assert!(!catalog.contains("tools.grep("), "{catalog}");
+    }
+
+    #[test]
+    fn custom_scope_is_closed_by_its_acl() {
+        let tools = vec!["read".to_string(), "grep".to_string()];
+        let specs = tool_specs_for_run_with_code_mode(
+            "build",
+            "backend",
+            "read",
+            &HashSet::new(),
+            Some(&tools),
+            Some(&[]),
+            CodeMode::Off,
+        );
+        let names = names(&specs);
+        assert_eq!(names, vec!["read", "grep"]);
+        assert!(!names.contains(&"edit"));
+        // A custom scope with no explicit ACL must expose nothing, not the
+        // whole built-in inventory.
+        let none = tool_specs_for_run_with_code_mode(
+            "build",
+            "backend",
+            "write",
+            &HashSet::new(),
+            None,
+            None,
+            CodeMode::Off,
+        );
+        assert!(names_of(&none).is_empty());
+    }
+
+    fn names_of(specs: &[serde_json::Value]) -> Vec<String> {
+        specs
+            .iter()
+            .filter_map(|spec| {
+                spec.get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect()
     }
 }

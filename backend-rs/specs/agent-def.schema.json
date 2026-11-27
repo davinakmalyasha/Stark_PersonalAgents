@@ -1,0 +1,152 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://stark.local/specs/agent-def.schema.json",
+  "title": "Stark Agent Definition v2",
+  "description": "One file per agent under .deep_agents/config/agents/<key>.json. Built-in keys are validated overrides with compiled caps; any other key is a full custom definition. Custom agents are closed-world: tools is required (use [] for none); missing skills/mcp means none; Code Mode is off.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "display"],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2,
+      "default": 2,
+      "description": "v1 files are read and migrated on read; every write is v2."
+    },
+    "key": {
+      "type": "string",
+      "pattern": "^[a-z0-9_-]{1,64}$",
+      "description": "Optional in-file copy of the filename key. The filename wins."
+    },
+    "display": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 400
+    },
+    "tier": {
+      "type": "string",
+      "description": "Model matrix tier: workspace, specialist, or orchestrator. Empty inherits the built-in/custom default."
+    },
+    "provider": {
+      "type": ["string", "null"],
+      "description": "Provider id present in providers.json. Null inherits the active provider."
+    },
+    "model": {
+      "type": ["string", "null"],
+      "description": "Model key, id, or alias for the selected provider. Null inherits the tier matrix."
+    },
+    "thinking": {
+      "type": ["string", "null"],
+      "enum": ["inherit", "none", "minimal", "low", "medium", "high", null]
+    },
+    "access": {
+      "type": "string",
+      "enum": ["read", "write"],
+      "default": "read",
+      "description": "Custom agents: root access. write is capped to a worktree when spawned. Built-ins: may narrow, never widen, their compiled cap."
+    },
+    "prompt": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "profile": {
+          "type": "string",
+          "enum": ["coding", "general", "plain"],
+          "default": "general",
+          "description": "coding uses the Developer composer; general uses the generic composer. Built-ins keep their compiled profile."
+        },
+        "persona": {
+          "type": "string",
+          "description": "Appended after harness/safety instructions. Code-enforced guards are never removed by a persona."
+        }
+      }
+    },
+    "system_prompt": {
+      "type": ["string", "null"],
+      "description": "Legacy v1 persona. Do not combine with prompt.persona."
+    },
+    "tools": {
+      "type": "array",
+      "description": "Built-ins: optional subset of the compiled scope contract. Custom agents: the complete closed tool list; required for new custom agents (use [] for none).",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9_]+$"
+      }
+    },
+    "skills": {
+      "type": "array",
+      "description": "Skill names discovered under .agents/skills or .deep_agents/skills. Built-ins: null/omitted means all. Custom: omitted means none.",
+      "uniqueItems": true,
+      "items": {
+        "type": "string"
+      }
+    },
+    "mcp": {
+      "type": "array",
+      "description": "Configured MCP server names. Built-ins: null/omitted means all. Custom: omitted means none.",
+      "uniqueItems": true,
+      "items": {
+        "type": "string"
+      }
+    },
+    "aliases": {
+      "type": "array",
+      "description": "Compatibility names. Never listed as agents. Must not shadow any key or alias. Built-in aliases are fixed and ignore this field.",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9_-]{1,64}$"
+      }
+    },
+    "delegation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "delegatable": {
+          "type": "boolean",
+          "default": false,
+          "description": "May be selected as a delegate target."
+        },
+        "can_delegate": {
+          "type": "boolean",
+          "default": false,
+          "description": "May call delegate/delegation_status. Built-ins are capped."
+        },
+        "can_spawn": {
+          "type": "boolean",
+          "default": false,
+          "description": "May use spawn_agent and the durable agent tree. Built-ins are capped."
+        }
+      }
+    },
+    "ui": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "visible": {
+          "type": "boolean",
+          "default": true
+        },
+        "order": {
+          "type": "integer",
+          "default": 0
+        }
+      }
+    },
+    "code_mode": {
+      "type": "string",
+      "enum": ["off", "none", "disabled", "hybrid", "both", "preferred", "only", "strict"],
+      "description": "Built-in Developer only. Custom agents must use off until the additive Code Mode capability lands."
+    },
+    "full_codemode": {
+      "type": ["boolean", "null"],
+      "description": "Built-in Developer only. Opt-in promotion of hybrid to the full OpenCode surface."
+    }
+  }
+}

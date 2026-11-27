@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use stark_store::{AgentRecord, AgentStore};
 use stark_tools::ToolOutcome;
 
-use crate::{RunContext, agent_for_scope, agents_tools};
+use crate::{RunContext, agents_tools};
 
 const MAX_CHILDREN: usize = 6;
 const MAX_DEPTH: i64 = 1;
@@ -186,14 +186,29 @@ async fn spawn_agent(ctx: &RunContext, args: &Value) -> Result<String, String> {
                 .to_string(),
         );
     }
-    if let Some(agent_type) = args.get("agent_type").and_then(Value::as_str) {
-        let normalized = agent_type.trim().to_ascii_lowercase();
-        if !normalized.is_empty() && normalized != "developer" && normalized != "dev" {
-            return Err(format!(
-                "subagent type '{agent_type}' is not configured yet; use Developer"
-            ));
-        }
+    if let Some(config) = &ctx.config
+        && !config.can_spawn
+    {
+        return Err("this agent is not allowed to spawn child agents".to_string());
     }
+    let registry = crate::AgentRegistry::open(ctx.store.harness_root());
+    let requested_type = args
+        .get("agent_type")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("developer");
+    let spec = registry
+        .get(requested_type)
+        .cloned()
+        .or_else(|| {
+            registry
+                .list()
+                .iter()
+                .find(|agent| agent.display.eq_ignore_ascii_case(requested_type))
+                .cloned()
+        })
+        .ok_or_else(|| format!("subagent type '{requested_type}' is not configured"))?;
     let path = canonical_path(&current, task_name);
     if store
         .list(None)
@@ -264,7 +279,6 @@ async fn spawn_agent(ctx: &RunContext, args: &Value) -> Result<String, String> {
     } else {
         message.to_string()
     };
-    let spec = agent_for_scope("developer").ok_or_else(|| "developer agent missing".to_string())?;
     let agent = store
         .create_agent(
             "subagent",
@@ -272,15 +286,22 @@ async fn spawn_agent(ctx: &RunContext, args: &Value) -> Result<String, String> {
             Some(&current.id),
             &chat_id,
             &ctx.workspace_id,
-            "developer",
-            spec.display,
+            &spec.key,
+            &spec.display,
             task_name,
             &model,
             current.depth + 1,
         )
         .await
         .map_err(|error| error.to_string())?;
-    let _ = store.set_access(&agent.id, "write").await;
+    // `spawn_agent` children run in the parent's workspace, not a fresh
+    // worktree. Use the target's root access, capped by the parent's access so
+    // a read-only parent can never create a writing child.
+    let mut access = crate::agent_access_for(&spec, 0, false);
+    if ctx.file_access.is_read_only() {
+        access = crate::FileAccess::Read;
+    }
+    let _ = store.set_access(&agent.id, access.as_str()).await;
     store
         .enqueue(
             Some(&current.id),

@@ -11,6 +11,7 @@
 //! naming, output truncation. No `rmcp::` types leak past `McpServer`.
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 use std::process::Stdio;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -69,6 +70,18 @@ pub struct ServerConfig {
     pub startup_timeout_sec: f64,
     #[serde(default = "default_tool_timeout")]
     pub tool_timeout_sec: f64,
+}
+
+/// Configured MCP server names, read from `.deep_agents/mcp_servers.json`.
+/// Used by the agent-definition validator so unknown servers are rejected at
+/// save time instead of silently disappearing at run time.
+pub fn configured_servers(root: &Path) -> Vec<String> {
+    let path = root.join(".deep_agents").join("mcp_servers.json");
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<McpConfig>(&raw).ok())
+        .map(|config| config.servers.keys().cloned().collect())
+        .unwrap_or_default()
 }
 
 fn default_approval() -> String {
@@ -1721,8 +1734,10 @@ mod tests {
             root: std::path::PathBuf::new(),
             servers: RwLock::new(BTreeMap::new()),
         };
-        let mut code = ServerConfig::default();
-        code.scopes = vec!["developer".to_string()];
+        let code = ServerConfig {
+            scopes: vec!["developer".to_string()],
+            ..ServerConfig::default()
+        };
         let code = Arc::new(McpServer::new("code".to_string(), code));
         *code.status.write().unwrap() = "connected".to_string();
         *code.tools.write().unwrap() = vec![json!({
@@ -1730,9 +1745,11 @@ mod tests {
             "description": "Look something up",
             "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}
         })];
-        let mut direct = ServerConfig::default();
-        direct.scopes = vec!["developer".to_string()];
-        direct.codemode = Some(false);
+        let direct = ServerConfig {
+            scopes: vec!["developer".to_string()],
+            codemode: Some(false),
+            ..ServerConfig::default()
+        };
         let direct = Arc::new(McpServer::new("direct".to_string(), direct));
         *direct.status.write().unwrap() = "connected".to_string();
         *direct.tools.write().unwrap() = vec![json!({

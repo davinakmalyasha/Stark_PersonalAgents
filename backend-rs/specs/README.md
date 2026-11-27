@@ -95,3 +95,20 @@ dispatch arm.
 The Developer surface is documented by the contract itself and the
 `stark-tools` inventory. The old per-tool pages and design docs were deleted;
 the code is the source of truth.
+
+## Custom agents and the frozen contract
+
+`tool-specs.json` remains the frozen wire contract for the eight built-in
+scopes. Custom agents do **not** add entries to `scope_map`; they use the
+runtime registry's closed ACL (`stark-core/src/agent_registry.rs`). This keeps
+contract tests stable while making agent add/remove a data operation.
+
+Rules for custom definitions:
+
+- `tools` is the complete allowlist; omitted tools means an invalid definition.
+- Unknown tools/skills/MCP servers are rejected on save.
+- Read-only agents cannot receive mutating tools.
+- Custom Code Mode is off; `execute` is rejected.
+- Built-ins can narrow their compiled caps but never widen them.
+
+Schema: `agent-def.schema.json`. API: `docs/agent-builder-api.md`.

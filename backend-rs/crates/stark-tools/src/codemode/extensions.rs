@@ -124,8 +124,13 @@ async fn resolve(host: &RunHost, raw: &str) -> Result<(PathBuf, String, bool), H
     let inside = crate::paths::path_starts_with(&canonical, &workspace);
     if !inside {
         let label = absolute.to_string_lossy().to_string();
-        if let Some(blocked) =
-            crate::permissions::gate(ctx, "external_directory", &[label.clone()], &label).await
+        if let Some(blocked) = crate::permissions::gate(
+            ctx,
+            "external_directory",
+            std::slice::from_ref(&label),
+            &label,
+        )
+        .await
         {
             return Err(blocked_error(blocked));
         }

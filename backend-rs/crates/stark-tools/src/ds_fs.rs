@@ -339,6 +339,7 @@ fn under_denylist(relative: &str, is_dir: bool) -> bool {
 /// Warm file list for `root`: `(root-relative path, is_dir)` pairs from
 /// `search::warm_entries` (blocking walk on a cold/dirty slot, so run it in
 /// `spawn_blocking`).
+#[allow(clippy::result_large_err)]
 async fn warm_list(
     root: &Path,
     respect_ignore: bool,

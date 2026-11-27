@@ -122,6 +122,7 @@ fn job_file(harness_root: &Path, id: &str) -> PathBuf {
     snapshot_dir(harness_root).join(format!("{id}.json"))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_job(
     path: &Path,
     status: &JobStatus,

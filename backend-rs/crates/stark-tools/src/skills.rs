@@ -82,6 +82,46 @@ async fn read_skill(path: &Path) -> Option<(String, String, String)> {
     Some((name, description, text))
 }
 
+/// Discovered skill names, sync, for agent-definition validation.
+pub fn skill_names(workspace: &Path, harness_root: &Path) -> Vec<String> {
+    let mut roots = vec![
+        workspace.join(".agents").join("skills"),
+        harness_root.join(".agents").join("skills"),
+        harness_root.join(".deep_agents").join("skills"),
+    ];
+    roots.sort();
+    roots.dedup();
+    let mut names = std::collections::BTreeSet::new();
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let skill_path = path.join("SKILL.md");
+            let Ok(text) = std::fs::read_to_string(&skill_path) else {
+                continue;
+            };
+            let fields = parse_frontmatter(&text);
+            let name = fields
+                .get("name")
+                .cloned()
+                .filter(|value| !value.is_empty())
+                .or_else(|| {
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                });
+            if let Some(name) = name {
+                names.insert(name);
+            }
+        }
+    }
+    names.into_iter().collect()
+}
+
 pub async fn catalog_block_for(workspace: &Path, harness_root: &Path) -> Option<String> {
     catalog_block_for_agent(workspace, harness_root, None).await
 }

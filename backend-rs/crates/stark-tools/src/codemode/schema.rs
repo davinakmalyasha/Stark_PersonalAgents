@@ -670,13 +670,10 @@ pub fn tool_signature(
         format!("({})", json_schema_to_typescript(input_schema, true))
     };
     format!(
-        "{}{}{}",
+        "{}{}: Promise<{}>",
         tool_expression(path),
         params,
-        format!(
-            ": Promise<{}>",
-            json_schema_to_typescript(output_schema, true)
-        )
+        json_schema_to_typescript(output_schema, true)
     )
 }
 

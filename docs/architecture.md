@@ -96,6 +96,35 @@ Dispatch passes through the policy and plan guards, the question broker, the
 process manager, and MCP routing. Tool output is bounded before it reaches the
 model.
 
+### Agent registry
+
+`stark-core/src/agent_registry.rs` is the runtime source of truth. It merges
+the eight compiled `AgentSpec` seeds with custom records from
+`.deep_agents/config/agents/*.json` into one `EffectiveAgent` shape used by the
+picker, run selection, prompts, tools, access, delegation, schedules, and
+groups.
+
+- Built-ins are immutable seeds with compiled access, prompt-profile,
+  delegation, and tool caps. A config file can narrow but never widen them.
+- Custom agents have a closed tool list. Missing `tools` is an error; an
+  explicit `[]` is a talk-only agent. Omitted `skills`/`mcp` means none for
+  custom agents, not all.
+- Invalid definitions are quarantined and reported; they are never partially
+  applied.
+- Aliases resolve at read time and are never listed. `coder` remains an alias
+  for `developer`.
+- Every run snapshots its runtime record. A chat stores its resolved
+  `agent_key`; deleting that custom agent makes the next run fail explicitly
+  instead of silently falling back to a more privileged built-in.
+- Custom agents are direct-tools-only in v2. Code Mode for custom agents is
+  deferred until the additive `execute` capability lands; built-in Developer
+  defaults are unchanged.
+- Dispatch checks the effective ACL for every non-MCP tool. An unknown scope
+  without an explicit ACL exposes nothing, not the full inventory.
+
+The builder contract is documented in `docs/agent-builder-api.md` and
+`backend-rs/specs/agent-def.schema.json`.
+
 ### Code Mode
 
 The coding scope (`developer`) defaults to OpenCode's base Code Mode.
@@ -136,11 +165,12 @@ unbounded set of language runtimes; this is transport-internal and never
 model-visible. A delivered
 background job is removed from memory and disk; no additional age or row cap
 is applied. Like OpenCode, a script that stops yielding is not killed; the
-two-minute foreground block only moves it to the background. Per-agent config
-can set `code_mode` to `off`, `hybrid`, or `only`;
+two-minute foreground block only moves it to the background. Built-in
+Developer config can set `code_mode` to `off`, `hybrid`, or `only`;
 `off` restores the full direct surface and removes `execute`, while
 `hybrid` keeps the base surface (core tools direct, long-tail through
-`execute`, fetch only, no script timeout/background).
+`execute`, fetch only, no script timeout/background). Custom agents are
+direct-tools-only in v2 and cannot set an enabled `code_mode`.
 
 The Code Mode catalog is an instruction source with OpenCode's split
 delivery. The first observation is the chat's frozen epoch baseline: it is

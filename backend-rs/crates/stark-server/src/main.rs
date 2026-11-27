@@ -24,7 +24,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use stark_config::{AgentFile, ConfigStore, EffectiveAgent};
 use stark_contract::{AppState, ServerEvent};
-use stark_core::{RunContext, agent_for_scope, resolve_agent, run_agent};
+use stark_core::{
+    AgentRegistry, RunContext, agent_access_for, preview_system_prompt, resolve_definition,
+    run_agent, validate_definition,
+};
 use stark_providers::{ImagePart, Provider, ProviderConfig};
 use stark_store::{
     AgentRecord, AgentStore, CanvasStore, ChatStore, GroupStore, MemoryStore, NewEntry,
@@ -512,21 +515,23 @@ impl ServerState {
 
 /// Resolve an agent's configuration, falling back to the built-in defaults when
 /// a user-edited agent file is invalid. A broken file must not brick a chat.
+fn agent_registry(state: &ServerState) -> AgentRegistry {
+    AgentRegistry::load(&state.config, &state.harness_root)
+}
+
 fn effective_for(state: &ServerState, scope: &str, tier: &str) -> Arc<EffectiveAgent> {
-    match state.config.effective(scope, tier) {
-        Ok(effective) => Arc::new(effective),
-        Err(error) => {
-            tracing::warn!(
-                "agent config for '{scope}' is invalid: {error}; using built-in defaults"
-            );
-            Arc::new(
-                state
-                    .config
-                    .effective("__default__", tier)
-                    .unwrap_or_else(|_| stark_config::builtin_effective(tier)),
-            )
-        }
+    let registry = agent_registry(state);
+    if let Some(agent) = registry.get(scope) {
+        return Arc::new(agent.clone());
     }
+    tracing::warn!("agent '{scope}' is not in the registry; using built-in defaults");
+    Arc::new(
+        state
+            .config
+            .effective(scope, tier)
+            .or_else(|_| state.config.effective("__default__", tier))
+            .unwrap_or_else(|_| stark_config::builtin_effective(tier)),
+    )
 }
 
 fn legacy_env_names() -> Vec<&'static str> {
@@ -592,6 +597,10 @@ struct RunRequest {
     attachments: Vec<Value>,
     #[serde(default)]
     workspace_kind: String,
+    /// Explicit agent key (built-in or custom). When empty the registry routes
+    /// by workspace kind/path, preserving old clients.
+    #[serde(default, alias = "agent_key")]
+    agent: String,
 }
 
 fn default_temperature() -> f64 {
@@ -967,12 +976,21 @@ async fn main() -> anyhow::Result<()> {
             delete(remove_provider_key_handler),
         )
         .route("/api/provider/usage", get(provider_usage_handler))
+        .route("/api/agent-catalog", get(agent_catalog_handler))
         .route("/api/config/agents", get(agents_config_handler))
         .route(
             "/api/config/agents/{key}",
             get(agent_config_handler)
                 .put(save_agent_handler)
                 .delete(delete_agent_handler),
+        )
+        .route(
+            "/api/config/agents/{key}/preview",
+            post(preview_agent_handler),
+        )
+        .route(
+            "/api/config/agents/{key}/duplicate",
+            post(duplicate_agent_handler),
         )
         .route(
             "/api/workspaces",
@@ -1441,14 +1459,21 @@ async fn canvas_loop(state: ServerState, shutdown: CancellationToken) {
                     .await;
                 continue;
             }
-            let target = canvas_target(&state, &chat);
+            let target = match canvas_target(&state, &chat) {
+                Ok(target) => target,
+                Err(error) => {
+                    tracing::warn!("canvas wake {id} target invalid: {error}");
+                    let _ = store.mark_wake(id, "failed").await;
+                    continue;
+                }
+            };
             spawn_follow_up_run(state.clone(), target, text);
             let _ = store.mark_wake(id, "done").await;
         }
     }
 }
 
-fn canvas_target(state: &ServerState, chat: &Value) -> RunTarget {
+fn canvas_target(state: &ServerState, chat: &Value) -> Result<RunTarget, String> {
     let workspace_path = chat["workspacePath"].as_str().unwrap_or("");
     let workspace = if workspace_path.trim().is_empty() {
         state.harness_root.clone()
@@ -1457,26 +1482,41 @@ fn canvas_target(state: &ServerState, chat: &Value) -> RunTarget {
     };
     let workspace_id = chat["workspaceId"].as_str().unwrap_or("_general");
     let parent = chat["parentChatId"].as_str().unwrap_or("");
-    let scope = if workspace_id == "_house" {
-        "house"
-    } else if workspace_id == "_dfd" {
-        "dfd"
-    } else if workspace_id == "_personal" {
-        "general"
-    } else if !parent.trim().is_empty() {
-        if workspace != state.harness_root {
+    let registry = agent_registry(state);
+    let persisted = chat
+        .get("agentKey")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|key| !key.is_empty());
+    let agent = if let Some(key) = persisted {
+        registry
+            .get(key)
+            .cloned()
+            .ok_or_else(|| format!("agent '{key}' no longer exists; choose another agent"))?
+    } else {
+        let scope = if workspace_id == "_house" {
+            "house"
+        } else if workspace_id == "_dfd" {
+            "dfd"
+        } else if workspace_id == "_personal" {
+            "general"
+        } else if !parent.trim().is_empty() {
+            if workspace != state.harness_root {
+                "developer"
+            } else {
+                "general"
+            }
+        } else if workspace != state.harness_root {
             "developer"
         } else {
-            "general"
-        }
-    } else if workspace != state.harness_root {
-        "developer"
-    } else {
-        "orchestrator"
+            "orchestrator"
+        };
+        registry
+            .get(scope)
+            .cloned()
+            .unwrap_or_else(|| registry.route(scope, &workspace, &state.harness_root))
     };
-    let agent = stark_core::agent_for_scope(scope)
-        .unwrap_or_else(|| stark_core::agent_for_scope("general").expect("general agent"));
-    let mut effective = (*effective_for(state, agent.key, agent.tier)).clone();
+    let mut effective = agent.clone();
     let model = chat["model"]
         .as_str()
         .filter(|model| !model.trim().is_empty())
@@ -1490,7 +1530,7 @@ fn canvas_target(state: &ServerState, chat: &Value) -> RunTarget {
         .unwrap_or_else(|| effective.model.clone());
     effective.model = model.clone();
     let effective = Arc::new(effective);
-    RunTarget {
+    Ok(RunTarget {
         chat_id: chat["id"].as_str().unwrap_or("").to_string(),
         workspace_id: workspace_id.to_string(),
         workspace,
@@ -1501,7 +1541,7 @@ fn canvas_target(state: &ServerState, chat: &Value) -> RunTarget {
         depth: 0,
         agent_id: None,
         effective,
-    }
+    })
 }
 
 async fn schedule_loop(state: ServerState, shutdown: CancellationToken) {
@@ -1533,19 +1573,44 @@ async fn schedule_loop(state: ServerState, shutdown: CancellationToken) {
             } else {
                 PathBuf::from(&record.workspace_path)
             };
-            let scope = stark_core::agent_for_scope(&record.scope)
-                .map(|agent| agent.key.to_string())
-                .unwrap_or_else(|| record.scope.clone());
-            let tier = stark_core::agent_for_scope(&scope)
-                .map(|agent| agent.tier)
-                .unwrap_or("workspace");
-            let mut effective = (*effective_for(&state, &scope, tier)).clone();
+            let registry = agent_registry(&state);
+            let mut effective = match registry.get(&record.scope).cloned() {
+                Some(agent) => agent,
+                None => {
+                    tracing::warn!(
+                        "schedule {} references missing agent '{}'; skipped",
+                        record.id,
+                        record.scope
+                    );
+                    let _ = state
+                        .store
+                        .append_message(
+                            &record.chat_id,
+                            "error",
+                            &format!(
+                                "Scheduled run skipped: agent '{}' no longer exists.",
+                                record.scope
+                            ),
+                            false,
+                        )
+                        .await;
+                    if let Err(error) = store.mark_after_run(&record).await {
+                        tracing::warn!("scheduler mark after run failed: {error}");
+                    }
+                    continue;
+                }
+            };
+            let scope = effective.key.clone();
             let model = state
                 .config
                 .resolve_model(&effective.provider, &record.model)
                 .map(|(_, model)| model)
                 .unwrap_or_else(|_| effective.model.clone());
             effective.model = model.clone();
+            let role = record
+                .role
+                .clone()
+                .or_else(|| Some(effective.display.clone()));
             let effective = Arc::new(effective);
             spawn_follow_up_run(
                 state.clone(),
@@ -1554,7 +1619,7 @@ async fn schedule_loop(state: ServerState, shutdown: CancellationToken) {
                     workspace_id: record.workspace_id.clone(),
                     workspace,
                     scope,
-                    role: record.role.clone(),
+                    role,
                     model,
                     temperature: record.temperature,
                     depth: 0,
@@ -1606,16 +1671,19 @@ async fn group_loop(state: ServerState, shutdown: CancellationToken) {
     }
 }
 
-fn group_member_agent(owner: &str, detail: &Value) -> Option<stark_core::AgentSpec> {
+fn group_member_runtime(
+    registry: &AgentRegistry,
+    owner: &str,
+    detail: &Value,
+) -> Option<EffectiveAgent> {
     let owner = owner.trim();
     if owner.is_empty() {
         return None;
     }
-    // Agent names and their aliases live in one registry (`AgentSpec`), so
-    // "coder", "frontend", "ops", and friends resolve there instead of in a
-    // second hand-maintained table here.
-    if let Some(agent) = agent_for_scope(owner) {
-        return Some(agent);
+    // Agent names and aliases live in one registry, so custom agents resolve
+    // here exactly like built-ins.
+    if let Some(agent) = registry.get(owner) {
+        return Some(agent.clone());
     }
     let members = detail.get("members").and_then(Value::as_array)?;
     for member in members {
@@ -1628,21 +1696,33 @@ fn group_member_agent(owner: &str, detail: &Value) -> Option<stark_core::AgentSp
         }
         for key in ["kind", "derived_from", "name", "display"] {
             if let Some(candidate) = member.get(key).and_then(Value::as_str)
-                && let Some(agent) = agent_for_scope(candidate)
+                && let Some(agent) = registry.get(candidate)
             {
-                return Some(agent);
+                return Some(agent.clone());
             }
         }
     }
     None
 }
 
-fn group_item_agent(item: &Value, detail: &Value) -> stark_core::AgentSpec {
-    item.get("owner_member")
+fn group_item_runtime(
+    registry: &AgentRegistry,
+    item: &Value,
+    detail: &Value,
+) -> Result<EffectiveAgent, String> {
+    let owner = item
+        .get("owner_member")
         .and_then(Value::as_str)
-        .and_then(|owner| group_member_agent(owner, detail))
-        .or_else(|| agent_for_scope("developer"))
-        .expect("the developer agent is registered")
+        .map(str::trim)
+        .unwrap_or("");
+    if owner.is_empty() {
+        return registry
+            .get("developer")
+            .cloned()
+            .ok_or_else(|| "the developer agent is unavailable".to_string());
+    }
+    group_member_runtime(registry, owner, detail)
+        .ok_or_else(|| format!("owner_member '{owner}' does not match an agent"))
 }
 
 const GROUP_RUNTIME_NOTICE: &str = "Group projects run in their project folder. owner_member selects the agent; items tagged needs-approval (or flagged requires_approval) park for approval.";
@@ -1703,8 +1783,22 @@ async fn run_group_item(state: ServerState, groups: GroupStore, project_id: Stri
         .filter(|path| !path.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| state.harness_root.clone());
-    let agent = group_item_agent(&item, &detail);
-    let effective = effective_for(&state, agent.key, agent.tier);
+    let registry = agent_registry(&state);
+    let agent = match group_item_runtime(&registry, &item, &detail) {
+        Ok(agent) => agent,
+        Err(error) => {
+            let _ = groups
+                .finish_item(
+                    &project_id,
+                    item["id"].as_str().unwrap_or(""),
+                    false,
+                    &error,
+                )
+                .await;
+            return;
+        }
+    };
+    let effective = Arc::new(agent.clone());
     let model = effective.model.clone();
     let provider = state.provider_for(&effective);
     let title = format!(
@@ -1782,7 +1876,7 @@ async fn run_group_item(state: ServerState, groups: GroupStore, project_id: Stri
         role: Some(agent.display.to_string()),
         scope: agent.key.to_string(),
         depth: 0,
-        file_access: stark_core::FileAccess::Write,
+        file_access: agent_access_for(&agent, 0, false),
         model,
         temperature: 0.2,
         images: Vec::new(),
@@ -1942,7 +2036,13 @@ async fn notify_group_origin(
     let Ok(Some(chat)) = state.store.get_chat(&chat_id).await else {
         return;
     };
-    let target = canvas_target(state, &chat);
+    let target = match canvas_target(state, &chat) {
+        Ok(target) => target,
+        Err(error) => {
+            tracing::warn!("group result target invalid: {error}");
+            return;
+        }
+    };
     spawn_follow_up_run(state.clone(), target, message);
 }
 
@@ -2057,9 +2157,41 @@ Attached files:
     } else {
         state.harness_root.clone()
     };
-    let agent = resolve_agent(&request.workspace_kind, &workspace, &state.harness_root);
-
-    let mut effective = (*effective_for(state, agent.key, agent.tier)).clone();
+    let registry = agent_registry(state);
+    let requested_agent = request.agent.trim();
+    let agent = if !requested_agent.is_empty() {
+        registry.get(requested_agent).cloned().ok_or_else(|| {
+            StartRunError::Http(
+                StatusCode::BAD_REQUEST,
+                json!({"error": format!("unknown agent '{requested_agent}'")}),
+            )
+        })?
+    } else {
+        // Persisted chat agent wins over workspace routing, so a custom agent
+        // keeps its identity on every follow-up turn.
+        let persisted = match state.store.get_chat(&chat_id).await {
+            Ok(Some(chat)) => chat
+                .get("agentKey")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .filter(|key| !key.trim().is_empty()),
+            _ => None,
+        };
+        match persisted {
+            Some(key) => registry.get(&key).cloned().ok_or_else(|| {
+                StartRunError::Http(
+                    StatusCode::BAD_REQUEST,
+                    json!({
+                        "error": format!(
+                            "agent '{key}' no longer exists; choose another agent"
+                        )
+                    }),
+                )
+            })?,
+            None => registry.route(&request.workspace_kind, &workspace, &state.harness_root),
+        }
+    };
+    let mut effective = agent.clone();
     let model = if request.model.trim().is_empty() {
         effective.model.clone()
     } else {
@@ -2171,7 +2303,7 @@ Attached files:
                 note: image.name,
             })
             .collect();
-    let root_access = stark_core::default_access(&target.scope, 0, false);
+    let root_access = agent_access_for(&agent, 0, false);
     // Ensure the root agent exists before the run so status transitions are
     // visible in the tree for the whole run.
     let target = ensure_root_agent(state, target, root_access.as_str()).await;
@@ -2295,7 +2427,17 @@ async fn deliver_code_mode_restart_notices(state: ServerState) {
             Ok(Some(chat)) => chat,
             _ => continue,
         };
-        let target = canvas_target(&state, &chat);
+        let target = match canvas_target(&state, &chat) {
+            Ok(target) => target,
+            Err(error) => {
+                tracing::warn!(
+                    "Code Mode restart notice for {} dropped: {error}",
+                    notice.job_id
+                );
+                stark_tools::acknowledge_code_mode_notice(&state.harness_root, &notice.job_id);
+                continue;
+            }
+        };
         if state.runs.follow_up(&target.chat_id, &notice.message) {
             stark_tools::acknowledge_code_mode_notice(&state.harness_root, &notice.job_id);
             continue;
@@ -2321,13 +2463,31 @@ fn spawn_follow_up_run_attempt(
     attempt: u32,
 ) {
     // Re-resolve on every follow-up so config edits apply without waiting for
-    // a new chat.
-    let tier = agent_for_scope(&target.scope)
-        .map(|agent| agent.tier)
-        .unwrap_or("workspace");
-    let effective = effective_for(&state, &target.scope, tier);
-    target.model = effective.model.clone();
-    target.effective = effective;
+    // a new chat. A deleted custom agent is an explicit error, never a silent
+    // fallback to a more privileged built-in.
+    let runtime = match agent_registry(&state).get(&target.scope).cloned() {
+        Some(agent) => agent,
+        None => {
+            let store = state.store.clone();
+            let chat_id = target.chat_id.clone();
+            let scope = target.scope.clone();
+            tokio::spawn(async move {
+                let _ = store
+                    .append_message(
+                        &chat_id,
+                        "error",
+                        &format!(
+                            "Agent '{scope}' no longer exists. Pick another agent to continue."
+                        ),
+                        false,
+                    )
+                    .await;
+            });
+            return;
+        }
+    };
+    target.model = runtime.model.clone();
+    target.effective = Arc::new(runtime);
     let (tx, _) = broadcast::channel(RUN_EVENT_CAPACITY);
     let cancel = CancellationToken::new();
     let steering = Arc::new(Mutex::new(VecDeque::new()));
@@ -2391,7 +2551,7 @@ fn spawn_follow_up_run_attempt(
 
     let checkpoint = Checkpoint::begin_with_run_id(&target.chat_id, &target.workspace, run_id);
     let follow_access =
-        stark_core::default_access(&target.scope, target.depth, target.agent_id.is_some());
+        agent_access_for(&target.effective, target.depth, target.agent_id.is_some());
     let ctx = RunContext {
         chat_id: target.chat_id.clone(),
         workspace_id: target.workspace_id.clone(),
@@ -2582,7 +2742,7 @@ async fn agent_loop(state: ServerState, shutdown: CancellationToken) {
     }
 }
 
-async fn agent_target(state: &ServerState, agent: &AgentRecord) -> RunTarget {
+async fn agent_target(state: &ServerState, agent: &AgentRecord) -> Result<RunTarget, String> {
     let mut workspace_path = state
         .store
         .chat_workspace_path(&agent.chat_id)
@@ -2604,33 +2764,41 @@ async fn agent_target(state: &ServerState, agent: &AgentRecord) -> RunTarget {
     } else {
         PathBuf::from(workspace_path)
     };
-    // Stored agents may carry a legacy alias ("coder", "dev", "frontend").
-    // Normalize to the canonical key before resolving tools or config.
-    let scope = stark_core::agent_for_scope(&agent.scope)
-        .map(|spec| spec.key.to_string())
-        .unwrap_or_else(|| agent.scope.clone());
-    let tier = stark_core::agent_for_scope(&scope)
-        .map(|spec| spec.tier)
-        .unwrap_or("workspace");
+    // Stored agents may carry a legacy alias ("coder", "dev", "frontend"), or
+    // a custom key. Resolve through the one registry.
+    let registry = agent_registry(state);
+    let effective = registry
+        .get(&agent.scope)
+        .cloned()
+        .ok_or_else(|| format!("agent '{}' no longer exists", agent.scope))?;
+    let scope = effective.key.clone();
     // Config is authoritative. The stored `agent.model` is a snapshot from
     // creation time and may reference a provider the app no longer uses.
-    let effective = effective_for(state, &scope, tier);
-    RunTarget {
+    Ok(RunTarget {
         chat_id: agent.chat_id.clone(),
         workspace_id: agent.workspace_id.clone(),
         workspace,
         scope,
-        role: (!agent.role.is_empty()).then(|| agent.role.clone()),
+        role: (!agent.role.is_empty())
+            .then(|| agent.role.clone())
+            .or_else(|| Some(effective.display.clone())),
         model: effective.model.clone(),
         temperature: 0.2,
         depth: agent.depth.max(0) as u32,
         agent_id: Some(agent.id.clone()),
-        effective,
-    }
+        effective: Arc::new(effective),
+    })
 }
 
 async fn spawn_agent_run(state: ServerState, store: AgentStore, agent: AgentRecord) -> bool {
-    let target = agent_target(&state, &agent).await;
+    let target = match agent_target(&state, &agent).await {
+        Ok(target) => target,
+        Err(error) => {
+            tracing::warn!("agent {} target invalid: {error}", agent.id);
+            let _ = store.set_status(&agent.id, "failed", false).await;
+            return false;
+        }
+    };
     let pending = match store.messages(&agent.id).await {
         Ok(messages) => messages,
         Err(error) => {
@@ -2826,7 +2994,13 @@ async fn wake_parent_agent(
     let Ok(Some(parent)) = store.get(parent_id).await else {
         return;
     };
-    let target = agent_target(state, &parent).await;
+    let target = match agent_target(state, &parent).await {
+        Ok(target) => target,
+        Err(error) => {
+            tracing::warn!("parent agent target invalid: {error}");
+            return;
+        }
+    };
     let text = format!(
         "[AGENT RESULT] {} · {} · {}\nchat: {}\n{}\nReview the child result and continue.",
         child.path,
@@ -4098,12 +4272,10 @@ async fn provider_handler(
     let active = state.config.active_provider();
     let summaries = state.config.provider_summaries();
     let active_provider = summaries.iter().find(|provider| provider.id == active);
-    let effective = query.agent.as_deref().map(|agent| {
-        let tier = agent_for_scope(agent)
-            .map(|spec| spec.tier)
-            .unwrap_or("workspace");
-        effective_for(&state, agent, tier)
-    });
+    let effective = query
+        .agent
+        .as_deref()
+        .map(|agent| effective_for(&state, agent, "workspace"));
     let legacy_env: Vec<&str> = legacy_env_names();
     Json(json!({
         "provider": active,
@@ -4562,28 +4734,111 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
+fn agent_issues(registry: &AgentRegistry, key: &str) -> Vec<String> {
+    let prefix = format!("{key}:");
+    registry
+        .issues()
+        .iter()
+        .filter(|issue| issue.starts_with(&prefix))
+        .cloned()
+        .collect()
+}
+
+fn builtin_spec(key: &str) -> Option<stark_core::AgentSpec> {
+    stark_core::workspace_agents()
+        .iter()
+        .find(|spec| spec.key == key)
+        .copied()
+}
+
+fn builtin_override(state: &ServerState, spec: stark_core::AgentSpec) -> Option<AgentFile> {
+    state.config.agent(spec.key).or_else(|| {
+        spec.aliases
+            .iter()
+            .find_map(|alias| state.config.agent(alias))
+    })
+}
+
 async fn agents_config_handler(State(state): State<ServerState>) -> Json<Value> {
-    let mut agents = Vec::new();
+    let registry = agent_registry(&state);
+    let mut agents: Vec<(i32, String, Value)> = Vec::new();
     for spec in stark_core::workspace_agents() {
-        let key = spec.key;
-        let effective = effective_for(&state, key, spec.tier);
-        agents.push(json!({
-            "key": spec.key,
-            "display": spec.display,
-            "tier": spec.tier,
-            "configured": state.config.agent(key).is_some(),
-            "override": state.config.agent(key),
-            "effective": effective,
-        }));
+        let effective = registry
+            .get(spec.key)
+            .cloned()
+            .unwrap_or_else(|| (*effective_for(&state, spec.key, spec.tier)).clone());
+        let issues = agent_issues(&registry, spec.key);
+        let configured = builtin_override(&state, *spec);
+        agents.push((
+            effective.ui_order,
+            spec.key.to_string(),
+            json!({
+                "key": spec.key,
+                "display": effective.display,
+                "description": effective.description,
+                "tier": effective.tier,
+                "builtin": true,
+                "editable": true,
+                "deletable": false,
+                "resettable": configured.is_some(),
+                "configured": configured.is_some(),
+                "valid": issues.is_empty(),
+                "errors": issues,
+                "override": configured,
+                "effective": effective,
+            }),
+        ));
     }
+    for (key, file) in state.config.agent_files() {
+        // Built-in keys are listed above. Legacy alias files (coder.json) are
+        // migrated into their canonical built-in, so they must not appear as
+        // a second agent here.
+        if stark_core::agent_for_scope(&key).is_some() {
+            continue;
+        }
+        let effective = registry.get(&key).cloned();
+        let issues = agent_issues(&registry, &key);
+        let order = effective
+            .as_ref()
+            .map(|agent| agent.ui_order)
+            .or(file.ui.as_ref().and_then(|ui| ui.order))
+            .unwrap_or(1000);
+        agents.push((
+            order,
+            key.clone(),
+            json!({
+                "key": key,
+                "display": effective.as_ref().map(|agent| agent.display.clone()).unwrap_or_else(|| file.display.clone()),
+                "description": effective.as_ref().map(|agent| agent.description.clone()).unwrap_or_else(|| file.description.clone()),
+                "tier": effective.as_ref().map(|agent| agent.tier.clone()).unwrap_or_else(|| file.tier.clone()),
+                "builtin": false,
+                "editable": true,
+                "deletable": true,
+                "resettable": false,
+                "configured": true,
+                "valid": effective.is_some() && issues.is_empty(),
+                "errors": issues,
+                "override": file,
+                "effective": effective,
+            }),
+        ));
+    }
+    agents.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
     Json(json!({
-        "agents": agents,
-        "issues": state.config.issues(),
+        "agents": agents.into_iter().map(|(_, _, value)| value).collect::<Vec<_>>(),
+        "issues": registry.issues(),
+        "config_issues": state.config.issues(),
         "active_provider": state.config.active_provider(),
         "providers": state.config.provider_summaries(),
         "config_file": state.config.has_file(),
         "legacy_env": legacy_env_names(),
         "health": state.provider_health.lock().map(|health| health.clone()).unwrap_or_default(),
+        "capabilities": {
+            "agent_builder": true,
+            "custom_agents": true,
+            "custom_code_mode": false,
+            "schema_version": 2,
+        },
     }))
 }
 
@@ -4592,22 +4847,41 @@ async fn agent_config_handler(
     Path(key): Path<String>,
     Query(query): Query<AgentQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let spec = agent_for_scope(&key).ok_or_else(|| {
-        (
+    let registry = agent_registry(&state);
+    let requested = key.trim().to_ascii_lowercase();
+    let canonical = registry
+        .canonical_key(&requested)
+        .unwrap_or_else(|| requested.clone());
+    if registry.get(&canonical).is_none() && state.config.agent(&canonical).is_none() {
+        return Err((
             StatusCode::NOT_FOUND,
             Json(json!({"error": format!("unknown agent '{key}'")})),
-        )
-    })?;
-    let tier = query
-        .tier
-        .filter(|tier| !tier.trim().is_empty())
-        .unwrap_or_else(|| spec.tier.to_string());
-    let effective = effective_for(&state, spec.key, &tier);
+        ));
+    }
+    let builtin = builtin_spec(&canonical);
+    let effective = registry.get(&canonical).cloned().or_else(|| {
+        builtin.map(|spec| {
+            (*effective_for(&state, spec.key, query.tier.as_deref().unwrap_or(spec.tier))).clone()
+        })
+    });
+    let issues = agent_issues(&registry, &canonical);
+    let override_file = builtin
+        .and_then(|spec| builtin_override(&state, spec))
+        .or_else(|| state.config.agent(&canonical));
     Ok(Json(json!({
-        "key": spec.key,
-        "display": spec.display,
-        "tier": spec.tier,
-        "override": state.config.agent(spec.key),
+        "key": canonical,
+        "display": effective.as_ref().map(|agent| agent.display.clone())
+            .or_else(|| override_file.as_ref().map(|file| file.display.clone()))
+            .unwrap_or_else(|| key.clone()),
+        "tier": effective.as_ref().map(|agent| agent.tier.clone())
+            .or_else(|| builtin.map(|spec| spec.tier.to_string()))
+            .unwrap_or_else(|| "workspace".to_string()),
+        "builtin": builtin.is_some(),
+        "editable": true,
+        "deletable": builtin.is_none(),
+        "valid": effective.is_some() && issues.is_empty(),
+        "errors": issues,
+        "override": override_file,
         "effective": effective,
     })))
 }
@@ -4617,24 +4891,47 @@ async fn save_agent_handler(
     Path(key): Path<String>,
     Json(agent): Json<AgentFile>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let spec = agent_for_scope(&key).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": format!("unknown agent '{key}'")})),
-        )
-    })?;
-    state.config.save_agent(spec.key, agent).map_err(|error| {
-        (
+    let registry = agent_registry(&state);
+    let requested = key.trim().to_ascii_lowercase();
+    let canonical = registry
+        .canonical_key(&requested)
+        .unwrap_or_else(|| requested.clone());
+    let check = validate_definition(
+        &state.config,
+        &state.harness_root,
+        &canonical,
+        &agent,
+        &registry,
+    );
+    if !check.errors.is_empty() {
+        return Err((
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": error.to_string()})),
-        )
-    })?;
-    let effective = effective_for(&state, spec.key, spec.tier);
+            Json(json!({
+                "error": "invalid agent definition",
+                "errors": check.errors,
+                "warnings": check.warnings,
+            })),
+        ));
+    }
+    state
+        .config
+        .save_agent(&canonical, agent)
+        .map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": error.to_string()})),
+            )
+        })?;
+    let registry = agent_registry(&state);
+    let effective = registry.get(&canonical).cloned();
     Ok(Json(json!({
         "ok": true,
-        "key": spec.key,
-        "override": state.config.agent(spec.key),
+        "key": canonical,
+        "builtin": builtin_spec(&canonical).is_some(),
+        "warnings": check.warnings,
+        "override": state.config.agent(&canonical),
         "effective": effective,
+        "errors": effective.is_none().then(|| agent_issues(&registry, &canonical)),
     })))
 }
 
@@ -4642,24 +4939,362 @@ async fn delete_agent_handler(
     State(state): State<ServerState>,
     Path(key): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let spec = agent_for_scope(&key).ok_or_else(|| {
-        (
+    let registry = agent_registry(&state);
+    let requested = key.trim().to_ascii_lowercase();
+    let canonical = registry
+        .canonical_key(&requested)
+        .unwrap_or_else(|| requested.clone());
+    let builtin = builtin_spec(&canonical).is_some();
+    if !builtin && state.config.agent(&canonical).is_none() {
+        return Err((
             StatusCode::NOT_FOUND,
             Json(json!({"error": format!("unknown agent '{key}'")})),
-        )
-    })?;
-    state.config.delete_agent(spec.key).map_err(|error| {
+        ));
+    }
+    state.config.delete_agent(&canonical).map_err(|error| {
         (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": error.to_string()})),
         )
     })?;
-    let effective = effective_for(&state, spec.key, spec.tier);
+    // A reset must also remove legacy alias files; otherwise coder.json would
+    // immediately re-apply as a developer override.
+    if let Some(spec) = builtin_spec(&canonical) {
+        for alias in spec.aliases {
+            let _ = state.config.delete_agent(alias);
+        }
+    }
+    let registry = agent_registry(&state);
+    let effective = registry.get(&canonical).cloned();
     Ok(Json(json!({
         "ok": true,
-        "key": spec.key,
+        "key": canonical,
+        "builtin": builtin,
+        "reset": builtin,
+        "deleted": !builtin,
         "effective": effective,
     })))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PreviewRequest {
+    #[serde(default)]
+    draft: Option<AgentFile>,
+    #[serde(default)]
+    workspace_path: String,
+    #[serde(default)]
+    mode: String,
+}
+
+fn tool_names(specs: &[Value]) -> Vec<String> {
+    specs
+        .iter()
+        .filter_map(|spec| {
+            spec.get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+async fn preview_agent_handler(
+    State(state): State<ServerState>,
+    Path(key): Path<String>,
+    Json(request): Json<PreviewRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let registry = agent_registry(&state);
+    let requested = key.trim().to_ascii_lowercase();
+    let canonical = registry
+        .canonical_key(&requested)
+        .unwrap_or_else(|| requested.clone());
+    let builtin = builtin_spec(&canonical);
+    let file = request
+        .draft
+        .or_else(|| state.config.agent(&canonical))
+        .or_else(|| builtin.map(|_| AgentFile::default()));
+    let Some(file) = file else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("unknown agent '{key}'")})),
+        ));
+    };
+    let check = validate_definition(
+        &state.config,
+        &state.harness_root,
+        &canonical,
+        &file,
+        &registry,
+    );
+    if !check.errors.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "invalid agent definition",
+                "errors": check.errors,
+                "warnings": check.warnings,
+            })),
+        ));
+    }
+    let effective = resolve_definition(&state.config, &state.harness_root, &canonical, &file)
+        .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({"error": error}))))?;
+    let workspace = if request.workspace_path.trim().is_empty() {
+        state.harness_root.clone()
+    } else {
+        PathBuf::from(request.workspace_path.trim())
+    };
+    let workspace_id = state
+        .store
+        .workspace_id_for_path(workspace.to_string_lossy().as_ref());
+    let mode = if request.mode.trim().is_empty() {
+        "build"
+    } else {
+        request.mode.trim()
+    };
+    let system_prompt = preview_system_prompt(
+        &effective,
+        &workspace,
+        &workspace_id,
+        &state.harness_root,
+        mode,
+    )
+    .await;
+    let code_mode = effective
+        .code_mode
+        .as_deref()
+        .and_then(stark_tools::CodeMode::parse)
+        .unwrap_or_default();
+    let full = code_mode.enabled()
+        && (matches!(code_mode, stark_tools::CodeMode::Only)
+            || effective.full_codemode.unwrap_or(false));
+    let direct = stark_tools::tool_specs_for_run_with_code_mode_full(
+        mode,
+        &canonical,
+        &effective.access,
+        &HashSet::new(),
+        effective.tools.as_deref(),
+        effective.mcp.as_deref(),
+        code_mode,
+        full,
+    );
+    let program = if code_mode.enabled() {
+        stark_tools::program_specs_for_run_full(
+            mode,
+            &canonical,
+            &effective.access,
+            effective.tools.as_deref(),
+            effective.mcp.as_deref(),
+            full,
+        )
+    } else {
+        Vec::new()
+    };
+    let mut warnings = check.warnings;
+    warnings.extend(agent_issues(&registry, &canonical));
+    Ok(Json(json!({
+        "ok": true,
+        "key": canonical,
+        "builtin": builtin.is_some(),
+        "effective": effective,
+        "system_prompt": system_prompt,
+        "prompt_tokens": stark_core::estimate_prompt_tokens(&system_prompt),
+        "tools": {
+            "direct": tool_names(&direct),
+            "program": tool_names(&program),
+            "direct_specs": direct,
+            "program_specs": program,
+        },
+        "warnings": warnings,
+    })))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DuplicateRequest {
+    #[serde(default)]
+    key: String,
+    #[serde(default)]
+    display: Option<String>,
+}
+
+async fn duplicate_agent_handler(
+    State(state): State<ServerState>,
+    Path(key): Path<String>,
+    Json(request): Json<DuplicateRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let registry = agent_registry(&state);
+    let requested = key.trim().to_ascii_lowercase();
+    let canonical = registry
+        .canonical_key(&requested)
+        .unwrap_or_else(|| requested.clone());
+    let Some(source) = registry.get(&canonical).cloned() else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("unknown agent '{key}'")})),
+        ));
+    };
+    let new_key = request.key.trim().to_ascii_lowercase();
+    if new_key.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "duplicate requires a new key"})),
+        ));
+    }
+    let display = request
+        .display
+        .filter(|display| !display.trim().is_empty())
+        .unwrap_or_else(|| format!("{} Copy", source.display));
+    let mut file = state.config.agent(&canonical).unwrap_or_default();
+    file.key = new_key.clone();
+    file.display = display;
+    file.description = source.description.clone();
+    file.tier = source.tier.clone();
+    file.access = Some(source.access.clone());
+    // A custom agent has no compiled base instructions, so a duplicate of a
+    // general-profile built-in must carry those instructions in its persona.
+    let base_instructions = if source.prompt_profile == "general" {
+        stark_core::agent_for_scope(&canonical).map(|spec| spec.instructions)
+    } else {
+        None
+    };
+    let persona = [
+        source.persona.clone(),
+        base_instructions.map(str::to_string),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|value| !value.trim().is_empty())
+    .collect::<Vec<_>>()
+    .join("\n\n");
+    file.prompt = Some(stark_config::AgentPromptFile {
+        profile: Some(source.prompt_profile.clone()),
+        persona: (!persona.is_empty()).then_some(persona),
+    });
+    file.system_prompt = None;
+    // Custom agents are direct-only, so the execute dispatcher cannot be
+    // copied from Developer.
+    let read_only = source.access == "read";
+    file.tools = source.tools.as_ref().map(|tools| {
+        tools
+            .iter()
+            .filter(|tool| tool.as_str() != "execute")
+            // A read-only custom agent cannot carry mutating tools. Built-in
+            // read-only agents enforce the same rule at the surface layer.
+            .filter(|tool| !read_only || !stark_tools::is_read_blocked(tool))
+            .cloned()
+            .collect()
+    });
+    file.skills = Some(
+        source
+            .skills
+            .clone()
+            .unwrap_or_else(|| stark_tools::skill_names(&state.harness_root, &state.harness_root)),
+    );
+    file.mcp = Some(
+        source
+            .mcp
+            .clone()
+            .unwrap_or_else(|| stark_tools::configured_servers(&state.harness_root)),
+    );
+    file.aliases = None;
+    file.delegation = Some(stark_config::AgentDelegationFile {
+        delegatable: Some(source.delegatable),
+        can_delegate: Some(source.can_delegate),
+        can_spawn: Some(source.can_spawn),
+    });
+    file.ui = Some(stark_config::AgentUiFile {
+        visible: Some(source.ui_visible),
+        order: Some(source.ui_order),
+    });
+    file.code_mode = Some("off".to_string());
+    file.full_codemode = None;
+    let check = validate_definition(
+        &state.config,
+        &state.harness_root,
+        &new_key,
+        &file,
+        &registry,
+    );
+    if !check.errors.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "invalid duplicate",
+                "errors": check.errors,
+                "warnings": check.warnings,
+            })),
+        ));
+    }
+    state.config.save_agent(&new_key, file).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": error.to_string()})),
+        )
+    })?;
+    let registry = agent_registry(&state);
+    Ok(Json(json!({
+        "ok": true,
+        "key": new_key,
+        "source": canonical,
+        "effective": registry.get(&new_key),
+    })))
+}
+
+async fn agent_catalog_handler(State(state): State<ServerState>) -> Json<Value> {
+    let registry = agent_registry(&state);
+    let tools: Vec<Value> = stark_tools::contract()
+        .exposed_tools()
+        .filter(|tool| stark_tools::is_implemented(&tool.name))
+        .map(|tool| {
+            json!({
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.parameters,
+                "program": stark_tools::is_program(&tool.name),
+                "codemode": stark_tools::is_codemode(&tool.name),
+                "read_blocked": stark_tools::is_read_blocked(&tool.name),
+                "plan_write": stark_tools::is_plan_write(&tool.name),
+            })
+        })
+        .collect();
+    let agents: Vec<Value> = registry
+        .visible()
+        .into_iter()
+        .map(|agent| {
+            json!({
+                "key": agent.key,
+                "display": agent.display,
+                "description": agent.description,
+                "tier": agent.tier,
+                "builtin": agent.builtin,
+                "access": agent.access,
+                "prompt_profile": agent.prompt_profile,
+                "tools": agent.tools,
+                "code_mode": agent.code_mode,
+                "ui_order": agent.ui_order,
+            })
+        })
+        .collect();
+    let mcp = stark_tools::McpManager::global()
+        .map(|manager| manager.status_snapshot())
+        .unwrap_or_default();
+    Json(json!({
+        "schema_version": 2,
+        "capabilities": {
+            "agent_builder": true,
+            "custom_agents": true,
+            "custom_code_mode": false,
+            "duplicate": true,
+            "preview": true,
+        },
+        "agents": agents,
+        "tools": tools,
+        "skills": stark_tools::skill_names(&state.harness_root, &state.harness_root),
+        "mcp": mcp,
+        "mcp_configured": stark_tools::configured_servers(&state.harness_root),
+        "providers": state.config.provider_summaries(),
+        "active_provider": state.config.active_provider(),
+        "issues": registry.issues(),
+    }))
 }
 
 /// Build one portable backup zip. Excludes `.env`, models, logs and WAL.
@@ -7711,6 +8346,8 @@ mod tests {
 
     #[test]
     fn group_owner_member_selects_the_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = AgentRegistry::open(dir.path());
         let detail = json!({
             "members": [
                 {"name": "Nova", "display": "Nova", "kind": "ui"},
@@ -7718,26 +8355,210 @@ mod tests {
             ]
         });
         assert_eq!(
-            group_item_agent(&json!({"owner_member": "UI"}), &detail).key,
+            group_item_runtime(&registry, &json!({"owner_member": "UI"}), &detail)
+                .unwrap()
+                .key,
             "ui"
         );
         assert_eq!(
-            group_item_agent(&json!({"owner_member": "research"}), &detail).key,
+            group_item_runtime(&registry, &json!({"owner_member": "research"}), &detail)
+                .unwrap()
+                .key,
             "general"
         );
         assert_eq!(
-            group_item_agent(&json!({"owner_member": "Nova"}), &detail).key,
+            group_item_runtime(&registry, &json!({"owner_member": "Nova"}), &detail)
+                .unwrap()
+                .key,
             "ui"
         );
         assert_eq!(
-            group_item_agent(&json!({"owner_member": "ops"}), &detail).key,
+            group_item_runtime(&registry, &json!({"owner_member": "ops"}), &detail)
+                .unwrap()
+                .key,
             "devops"
         );
+        assert!(
+            group_item_runtime(&registry, &json!({"owner_member": "unknown"}), &detail).is_err()
+        );
         assert_eq!(
-            group_item_agent(&json!({"owner_member": "unknown"}), &detail).key,
+            group_item_runtime(&registry, &json!({}), &detail)
+                .unwrap()
+                .key,
             "developer"
         );
-        assert_eq!(group_item_agent(&json!({}), &detail).key, "developer");
+    }
+
+    #[tokio::test]
+    async fn custom_agent_crud_preview_and_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = group_test_state(dir.path(), "http://127.0.0.1:9".to_string()).await;
+        let file: AgentFile = serde_json::from_value(json!({
+            "version": 2,
+            "display": "Backend",
+            "description": "Rust backend work",
+            "access": "write",
+            "prompt": {"profile": "coding", "persona": "You own backend-rs."},
+            "tools": ["read", "edit", "glob", "grep"],
+            "skills": [],
+            "mcp": [],
+            "delegation": {"delegatable": true, "can_delegate": false, "can_spawn": false},
+            "ui": {"visible": true, "order": 25}
+        }))
+        .unwrap();
+        let saved = save_agent_handler(
+            State(state.clone()),
+            Path("backend".to_string()),
+            Json(file),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.0["key"], "backend");
+        assert_eq!(saved.0["effective"]["access"], "write");
+        assert_eq!(saved.0["effective"]["prompt_profile"], "coding");
+
+        let listed = agents_config_handler(State(state.clone())).await;
+        let entry = listed.0["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["key"] == "backend")
+            .expect("custom agent in list");
+        assert_eq!(entry["builtin"], false);
+        assert_eq!(entry["deletable"], true);
+        assert_eq!(entry["valid"], true);
+
+        let preview = preview_agent_handler(
+            State(state.clone()),
+            Path("backend".to_string()),
+            Json(PreviewRequest {
+                draft: None,
+                workspace_path: dir.path().to_string_lossy().to_string(),
+                mode: "build".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        let prompt = preview.0["system_prompt"].as_str().unwrap();
+        assert!(prompt.contains("You own backend-rs."));
+        assert!(preview.0["tools"]["direct"].as_array().is_some());
+        assert!(preview.0["prompt_tokens"].as_u64().unwrap() > 0);
+
+        let deleted = delete_agent_handler(State(state.clone()), Path("backend".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(deleted.0["deleted"], true);
+        let after = agent_config_handler(
+            State(state.clone()),
+            Path("backend".to_string()),
+            Query(AgentQuery { tier: None }),
+        )
+        .await;
+        assert!(after.is_err());
+    }
+
+    #[tokio::test]
+    async fn legacy_alias_file_is_listed_as_its_builtin_and_reset_removes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = group_test_state(dir.path(), "http://127.0.0.1:9".to_string()).await;
+        let agents_dir = dir.path().join(".deep_agents/config/agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("coder.json"),
+            r#"{"display":"Legacy Coder"}"#,
+        )
+        .unwrap();
+        let listed = agents_config_handler(State(state.clone())).await;
+        let keys: Vec<String> = listed.0["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["key"].as_str().map(str::to_string))
+            .collect();
+        assert!(!keys.contains(&"coder".to_string()), "{keys:?}");
+        let developer = listed.0["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["key"] == "developer")
+            .unwrap();
+        assert_eq!(developer["display"], "Legacy Coder");
+        let _ = delete_agent_handler(State(state.clone()), Path("developer".to_string()))
+            .await
+            .unwrap();
+        assert!(!agents_dir.join("coder.json").exists());
+        let listed = agents_config_handler(State(state)).await;
+        let developer = listed.0["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["key"] == "developer")
+            .unwrap();
+        assert_eq!(developer["display"], "Developer");
+    }
+
+    #[tokio::test]
+    async fn duplicating_builtins_produces_safe_custom_agents() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = group_test_state(dir.path(), "http://127.0.0.1:9".to_string()).await;
+        let developer = duplicate_agent_handler(
+            State(state.clone()),
+            Path("developer".to_string()),
+            Json(DuplicateRequest {
+                key: "backend2".to_string(),
+                display: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let tools = developer.0["effective"]["tools"].as_array().unwrap();
+        assert!(!tools.iter().any(|tool| tool == "execute"));
+        assert_eq!(developer.0["effective"]["code_mode"], "off");
+        assert_eq!(developer.0["effective"]["prompt_profile"], "coding");
+
+        let house = duplicate_agent_handler(
+            State(state.clone()),
+            Path("house".to_string()),
+            Json(DuplicateRequest {
+                key: "house2".to_string(),
+                display: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(house.0["effective"]["access"], "read");
+        let persona = house.0["effective"]["persona"].as_str().unwrap_or("");
+        assert!(persona.contains("You are the House agent"), "{persona}");
+    }
+
+    #[tokio::test]
+    async fn custom_agent_rejects_unsafe_definitions() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = group_test_state(dir.path(), "http://127.0.0.1:9".to_string()).await;
+        let unknown: AgentFile = serde_json::from_value(json!({
+            "version": 2,
+            "tools": ["read", "not_a_tool"]
+        }))
+        .unwrap();
+        let result =
+            save_agent_handler(State(state.clone()), Path("bad".to_string()), Json(unknown)).await;
+        assert!(result.is_err());
+
+        let read_only_edit: AgentFile = serde_json::from_value(json!({
+            "version": 2,
+            "access": "read",
+            "tools": ["read", "edit"]
+        }))
+        .unwrap();
+        let result = save_agent_handler(
+            State(state.clone()),
+            Path("readonly".to_string()),
+            Json(read_only_edit),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(state.config.agent("bad").is_none());
+        assert!(state.config.agent("readonly").is_none());
     }
 
     #[test]
@@ -8114,6 +8935,187 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn custom_agent_runs_with_a_closed_tool_surface_and_persists_on_follow_up() {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::http::header;
+        use axum::routing::post;
+
+        async fn capture_provider(
+            State(seen): State<Arc<Mutex<Vec<Value>>>>,
+            Json(body): Json<Value>,
+        ) -> Response {
+            seen.lock().unwrap().push(body);
+            let body = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Custom reply\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            );
+            Response::builder()
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(body))
+                .unwrap()
+        }
+
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let captured = seen.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/chat/completions", post(capture_provider))
+                    .with_state(captured),
+            )
+            .await
+            .unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = group_test_state(dir.path(), format!("http://{address}")).await;
+        let file: AgentFile = serde_json::from_value(json!({
+            "version": 2,
+            "display": "Backend",
+            "description": "Rust backend work",
+            "access": "read",
+            "prompt": {"profile": "general", "persona": "CUSTOM PERSONA: own backend-rs."},
+            "tools": ["read", "grep"],
+            "skills": [],
+            "mcp": []
+        }))
+        .unwrap();
+        let _ = save_agent_handler(
+            State(state.clone()),
+            Path("backend".to_string()),
+            Json(file),
+        )
+        .await
+        .unwrap();
+
+        let request = RunRequest {
+            prompt: "inspect".to_string(),
+            model: "mock".to_string(),
+            temperature: 0.0,
+            workspace_path: dir.path().to_string_lossy().to_string(),
+            workspace_id: "_general".to_string(),
+            chat_id: "chat-custom".to_string(),
+            attachments: Vec::new(),
+            workspace_kind: "general".to_string(),
+            agent: "backend".to_string(),
+        };
+        let _ = run_command_handler(
+            State(state.clone()),
+            Path("chat-custom".to_string()),
+            Json(request),
+        )
+        .await
+        .unwrap();
+        for _ in 0..400 {
+            if !state.runs.is_running("chat-custom") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(!state.runs.is_running("chat-custom"));
+        let chat = state.store.get_chat("chat-custom").await.unwrap().unwrap();
+        assert_eq!(chat["agentKey"], "backend");
+        {
+            let requests = seen.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            let body = &requests[0];
+            let system = body["messages"][0]["content"].as_str().unwrap_or("");
+            assert!(system.contains("CUSTOM PERSONA"), "{system}");
+            let tools: Vec<String> = body["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|tool| {
+                    tool.pointer("/function/name")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .collect();
+            assert_eq!(tools, vec!["read", "grep"]);
+        }
+
+        // Follow-up with no explicit agent must keep the persisted custom
+        // agent instead of re-routing to General.
+        let follow_up = RunRequest {
+            prompt: "continue".to_string(),
+            model: "mock".to_string(),
+            temperature: 0.0,
+            workspace_path: dir.path().to_string_lossy().to_string(),
+            workspace_id: "_general".to_string(),
+            chat_id: "chat-custom".to_string(),
+            attachments: Vec::new(),
+            workspace_kind: "general".to_string(),
+            agent: String::new(),
+        };
+        let _ = run_command_handler(
+            State(state.clone()),
+            Path("chat-custom".to_string()),
+            Json(follow_up),
+        )
+        .await
+        .unwrap();
+        for _ in 0..400 {
+            if !state.runs.is_running("chat-custom") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        {
+            let requests = seen.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            let system = requests[1]["messages"][0]["content"].as_str().unwrap_or("");
+            assert!(system.contains("CUSTOM PERSONA"), "{system}");
+            let tools: Vec<String> = requests[1]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|tool| {
+                    tool.pointer("/function/name")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .collect();
+            assert_eq!(tools, vec!["read", "grep"]);
+        }
+
+        // Deleting the agent makes the persisted chat fail explicitly instead
+        // of silently routing to a more privileged built-in.
+        let _ = delete_agent_handler(State(state.clone()), Path("backend".to_string()))
+            .await
+            .unwrap();
+        let missing = run_command_handler(
+            State(state.clone()),
+            Path("chat-custom".to_string()),
+            Json(RunRequest {
+                prompt: "after delete".to_string(),
+                model: "mock".to_string(),
+                temperature: 0.0,
+                workspace_path: dir.path().to_string_lossy().to_string(),
+                workspace_id: "_general".to_string(),
+                chat_id: "chat-custom".to_string(),
+                attachments: Vec::new(),
+                workspace_kind: "general".to_string(),
+                agent: String::new(),
+            }),
+        )
+        .await;
+        assert!(missing.is_err());
+        let (_, Json(error)) = missing.unwrap_err();
+        assert!(
+            error["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("no longer exists"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
     async fn command_endpoint_starts_a_run_and_after_seq_predates_the_log() {
         async fn command_mock_provider(Json(_body): Json<Value>) -> Response {
             let body = concat!(
@@ -8149,6 +9151,7 @@ mod tests {
             chat_id: String::new(),
             attachments: Vec::new(),
             workspace_kind: "general".to_string(),
+            agent: String::new(),
         };
         let started = run_command_handler(
             State(state.clone()),

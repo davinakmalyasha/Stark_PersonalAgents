@@ -7,12 +7,12 @@ use serde_json::{Value, json};
 use stark_store::{AgentRecord, AgentStore, WorkspaceRegistry};
 use stark_tools::ToolOutcome;
 
-use crate::{RunContext, agent_for_scope, agents_tools};
+use crate::{AgentRegistry, RunContext, agents_tools};
 
 const MAX_JOBS: usize = 8;
 
 struct JobItem {
-    agent: crate::AgentSpec,
+    agent: stark_config::EffectiveAgent,
     task: String,
     outcome: String,
     acceptance: String,
@@ -23,7 +23,14 @@ struct JobItem {
 }
 
 pub(crate) async fn delegate(ctx: &RunContext, args: &Value) -> ToolOutcome {
-    let items = match parse_items(args) {
+    if ctx
+        .config
+        .as_ref()
+        .is_some_and(|config| !config.can_delegate)
+    {
+        return ToolOutcome::err("this agent is not allowed to delegate work");
+    }
+    let items = match parse_items(ctx.store.harness_root(), args) {
         Ok(items) => items,
         Err(error) => return ToolOutcome::err(error),
     };
@@ -49,7 +56,7 @@ pub(crate) async fn delegate(ctx: &RunContext, args: &Value) -> ToolOutcome {
             &json!({
                 "action": "spawn",
                 "kind": "workspace",
-                "agent": item.agent.display,
+                "agent": item.agent.key,
                 "task": task,
                 "title": item.title,
                 "workspace_id": workspace_id,
@@ -78,7 +85,7 @@ pub(crate) async fn delegate(ctx: &RunContext, args: &Value) -> ToolOutcome {
         let agent = match spawned_id {
             Some(id) => store.get(&id).await.ok().flatten(),
             None => store
-                .workspace_agent(&workspace_id, item.agent.key)
+                .workspace_agent(&workspace_id, &item.agent.key)
                 .await
                 .ok()
                 .flatten(),
@@ -187,7 +194,7 @@ fn resolve_target(ctx: &RunContext, item: &JobItem) -> Result<(String, String), 
             Err(error) => Err(error),
         };
     }
-    match item.agent.key {
+    match item.agent.key.as_str() {
         "house" => Ok((
             "_house".to_string(),
             harness.join("_house").to_string_lossy().to_string(),
@@ -323,7 +330,7 @@ fn format_agent(agent: &AgentRecord) -> String {
     text
 }
 
-fn parse_items(args: &Value) -> Result<Vec<JobItem>, String> {
+fn parse_items(harness_root: &std::path::Path, args: &Value) -> Result<Vec<JobItem>, String> {
     let Some(items) = args.get("items").and_then(Value::as_array) else {
         return Err("Error: delegate requires a non-empty items array".to_string());
     };
@@ -345,10 +352,27 @@ fn parse_items(args: &Value) -> Result<Vec<JobItem>, String> {
             .and_then(Value::as_str)
             .unwrap_or("")
             .trim();
-        let agent = agent_for_scope(agent_name)
-            .filter(|agent| matches!(agent.key, "developer" | "general" | "house" | "ui" | "dfd"))
+        let registry = AgentRegistry::open(harness_root);
+        let agent = registry
+            .get(agent_name)
+            .cloned()
+            .or_else(|| {
+                registry
+                    .list()
+                    .iter()
+                    .find(|agent| agent.display.eq_ignore_ascii_case(agent_name))
+                    .cloned()
+            })
+            .filter(|agent| agent.delegatable)
             .ok_or_else(|| {
-                format!("Error: items[{index}].agent must be Developer, General, House, UI, or DFD")
+                format!(
+                    "Error: items[{index}].agent must be a delegatable agent (got '{}')",
+                    if agent_name.is_empty() {
+                        "empty"
+                    } else {
+                        agent_name
+                    }
+                )
             })?;
         let task = object
             .get("task")
@@ -437,12 +461,16 @@ mod tests {
 
     #[test]
     fn validates_items() {
-        assert!(parse_items(&json!({"items": []})).is_err());
-        assert!(parse_items(&json!({"items": [item("Orchestrator", "x")]})).is_err());
-        assert!(parse_items(&json!({"items": [item("Developer", "")]})).is_err());
-        let parsed = parse_items(&json!({
-            "items": [item("developer", "Build it"), item("General", "Research it")]
-        }))
+        let root = std::path::Path::new(".");
+        assert!(parse_items(root, &json!({"items": []})).is_err());
+        assert!(parse_items(root, &json!({"items": [item("Orchestrator", "x")]})).is_err());
+        assert!(parse_items(root, &json!({"items": [item("Developer", "")]})).is_err());
+        let parsed = parse_items(
+            root,
+            &json!({
+                "items": [item("developer", "Build it"), item("General", "Research it")]
+            }),
+        )
         .unwrap();
         assert_eq!(parsed[0].agent.key, "developer");
         assert_eq!(parsed[1].agent.key, "general");
@@ -450,14 +478,17 @@ mod tests {
 
     #[test]
     fn prompt_includes_outcome_and_acceptance() {
-        let parsed = parse_items(&json!({
-            "items": [{
-                "agent": "Developer",
-                "task": "Build it",
-                "outcome": "A working build",
-                "acceptance": "Tests pass"
-            }]
-        }))
+        let parsed = parse_items(
+            std::path::Path::new("."),
+            &json!({
+                "items": [{
+                    "agent": "Developer",
+                    "task": "Build it",
+                    "outcome": "A working build",
+                    "acceptance": "Tests pass"
+                }]
+            }),
+        )
         .unwrap();
         let prompt = job_prompt(&parsed[0], "ws-1", "C:/projects/ws-1");
         assert!(prompt.contains("You are Developer in workspace ws-1"));

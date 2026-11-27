@@ -308,6 +308,9 @@ impl ChatStore {
         migrate::ensure_column(&self.pool, "chats", "parent_chat_id", "TEXT").await?;
         migrate::ensure_column(&self.pool, "chats", "parent_workspace_id", "TEXT").await?;
         migrate::ensure_column(&self.pool, "chats", "token_usage_json", "TEXT").await?;
+        // The resolved agent key, so a custom agent survives every follow-up
+        // turn instead of being re-derived from the workspace path.
+        migrate::ensure_column(&self.pool, "chats", "agent_key", "TEXT").await?;
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS messages (
@@ -614,6 +617,19 @@ impl ChatStore {
         .bind(&now)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// Persist the canonical agent key for a chat. Follow-up turns read this
+    /// instead of re-deriving an agent from the workspace path.
+    pub async fn set_chat_agent(&self, chat_id: &str, agent_key: &str) -> Result<(), StoreError> {
+        validate_chat_id(chat_id)?;
+        sqlx::query("UPDATE chats SET agent_key = ?, updated_at = ? WHERE id = ?")
+            .bind(agent_key.trim().to_ascii_lowercase())
+            .bind(now_iso())
+            .bind(chat_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -1275,7 +1291,7 @@ impl ChatStore {
     pub async fn get_chat(&self, chat_id: &str) -> Result<Option<Value>, StoreError> {
         validate_chat_id(chat_id)?;
         let row = sqlx::query(
-            "SELECT id, workspace_id, workspace_path, title, model, created_at, updated_at, pinned, token_usage_json, parent_chat_id, parent_workspace_id FROM chats WHERE id = ?",
+            "SELECT id, workspace_id, workspace_path, title, model, created_at, updated_at, pinned, token_usage_json, parent_chat_id, parent_workspace_id, agent_key FROM chats WHERE id = ?",
         )
         .bind(chat_id)
         .fetch_optional(&self.pool)
@@ -1353,6 +1369,14 @@ impl ChatStore {
             .flatten()
         {
             chat["parentWorkspaceId"] = Value::String(parent);
+        }
+        if let Some(agent_key) = row
+            .try_get::<Option<String>, _>("agent_key")
+            .ok()
+            .flatten()
+            .filter(|key| !key.trim().is_empty())
+        {
+            chat["agentKey"] = Value::String(agent_key);
         }
         if let Some(raw) = row
             .try_get::<Option<String>, _>("token_usage_json")
@@ -2199,6 +2223,10 @@ mod tests {
 
         let loaded = store.get_chat(chat_id).await.unwrap().unwrap();
         assert_eq!(loaded["messages"][0]["content"], "hello");
+        assert!(loaded.get("agentKey").is_none());
+        store.set_chat_agent(chat_id, "backend").await.unwrap();
+        let loaded = store.get_chat(chat_id).await.unwrap().unwrap();
+        assert_eq!(loaded["agentKey"], "backend");
         assert!(store.delete_chat(chat_id).await.unwrap());
         assert!(store.list_chats(&record.id).await.is_empty());
     }

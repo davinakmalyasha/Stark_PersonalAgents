@@ -3706,6 +3706,8 @@ pub fn canvas_body<S: CanvasHost + crate::rune_transcript::TranscriptHost + 'sta
                 .radius(7.0)
                 .fill(ink("#0f0f12b8"))
                 .border(1.0, ink("#ffffff14"))
+                .hover(ink("#1d1d22"))
+                .hover_group()
                 .pl(7.0)
                 .pr(9.0)
                 .backdrop_blur(12.0)
@@ -3743,7 +3745,8 @@ pub fn canvas_body<S: CanvasHost + crate::rune_transcript::TranscriptHost + 'sta
                 .child(
                     text("Add".to_string())
                         .font(rune::tok::TextStyle::new(9.5, 600.0))
-                        .color(ink("#a9abb3")),
+                        .color(ink("#a9abb3"))
+                        .group_color(ink("#f4f4f5")),
                 ),
         );
     }
@@ -3783,6 +3786,8 @@ pub fn canvas_body<S: CanvasHost + crate::rune_transcript::TranscriptHost + 'sta
             .size(28.0, 28.0)
             .radius(8.0)
             .center()
+            .hover(ink("#ffffff0a"))
+            .hover_group()
             .child(
                 rune::el()
                     .key(format!("cam-{key}-icon"))
@@ -3791,67 +3796,57 @@ pub fn canvas_body<S: CanvasHost + crate::rune_transcript::TranscriptHost + 'sta
                     .shape(icon),
             )
     };
-    canvas =
-        canvas
+    canvas = canvas.child(
+        row()
+            .key("cam-hud")
+            .absolute(vw - 127.0, 10.0)
+            .items_center()
+            .gap(1.0)
             .child(
-                row()
-                    .key("cam-hud")
-                    .absolute(vw - 127.0, 10.0)
-                    .items_center()
-                    .gap(1.0)
-                    .child(
-                        hud_icon("zoom-out", "Zoom out", icon_minus(ink("#81848d")))
-                            .on_press_tx_enter(move |s: &mut S, tx| {
-                                let c = s.canvas_mut();
-                                c.cam_auto = false;
-                                c.cam.zoom_by(0.86);
-                                c.sync_cam_live();
-                                // The world scales at draw time; no view run.
-                                tx.live_only();
-                            }),
-                    )
-                    .child(
-                        hud_icon("zoom-in", "Zoom in", icon_plus(ink("#81848d")))
-                            .on_press_tx_enter(move |s: &mut S, tx| {
-                                let c = s.canvas_mut();
-                                c.cam_auto = false;
-                                c.cam.zoom_by(1.16);
-                                c.sync_cam_live();
-                                tx.live_only();
-                            }),
-                    )
-                    .child(
-                        hud_icon("fit", "Fit to view", icon_scan(ink("#81848d")))
-                            .on_press_tx_enter(move |s: &mut S, tx| {
-                                let c = s.canvas_mut();
-                                let cards = c.cards.clone();
-                                let (vw, vh) = (c.view_w, c.view_h);
-                                c.cam.fit_in(&cards, vw, vh);
-                                c.sync_cam_live();
-                                c.cam_auto = true;
-                                tx.live_only();
-                            }),
-                    )
-                    .child(
-                        hud_icon("reset", "Reset layout", icon_reset(ink("#81848d")))
-                            .on_press_enter(move |s: &mut S| {
-                                // `relayout`: tidy-tree slots again plus a fresh fit.
-                                s.canvas_mut().relayout();
-                            }),
-                    ),
+                hud_icon("zoom-out", "Zoom out", icon_minus(ink("#81848d"))).on_press_tx_enter(
+                    move |s: &mut S, tx| {
+                        let c = s.canvas_mut();
+                        c.cam_auto = false;
+                        c.cam.zoom_by(0.86);
+                        c.sync_cam_live();
+                        // The world scales at draw time; no view run.
+                        tx.live_only();
+                    },
+                ),
             )
-            .child(if !s.cards.is_empty() {
-                // `.canvas-map-hint`: bottom-left, 9pt dim copy (hidden behind the
-                // home chat card when it is open, and absent when the canvas is
-                // empty, exactly like the reference UI).
-                text("Drag to pan · scroll to zoom · drag cards to arrange".to_string())
-                    .key("cam-hint")
-                    .absolute(18.0, vh - 26.0)
-                    .font(rune::tok::TextStyle::new(9.0, 400.0))
-                    .color(ink("#4f525a"))
-            } else {
-                rune::el().key("cam-hint-empty").size(0.0, 0.0).inert()
-            });
+            .child(
+                hud_icon("zoom-in", "Zoom in", icon_plus(ink("#81848d"))).on_press_tx_enter(
+                    move |s: &mut S, tx| {
+                        let c = s.canvas_mut();
+                        c.cam_auto = false;
+                        c.cam.zoom_by(1.16);
+                        c.sync_cam_live();
+                        tx.live_only();
+                    },
+                ),
+            )
+            .child(
+                hud_icon("fit", "Fit to view", icon_scan(ink("#81848d"))).on_press_tx_enter(
+                    move |s: &mut S, tx| {
+                        let c = s.canvas_mut();
+                        let cards = c.cards.clone();
+                        let (vw, vh) = (c.view_w, c.view_h);
+                        c.cam.fit_in(&cards, vw, vh);
+                        c.sync_cam_live();
+                        c.cam_auto = true;
+                        tx.live_only();
+                    },
+                ),
+            )
+            .child(
+                hud_icon("reset", "Reset layout", icon_reset(ink("#81848d"))).on_press_enter(
+                    move |s: &mut S| {
+                        // `relayout`: tidy-tree slots again plus a fresh fit.
+                        s.canvas_mut().relayout();
+                    },
+                ),
+            ),
+    );
     // Sidebar rows mirror the cards: the active chat carries the white-9%
     // wash (`.house-sidebar-row.is-active`); a press switches selection.
     // Rows key off card ids so the board and the list can never disagree.

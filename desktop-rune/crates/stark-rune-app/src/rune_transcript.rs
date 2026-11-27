@@ -3055,24 +3055,22 @@ pub fn attachment_lightbox<S: 'static>(
         .child(content)
 }
 
-/// `MessageBubble.copyMessage`: write the row's raw text and, for user and
-/// error rows only, hold the reference UI's 1.5s Check state. Agent copy has no feedback.
+/// `MessageBubble.copyMessage`: write the row's raw text and hold the
+/// reference UI's 1.5s Check state. Every role gets the same confirmation —
+/// user, error and agent copy feel identical.
 fn copy_message<S: TranscriptHost + 'static>(
     s: &mut S,
     which: Thread,
     key: &str,
     text: String,
-    feedback: bool,
     tx: &mut rune::Tx,
 ) {
     tx.copy(text);
-    if feedback {
-        s.thread_mut(which)
-            .copied_messages
-            .insert(key.to_string(), crate::clock::now_millis());
-        // Poll again when the 1.5s window ends even if nothing else moves.
-        tx.wake_after(std::time::Duration::from_millis(50));
-    }
+    s.thread_mut(which)
+        .copied_messages
+        .insert(key.to_string(), crate::clock::now_millis());
+    // Poll again when the 1.5s window ends even if nothing else moves.
+    tx.wake_after(std::time::Duration::from_millis(50));
 }
 
 /// First press arms the row; the 3.2s poll timeout disarms it. The reference UI keeps
@@ -3664,7 +3662,7 @@ fn home_user_row<S: TranscriptHost + 'static>(s: &S, which: Thread, r: &RowData,
             .hover(home_rgba(255.0, 255.0, 255.0, 0.07))
             .hover_group()
             .on_press_tx_enter(move |s: &mut S, tx: &mut rune::Tx| {
-                copy_message(s, which, &copy_key, copy_text.clone(), true, tx);
+                copy_message(s, which, &copy_key, copy_text.clone(), tx);
             })
             .child(if copied {
                 rune::el()
@@ -3942,7 +3940,7 @@ fn home_agent_row<S: TranscriptHost + 'static>(
                 );
             }
         }
-        footer = footer.child(agent_copy_action::<S>(which, r, &final_text));
+        footer = footer.child(agent_copy_action::<S>(s, which, r, &final_text));
         group = group.child(footer);
     }
     group
@@ -4672,31 +4670,50 @@ fn thousands(n: u64) -> String {
 /// Agent copy action, placed in the footer beside the token/time strip.
 /// Agents never offer rewind or retry here; their turn is already complete.
 fn agent_copy_action<S: TranscriptHost + 'static>(
+    s: &S,
     which: Thread,
     r: &RowData,
     response: &str,
 ) -> El {
+    let copied = s.thread(which).copied_messages.contains_key(&r.key);
     let copy_text = response.to_string();
     let copy_key = r.key.clone();
     rune::el()
         .key(format!("{}-copy", r.key))
         .role("button")
         .focusable(true)
-        .label("Copy to clipboard")
+        .label(if copied {
+            "Copied"
+        } else {
+            "Copy to clipboard"
+        })
+        .help(if copied {
+            "Copied"
+        } else {
+            "Copy to clipboard"
+        })
         .size(25.0, 25.0)
         .radius(6.0)
         .center()
         .hover(home_ink("#27272a"))
         .hover_group()
         .on_press_tx_enter(move |s: &mut S, tx: &mut rune::Tx| {
-            copy_message(s, which, &copy_key, copy_text.clone(), false, tx);
+            copy_message(s, which, &copy_key, copy_text.clone(), tx);
         })
         .press_scale(0.96)
-        .child(crate::motion::hover_icon(
-            12.0,
-            home_icon_copy(12.0, home_ink("#71717a")),
-            home_icon_copy(12.0, home_ink("#d4d4d8")),
-        ))
+        .child(if copied {
+            rune::el()
+                .key(format!("{}-copy-check", r.key))
+                .size(12.0, 12.0)
+                .inert()
+                .shape(crate::lucide_check(12.0, 2.0, home_ink("#34d399")))
+        } else {
+            crate::motion::hover_icon(
+                12.0,
+                home_icon_copy(12.0, home_ink("#71717a")),
+                home_icon_copy(12.0, home_ink("#d4d4d8")),
+            )
+        })
 }
 
 /// `MessageBubble` system note (`.system-message-note`).
@@ -4797,7 +4814,7 @@ fn home_error_row<S: TranscriptHost + 'static>(
         .radius(6.0)
         .hover(home_rgba(255.0, 255.0, 255.0, 0.06))
         .on_press_tx_enter(move |s: &mut S, tx: &mut rune::Tx| {
-            copy_message(s, which, &copy_key, copy_text.clone(), true, tx);
+            copy_message(s, which, &copy_key, copy_text.clone(), tx);
         })
         .child(rune::el().size(10.0, 10.0).inert().shape(if copied {
             crate::lucide_check(10.0, 2.0, home_ink("#34d399"))
@@ -6931,6 +6948,20 @@ mod tests {
         // Users keep copy and rewind.
         assert!(rt.find("short-user-copy").is_some(), "user copy");
         assert!(rt.find("short-user-rewind").is_some(), "user rewind");
+
+        // Agent copy gets the same 1.5s check confirmation as user copy.
+        let (x, y) = rt.find("short-agent-copy").expect("agent copy placed");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.0);
+        assert!(
+            rt.state.copied_messages.contains_key("short-agent"),
+            "agent copy records feedback"
+        );
+        assert!(
+            rt.find("short-agent-copy-check").is_some(),
+            "agent copy shows the check"
+        );
     }
 
     #[test]

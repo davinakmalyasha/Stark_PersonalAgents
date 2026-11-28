@@ -14,7 +14,6 @@ stt-vulkan = ["stt", "transcribe-cpp/vulkan"]
 [dependencies]
 anyhow.workspace = true
 base64 = "0.22"
-cpal = "0.16"
 half = "2"
 hound = "3.5"
 log = "0.4"

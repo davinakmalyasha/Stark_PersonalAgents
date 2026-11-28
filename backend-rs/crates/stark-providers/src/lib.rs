@@ -1,4 +1,5 @@
 use std::pin::Pin;
+use std::sync::LazyLock;
 
 use eventsource_stream::Eventsource;
 use futures_util::{Stream, StreamExt};
@@ -1118,7 +1119,7 @@ fn freeform_patch(tool: &Value, formats: &[String]) -> Option<(Value, FreeformCu
             "description": description,
             "format": {
                 "type": "grammar",
-                "grammar": {"syntax": "lark", "definition": PATCH_GRAMMAR},
+                "grammar": {"syntax": "lark", "definition": patch_grammar()},
             },
         },
     });
@@ -1132,7 +1133,14 @@ fn freeform_patch(tool: &Value, formats: &[String]) -> Option<(Value, FreeformCu
 }
 
 /// OpenCode's fixed `packages/core/src/tool/patch-grammar.txt` (MIT).
-const PATCH_GRAMMAR: &str = include_str!("patch_grammar.lark");
+///
+/// Git may materialize the file with CRLF on Windows, but the grammar sent to
+/// providers must be byte-identical across platforms.
+fn patch_grammar() -> &'static str {
+    static GRAMMAR: LazyLock<String> =
+        LazyLock::new(|| include_str!("patch_grammar.lark").replace("\r\n", "\n"));
+    GRAMMAR.as_str()
+}
 
 /// One declared custom tool: the required string field and whether the first
 /// line carries the tool's other parameters (`// @options: {...}`).
@@ -2976,17 +2984,18 @@ mod tests {
             json!("Apply a unified patch.")
         );
         assert_eq!(patch["custom"]["format"]["type"], json!("grammar"));
+        let grammar = patch_grammar();
         assert_eq!(
             patch["custom"]["format"]["grammar"]["definition"],
-            json!(PATCH_GRAMMAR)
+            json!(grammar)
         );
         assert_eq!(
             patch["custom"]["format"]["grammar"]["syntax"],
             json!("lark")
         );
-        assert!(!PATCH_GRAMMAR.contains("// @options:"));
-        assert!(PATCH_GRAMMAR.starts_with("start: begin_patch hunk+ end_patch\n"));
-        assert!(PATCH_GRAMMAR.ends_with("%import common.LF\n"));
+        assert!(!grammar.contains("// @options:"));
+        assert!(grammar.starts_with("start: begin_patch hunk+ end_patch\n"));
+        assert!(grammar.ends_with("%import common.LF\n"));
 
         // Lark-only models accept the patch tool but not text freeform execute.
         let (converted, customs) = freeform_tools(&tools, &["lark".into()]);

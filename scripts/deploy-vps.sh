@@ -3,7 +3,7 @@
 #
 #   bash deploy-vps.sh /root/stark-linux-x86_64.tar.gz [git-sha]
 #
-# Layout: /opt/stark/releases/<stamp>/{stark-server,REVISION}
+# Layout: /opt/stark/releases/<stamp>/{stark-server,codemode-worker,REVISION}
 #         /opt/stark/current -> releases/<stamp>
 # Rollback keeps /opt/stark/previous pointing at the last healthy release.
 #
@@ -50,11 +50,13 @@ flock -w 600 9 || { echo "!! another deploy holds $LOCK"; exit 1; }
 echo "==> extract ($REVISION)"
 tar -xzf "$ARCHIVE" -C "$WORK"
 test -f "$WORK/opt/stark/stark-server"
+test -f "$WORK/opt/stark/codemode-worker"
 
 mkdir -p "$RELEASES/$STAMP"
 mv "$WORK/opt/stark/stark-server" "$RELEASES/$STAMP/stark-server"
+mv "$WORK/opt/stark/codemode-worker" "$RELEASES/$STAMP/codemode-worker"
 printf '%s\n' "$REVISION" > "$RELEASES/$STAMP/REVISION"
-chmod +x "$RELEASES/$STAMP/stark-server"
+chmod +x "$RELEASES/$STAMP/stark-server" "$RELEASES/$STAMP/codemode-worker"
 chown -R stark:stark "$RELEASES/$STAMP"
 
 # Unit points at the `current` symlink so releases are immutable.
@@ -124,7 +126,8 @@ systemctl restart stark
 echo "==> health"
 HEALTHY=0
 for _ in $(seq 1 30); do
-  if curl -fsS --max-time 3 http://127.0.0.1:8123/api/health | grep -q '"ok":true'; then
+  if curl -fsS --max-time 3 http://127.0.0.1:8123/api/health \
+    | jq -e '.ok == true and .code_mode.available == true' >/dev/null; then
     HEALTHY=1
     break
   fi

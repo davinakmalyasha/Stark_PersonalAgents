@@ -1,6 +1,6 @@
 # Builds the Linux deploy unit for the VPS runner: the stark-server binary
-# (x86_64, glibc matched to the deploy OS). The VPS never compiles — it
-# downloads this artifact and runs it.
+# and the compiled Code Mode worker (x86_64, glibc matched to the deploy OS).
+# The VPS never compiles — it downloads this artifact and runs it.
 #
 # Trigger: manual, or every push to master. The desktop master feed and the
 # VPS deploy therefore follow the same commits; docs-only pushes redeploy the
@@ -29,11 +29,6 @@ jobs:
         with:
           workspaces: backend-rs -> target
 
-      # stark-voice -> cpal -> alsa-sys needs the ALSA headers on Linux.
-      # (Runtime needs libasound2t64 on the VPS too — handled at deploy.)
-      - name: System deps (Linux audio headers)
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-
       - name: Contract sanity (frozen v6 tool contract)
         working-directory: backend-rs
         run: cargo test -p stark-contract
@@ -42,13 +37,25 @@ jobs:
         working-directory: backend-rs
         run: cargo build --release -p stark-server
 
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.4"
+
+      - name: Build Code Mode worker
+        working-directory: backend-rs/codemode-worker
+        run: |
+          bun install --frozen-lockfile
+          bun run build
+          test -x dist/codemode-worker
+
       - name: Package deploy unit
         run: |
           mkdir -p pkg/opt/stark
           cp backend-rs/target/release/stark-server pkg/opt/stark/stark-server
-          chmod +x pkg/opt/stark/stark-server
+          cp backend-rs/codemode-worker/dist/codemode-worker pkg/opt/stark/codemode-worker
+          chmod +x pkg/opt/stark/stark-server pkg/opt/stark/codemode-worker
           tar -czf stark-linux-x86_64.tar.gz -C pkg opt
-          tar -tzf stark-linux-x86_64.tar.gz | head -8
+          tar -tzf stark-linux-x86_64.tar.gz
           ls -la stark-linux-x86_64.tar.gz
 
       - uses: actions/upload-artifact@v4

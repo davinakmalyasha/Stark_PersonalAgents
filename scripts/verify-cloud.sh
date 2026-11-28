@@ -23,6 +23,11 @@ if [ -n "$EXPECTED" ]; then
   echo "build matches $EXPECTED"
 fi
 
+echo "==> code mode"
+printf '%s' "$HEALTH" | jq -e '.code_mode.available == true' >/dev/null
+printf '%s' "$HEALTH" | jq -c '.code_mode'
+test -x /opt/stark/current/codemode-worker
+
 echo "==> provider key (boolean only)"
 curl -fsS "$BASE/api/provider" | jq '{provider, base_url, has_key, legacy_env}'
 

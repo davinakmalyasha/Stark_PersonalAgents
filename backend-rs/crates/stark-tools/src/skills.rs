@@ -389,6 +389,43 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
+    async fn junction_skill_root_is_ignored_on_windows() {
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("review")).unwrap();
+        std::fs::write(
+            outside.path().join("review/SKILL.md"),
+            "---\nname: review\ndescription: Outside.\n---\n# Outside\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join(".agents")).unwrap();
+        let link = dir.path().join(".agents/skills");
+        // Junctions do not need Developer Mode, so this covers the common
+        // Windows reparse-point bypass even when symlink creation is denied.
+        let script = format!(
+            "New-Item -ItemType Junction -Path '{}' -Target '{}' | Out-Null",
+            link.display(),
+            outside.path().display()
+        );
+        let created = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !created {
+            return;
+        }
+
+        let ctx = context(dir.path());
+        assert!(catalog_block_for(dir.path(), dir.path()).await.is_none());
+        let out = skill(&ctx, &serde_json::json!({"name": "review"})).await;
+        assert!(out.is_error, "{}", out.content);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
     async fn symlinked_skill_files_are_ignored_on_windows() {
         use std::os::windows::fs::{symlink_dir, symlink_file};
 

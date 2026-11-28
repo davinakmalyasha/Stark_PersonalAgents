@@ -123,7 +123,10 @@ groups.
   features. Built-in Code Mode defaults are unchanged.
 - Custom routing is opt-in and only used when no explicit agent/chat identity
   exists. A unique workspace-kind/path match wins; ambiguous matches fall back
-  to the built-in heuristic with a warning.
+  to the built-in heuristic with a warning. Paths are normalized absolute
+  globs: separators and Windows verbatim prefixes are canonicalized, matching
+  is case-insensitive on Windows/macOS, and invalid or relative rules are
+  dropped with a warning at load instead of quarantining the agent.
 - Dispatch checks the effective ACL for every non-MCP tool. An unknown scope
   without an explicit ACL exposes nothing, not the full inventory.
 
@@ -169,8 +172,11 @@ outlives sessions, it retains the four most recent inventories rather than an
 unbounded set of language runtimes; this is transport-internal and never
 model-visible. A delivered
 background job is removed from memory and disk; no additional age or row cap
-is applied. Like OpenCode, a script that stops yielding is not killed; the
-two-minute foreground block only moves it to the background. Built-in
+is applied. Like OpenCode, a script that stops yielding is not killed by the
+two-minute foreground block; it only moves to the background. Stop is still
+reliable: the host waits two seconds for the worker to acknowledge `cancel`,
+then kills the Bun child (failing concurrent runs in that worker) and respawns
+it lazily on the next call. Built-in
 Developer config can set `code_mode` to `off`, `hybrid`, or `only`;
 `off` restores the full direct surface and removes `execute`, while
 `hybrid` keeps the base surface (core tools direct, long-tail through
@@ -255,7 +261,9 @@ advertises no freeform format, so it still receives the JSON function tool.
 Skills are directories at `.agents/skills/<name>/SKILL.md` (workspace or
 harness level). The catalog is injected into the prompt; the model loads a
 skill with the `skill` tool. Agent configuration can restrict the visible
-catalog.
+catalog. Workspace skills are trusted instructions from the repository;
+symlinked skill directories and `SKILL.md` files are ignored in every root so
+a cloned repo cannot point at an arbitrary host file.
 
 ### MCP
 

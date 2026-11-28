@@ -2842,16 +2842,17 @@ mod code_mode_policy_tests {
         manager.initialize(&defs_a).await.unwrap();
         manager.initialize(&defs_b).await.unwrap();
         let inner = manager.prepare().await.unwrap();
-        let result = crate::codemode::worker::WorkerManager::execute_on(
-            inner,
-            "run_inventory_a",
-            &ctx_a,
-            "return await tools.read({ file_path: 'a.txt' });",
-            false,
-            &defs_a,
-        )
-        .await
-        .unwrap();
+        let result = manager
+            .execute_on(
+                inner,
+                "run_inventory_a",
+                &ctx_a,
+                "return await tools.read({ file_path: 'a.txt' });",
+                false,
+                &defs_a,
+            )
+            .await
+            .unwrap();
         assert!(!result.error, "{}", result.text);
         assert!(result.text.contains("inventory a"), "{}", result.text);
         assert!(
@@ -2859,6 +2860,74 @@ mod code_mode_policy_tests {
             "the other inventory's initialize must not change this call: {}",
             result.text
         );
+    }
+
+    #[tokio::test]
+    async fn execute_short_circuits_an_already_cancelled_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let ctx = coding(dir.path()).with_cancel(cancel);
+        let out = dispatch("execute", &json!({"code": "return 1"}), &ctx).await;
+        assert!(out.is_error, "{}", out.content);
+        assert_eq!(
+            out.class,
+            Some(ToolErrorClass::Cancelled),
+            "{}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_kills_an_unresponsive_worker_and_respawns() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = crate::WorkerManager::local(dir.path());
+        let ctx = coding(dir.path()).with_worker_manager(manager.clone());
+        let cancel = ctx.cancel.clone();
+        let started = dir.path().join("started.txt");
+        let task = tokio::spawn(async move {
+            dispatch(
+                "execute",
+                &json!({
+                    "code": "await Bun.write('started.txt', '1'); for (;;) {}",
+                    "timeout": 600_000
+                }),
+                &ctx,
+            )
+            .await
+        });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !started.is_file() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the program never reached its loop"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let cancelled_at = tokio::time::Instant::now();
+        cancel.cancel();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(15), task)
+            .await
+            .expect("cancel must not hang on a synchronous program")
+            .unwrap();
+        assert!(outcome.is_error, "{}", outcome.content);
+        assert_eq!(
+            outcome.class,
+            Some(ToolErrorClass::Cancelled),
+            "{}",
+            outcome.content
+        );
+        assert!(
+            cancelled_at.elapsed() < std::time::Duration::from_secs(12),
+            "cancel took {:?}",
+            cancelled_at.elapsed()
+        );
+
+        // The killed child must be replaced lazily, not leave a dead manager.
+        let ctx = coding(dir.path()).with_worker_manager(manager);
+        let out = dispatch("execute", &json!({"code": "return 1"}), &ctx).await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains('1'), "{}", out.content);
     }
 
     #[tokio::test]

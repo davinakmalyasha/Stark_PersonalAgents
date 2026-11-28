@@ -19,7 +19,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -51,6 +51,11 @@ pub struct WorkerExecuteResult {
 }
 
 type PendingTx = oneshot::Sender<Result<Value, String>>;
+
+/// How long the host waits for a cancelled run to acknowledge before killing
+/// the worker. A synchronous program blocks Bun's event loop, so the cancel
+/// RPC can never be read; the child is the only thing the host can stop.
+const CANCEL_GRACE: Duration = Duration::from_secs(2);
 
 pub(crate) struct WorkerInner {
     stdin: AsyncMutex<tokio::process::ChildStdin>,
@@ -104,6 +109,16 @@ impl WorkerInner {
 
     fn remove_host(&self, run_id: &str) {
         self.runs.lock().unwrap().remove(run_id);
+    }
+
+    fn fail_pending(&self, message: &str) {
+        let pending: Vec<PendingTx> = {
+            let mut table = self.pending.lock().unwrap();
+            table.drain().map(|(_, tx)| tx).collect()
+        };
+        for tx in pending {
+            let _ = tx.send(Err(message.to_string()));
+        }
     }
 }
 
@@ -166,6 +181,35 @@ impl WorkerManager {
             initializing: AsyncMutex::new(()),
             initialized: Mutex::new(None),
             _child: AsyncMutex::new(None),
+        }
+    }
+
+    /// Last-resort shutdown for a worker that will not answer `cancel`.
+    /// Concurrent runs fail with `reason`; the next call respawns lazily.
+    /// `target` is checked so a worker spawned after the timeout is never
+    /// killed by mistake.
+    pub(crate) async fn kill(&self, target: &Arc<WorkerInner>, reason: &str) {
+        // Serialize with lazy startup so the child we take is the target's.
+        let _starting = self.starting.lock().await;
+        let inner = {
+            let mut guard = self.inner.lock().await;
+            match guard.as_ref() {
+                Some(inner) if Arc::ptr_eq(inner, target) => guard.take(),
+                _ => None,
+            }
+        };
+        let Some(inner) = inner else {
+            return;
+        };
+        inner.dead.store(true, Ordering::Release);
+        inner.fail_pending(reason);
+        inner.runs.lock().unwrap().clear();
+        *self.initialized.lock().unwrap() = None;
+        let child = { self._child.lock().await.take() };
+        drop(_starting);
+        if let Some(mut child) = child {
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
         }
     }
 
@@ -497,6 +541,7 @@ impl WorkerManager {
     /// future does not lazily spawn the worker, so it is `Send` and can be
     /// spawned normally.
     pub(crate) async fn execute_on(
+        &self,
         inner: Arc<WorkerInner>,
         run_id: &str,
         ctx: &ToolContext,
@@ -519,7 +564,32 @@ impl WorkerManager {
         let response = tokio::select! {
             biased;
             _ = ctx.cancel.cancelled() => {
-                let _ = inner.send(&inner.next_id("r"), "cancel", &json!({"runId": run_id})).await;
+                let cancel_id = inner.next_id("r");
+                let cancel = tokio::time::timeout(
+                    CANCEL_GRACE,
+                    inner.send(&cancel_id, "cancel", &json!({"runId": run_id})),
+                )
+                .await;
+                match cancel {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            run_id = %run_id,
+                            error = %error,
+                            "code mode worker cancel failed; killing it"
+                        );
+                        self.kill(&inner, "code mode worker cancel failed").await;
+                    }
+                    Err(_) => {
+                        inner.pending.lock().unwrap().remove(&cancel_id);
+                        tracing::warn!(
+                            run_id = %run_id,
+                            "code mode worker did not acknowledge cancel; killing it"
+                        );
+                        self.kill(&inner, "code mode worker did not acknowledge cancel")
+                            .await;
+                    }
+                }
                 inner.remove_host(run_id);
                 return Err("CANCELLED".to_string());
             }
@@ -531,15 +601,45 @@ impl WorkerManager {
     }
 
     pub async fn cancel(&self, run_id: &str) -> bool {
-        let Ok(inner) = self.ensure_live().await else {
-            return false;
+        // Cancel never spawns a worker: a run can only exist on a live child.
+        let inner = {
+            let guard = self.inner.lock().await;
+            match guard.as_ref() {
+                Some(inner) if !inner.dead.load(Ordering::Acquire) => inner.clone(),
+                _ => return false,
+            }
         };
-        let cancelled = inner
-            .send(&inner.next_id("r"), "cancel", &json!({"runId": run_id}))
-            .await
-            .ok()
-            .and_then(|value| value.get("cancelled").and_then(Value::as_bool))
-            .unwrap_or(false);
+        let cancel_id = inner.next_id("r");
+        let response = tokio::time::timeout(
+            CANCEL_GRACE,
+            inner.send(&cancel_id, "cancel", &json!({"runId": run_id})),
+        )
+        .await;
+        let cancelled = match response {
+            Ok(Ok(value)) => value
+                .get("cancelled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    run_id = %run_id,
+                    error = %error,
+                    "code mode worker cancel failed; killing it"
+                );
+                self.kill(&inner, "code mode worker cancel failed").await;
+                false
+            }
+            Err(_) => {
+                inner.pending.lock().unwrap().remove(&cancel_id);
+                tracing::warn!(
+                    run_id = %run_id,
+                    "code mode worker did not acknowledge cancel; killing it"
+                );
+                self.kill(&inner, "code mode worker did not acknowledge cancel")
+                    .await;
+                false
+            }
+        };
         self.forget(run_id).await;
         cancelled
     }

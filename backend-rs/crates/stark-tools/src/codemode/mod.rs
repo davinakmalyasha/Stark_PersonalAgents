@@ -311,7 +311,12 @@ pub async fn handle(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         // agents attach the shared manager in stark-core.
         None => WorkerManager::local(&ctx.harness_root),
     };
-    if let Err(error) = manager.initialize(&defs).await {
+    let initialized = tokio::select! {
+        biased;
+        _ = ctx.cancel.cancelled() => return crate::cancelled_outcome(EXECUTE_TOOL),
+        result = manager.initialize(&defs) => result,
+    };
+    if let Err(error) = initialized {
         return ToolOutcome::err_class(
             ToolErrorClass::Transport,
             format!("code mode worker error: {error}"),
@@ -320,7 +325,12 @@ pub async fn handle(ctx: &ToolContext, args: &Value) -> ToolOutcome {
     if ctx.cancel.is_cancelled() {
         return crate::cancelled_outcome(EXECUTE_TOOL);
     }
-    let inner = match manager.prepare().await {
+    let prepared = tokio::select! {
+        biased;
+        _ = ctx.cancel.cancelled() => return crate::cancelled_outcome(EXECUTE_TOOL),
+        result = manager.prepare() => result,
+    };
+    let inner = match prepared {
         Ok(inner) => inner,
         Err(error) => {
             return ToolOutcome::err_class(
@@ -438,8 +448,9 @@ fn spawn_execute(
     tokio::spawn(async move {
         // Keep the manager alive for the whole script: background scripts and
         // in-flight tool calls rely on its child/registry.
-        let _manager = manager;
-        WorkerManager::execute_on(inner, &run_id, &ctx, &code, full, &tools).await
+        manager
+            .execute_on(inner, &run_id, &ctx, &code, full, &tools)
+            .await
     })
 }
 

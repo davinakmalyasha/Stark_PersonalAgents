@@ -26,6 +26,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: backend-rs -> target
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.4"
+      - name: Install Code Mode worker dependencies
+        working-directory: backend-rs/codemode-worker
+        run: bun install --frozen-lockfile
+      - name: Typecheck Code Mode worker
+        working-directory: backend-rs/codemode-worker
+        run: bun run typecheck
+      - name: Test Code Mode worker
+        working-directory: backend-rs/codemode-worker
+        run: bun test
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace

@@ -920,6 +920,18 @@ fn home_chat_overlay(s: &ShellState, stage_w: f32, stage_h: f32, window_h: f32) 
         None if s.canvas.cards.is_empty() => (&s.transcript, Thread::Main),
         None => return None,
     };
+    // The home card is glass (18px backdrop blur). When a sheet with its own
+    // backdrop blur is mounted above it, the card's blur composites under the
+    // sheet's blur, which reads as a second, heavier blur. Keep exactly one:
+    // the sheet's. The card is behind the sheet anyway.
+    let sheet_open = thread.provider_keys.open
+        || thread.agent_config.open
+        || thread.notes.open
+        || thread.stats_open
+        || thread.settings.open
+        || thread.attachment_preview.is_some()
+        || s.canvas.projects.dialog.open
+        || s.canvas.projects.group.is_open();
     // The reference UI caps the wrapper (`md:max-w-[740px]`) and the wrapper's own
     // `px-2` gutters sit inside that cap: the card is at most 724 wide.
     // At 800 the stage is narrower than the cap, so this matches the old
@@ -937,7 +949,7 @@ fn home_chat_overlay(s: &ShellState, stage_w: f32, stage_h: f32, window_h: f32) 
         .fill(ink("#0d0d10fc"))
         // `.house-chat-card { backdrop-filter: blur(18px) }`: without it the
         // fill leaves sharp canvas ghosts under the conversation.
-        .backdrop_blur(18.0)
+        .backdrop_blur(if sheet_open { 0.0 } else { 18.0 })
         .px(8.0)
         .pt(6.0)
         .pb(4.0)

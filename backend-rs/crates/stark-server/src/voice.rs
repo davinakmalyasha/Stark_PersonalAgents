@@ -390,10 +390,14 @@ pub async fn transcribe_handler(
     State(state): State<ServerState>,
     mut multipart: Multipart,
 ) -> Response {
-    let stt = match state.voice.as_ref().map(|v| v.ensure_stt()) {
-        Some(Ok(stt)) => stt,
-        _ => return unavailable("Parakeet STT is not available in this build"),
-    };
+    let voice = state.voice.clone();
+    let stt =
+        match tokio::task::spawn_blocking(move || voice.and_then(|voice| voice.ensure_stt().ok()))
+            .await
+        {
+            Ok(Some(stt)) => stt,
+            _ => return unavailable("Parakeet STT is not available in this build"),
+        };
     let mut bytes = Vec::new();
     let mut extension = "wav".to_string();
     while let Ok(Some(field)) = multipart.next_field().await {

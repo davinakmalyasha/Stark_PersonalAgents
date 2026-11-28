@@ -181,7 +181,8 @@ jobs:
             --features stark-rune-app/rune-real
           # The desktop feed ships its own local server. Parakeet Unified
           # English streams on the GPU through Vulkan, exactly like Hex.
-          cargo build --manifest-path backend-rs/Cargo.toml --release \
+          RUSTFLAGS="-C target-feature=+crt-static -L native=${VULKAN_SDK}/Lib" \
+            cargo build --manifest-path backend-rs/Cargo.toml --release \
             -p stark-server --features voice-stt,voice-stt-vulkan
 
       - name: Authenticode sign binaries (optional)

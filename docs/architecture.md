@@ -122,11 +122,21 @@ groups.
   custom `only`/`full_codemode` are rejected and stay built-in Developer
   features. Built-in Code Mode defaults are unchanged.
 - Custom routing is opt-in and only used when no explicit agent/chat identity
-  exists. A unique workspace-kind/path match wins; ambiguous matches fall back
-  to the built-in heuristic with a warning. Paths are normalized absolute
+  exists. A unique workspace-kind/path/repo match wins; ambiguous matches fall
+  back to the built-in heuristic with a warning. Paths are normalized absolute
   globs: separators and Windows verbatim prefixes are canonicalized, matching
-  is case-insensitive on Windows/macOS, and invalid or relative rules are
-  dropped with a warning at load instead of quarantining the agent.
+  is case-insensitive on Windows/macOS, and short/long Windows path forms are
+  both tried. Invalid or relative rules are dropped with a warning at load
+  instead of quarantining the agent. `routing.repos` matches a normalized
+  `host/owner/repo` git remote; path and repo rules are ANDed when both exist.
+- A workspace can be pinned to an agent explicitly through
+  `PUT /api/workspaces/{id}/agent-binding`. Binding is never created
+  automatically. Precedence is explicit run agent → chat `agentKey` →
+  workspace binding → routing → built-in fallback.
+- The registry is cached by `ConfigStore::revision()` (file mtimes/sizes), so
+  the picker and a run see the same generation without parsing JSON on every
+  request. Every effective agent carries a `definition_hash`; chats store the
+  hash of their last run so a changed agent surfaces as `agent_changed`.
 - Dispatch checks the effective ACL for every non-MCP tool. An unknown scope
   without an explicit ACL exposes nothing, not the full inventory.
 
@@ -164,13 +174,18 @@ transparently repaired into an implicit one-call program and returns a
 Code Mode programs across a server restart: a running script becomes
 `Interrupted by server restart.` and the server delivers that notice once at
 boot. Its durable row is deleted only after the notice is queued, so a crash
-before delivery produces it again instead of losing it. The worker is shared by every session in a harness, so each `execute`
+before delivery produces it again instead of losing it. Workers are scoped per
+chat (idle managers are reaped, and a process cap falls back to the
+least-recently-used worker), so a synchronous program in one conversation
+cannot block or kill another. Each `execute`
 carries its own inventory key; the sidecar caches runtimes per inventory
 (OpenCode's `WeakMap<Inventory, Runtime>` equivalent) instead of letting the
 last `initialize` decide what a concurrent session sees. Because that sidecar
 outlives sessions, it retains the four most recent inventories rather than an
 unbounded set of language runtimes; this is transport-internal and never
-model-visible. A delivered
+model-visible. Production prefers a standalone `codemode-worker` binary built
+with `bun build --compile`; Bun + source is the development fallback. The
+server reports availability/runtime in `/api/health`. A delivered
 background job is removed from memory and disk; no additional age or row cap
 is applied. Like OpenCode, a script that stops yielding is not killed by the
 two-minute foreground block; it only moves to the background. Stop is still
@@ -263,7 +278,9 @@ harness level). The catalog is injected into the prompt; the model loads a
 skill with the `skill` tool. Agent configuration can restrict the visible
 catalog. Workspace skills are trusted instructions from the repository;
 symlinked skill directories and `SKILL.md` files are ignored in every root so
-a cloned repo cannot point at an arbitrary host file.
+a cloned repo cannot point at an arbitrary host file. An agent may pin a skill
+to the SHA-256 of its `SKILL.md`; a changed pinned skill is refused at
+dispatch. The preview API returns each resolved skill's source and hash.
 
 ### MCP
 
@@ -297,6 +314,12 @@ The harness root holds:
 Rollout ordinals are the durable cursor for the run log. Database snapshots,
 backups, and retention are handled by `stark-store` and `stark-tools`.
 
+Security/operations events also land in the `audit_events` table: route
+decisions, ACL and skill denials, skill loads, worker kills, and agent
+create/delete/reset. Audit rows carry keys, hashes, and reasons only — never
+prompt text or file contents. `GET /api/audit` exposes a bounded, filterable
+view, and rows older than 90 days are pruned at store open.
+
 ## Security and execution
 
 - `stark-policy` decides which commands and tools require approval.
@@ -322,6 +345,10 @@ tasks, not part of the Stark application stack.
 
 - `desktop-rune/packaging/` builds the portable, versioned Rune install and
   the updater payload.
+- The Code Mode worker is built with `bun run build` into a standalone
+  `codemode-worker` binary (`backend-rs/codemode-worker/dist/`). The server
+  discovers it next to itself, under `resources/`, or via
+  `STARK_CODEMODE_WORKER_BIN`; dev checkouts fall back to Bun + source.
 - `stark-launcher` owns `current.json`, `pending.json`, `blocked.json`, server
   lifecycle, and rollback. It is a Windows GUI-subsystem binary; the launcher,
   UI and bundled server embed the Stark icon, and the UI plus shortcuts share

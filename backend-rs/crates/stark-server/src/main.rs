@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -367,6 +367,8 @@ impl RunManager {
     }
 }
 
+type RegistryCache = Arc<Mutex<Option<(u64, Arc<AgentRegistry>)>>>;
+
 #[derive(Clone)]
 struct ServerState {
     store: ChatStore,
@@ -380,6 +382,8 @@ struct ServerState {
     provider_health: Arc<Mutex<HashMap<String, String>>>,
     questions: Arc<QuestionBroker>,
     runs: Arc<RunManager>,
+    /// Registry snapshot keyed by `ConfigStore::revision()`.
+    registry_cache: RegistryCache,
     registry: WorkspaceRegistry,
     pairing: Arc<PairingStore>,
     ui_state_path: PathBuf,
@@ -515,8 +519,51 @@ impl ServerState {
 
 /// Resolve an agent's configuration, falling back to the built-in defaults when
 /// a user-edited agent file is invalid. A broken file must not brick a chat.
-fn agent_registry(state: &ServerState) -> AgentRegistry {
-    AgentRegistry::load(&state.config, &state.harness_root)
+fn agent_registry(state: &ServerState) -> Arc<AgentRegistry> {
+    let revision = state.config.revision();
+    if let Ok(cache) = state.registry_cache.lock()
+        && let Some((cached_revision, registry)) = cache.as_ref()
+        && *cached_revision == revision
+    {
+        return registry.clone();
+    }
+    let registry = Arc::new(AgentRegistry::load(&state.config, &state.harness_root));
+    if let Ok(mut cache) = state.registry_cache.lock() {
+        *cache = Some((revision, registry.clone()));
+    }
+    registry
+}
+
+fn route_agent(
+    registry: &AgentRegistry,
+    kind: &str,
+    workspace: &FsPath,
+    harness_root: &FsPath,
+    warning: &mut Option<String>,
+) -> EffectiveAgent {
+    let decision = registry.route_decision(kind, workspace, harness_root);
+    if let Some(message) = &decision.warning {
+        tracing::warn!(
+            workspace = %workspace.display(),
+            workspace_kind = %kind,
+            "agent routing ambiguity: {message}"
+        );
+        *warning = Some(message.clone());
+    }
+    decision.agent
+}
+
+/// Case-stable key for explicit workspace → agent pins.
+fn workspace_binding_key(path: &FsPath) -> String {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let mut key = path.to_string_lossy().replace('\\', "/");
+    while key.len() > 1 && key.ends_with('/') {
+        key.pop();
+    }
+    if cfg!(windows) {
+        key = key.to_ascii_lowercase();
+    }
+    key
 }
 
 fn effective_for(state: &ServerState, scope: &str, tier: &str) -> Arc<EffectiveAgent> {
@@ -887,6 +934,7 @@ async fn main() -> anyhow::Result<()> {
         provider_health: provider_health.clone(),
         questions: Arc::new(QuestionBroker::new()),
         runs: Arc::new(RunManager::default()),
+        registry_cache: Arc::new(Mutex::new(None)),
         registry: WorkspaceRegistry::new(&harness_root),
         pairing: Arc::new(PairingStore::new(&harness_root)),
         ui_state_path: harness_root.join(".deep_agents").join("ui_state.json"),
@@ -896,6 +944,12 @@ async fn main() -> anyhow::Result<()> {
     let codemode_state = state.clone();
     background.push(tokio::spawn(async move {
         deliver_code_mode_restart_notices(codemode_state).await;
+    }));
+    background.push(tokio::spawn(async {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            stark_tools::WorkerManager::sweep_idle();
+        }
     }));
     let scheduler_state = state.clone();
     let group_runner_state = state.clone();
@@ -953,6 +1007,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/chats/{chat_id}/log", get(chat_log_handler))
         .route("/api/abort", post(abort_handler))
         .route("/api/health", get(health_handler))
+        .route("/api/audit", get(audit_handler))
         .route("/api/state", get(state_handler))
         .route("/api/history", get(history_handler))
         .route("/api/runs/active", get(active_handler))
@@ -1003,6 +1058,12 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/workspaces/{workspace_id}",
             get(workspace_handler).delete(remove_workspace_handler),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/agent-binding",
+            get(workspace_agent_binding_handler)
+                .put(set_workspace_agent_binding_handler)
+                .delete(clear_workspace_agent_binding_handler),
         )
         .route(
             "/api/workspaces/{workspace_id}/files",
@@ -2061,6 +2122,8 @@ struct StartedRun {
     run_id: String,
     after_seq: u64,
     route_warning: Option<String>,
+    agent_hash: String,
+    agent_changed: bool,
 }
 
 enum StartRunError {
@@ -2169,6 +2232,7 @@ Attached files:
         state.harness_root.clone()
     };
     let registry = agent_registry(state);
+    let prior_chat = state.store.get_chat(&chat_id).await.ok().flatten();
     let mut route_warning = None;
     let requested_agent = request.agent.trim();
     let agent = if !requested_agent.is_empty() {
@@ -2181,14 +2245,12 @@ Attached files:
     } else {
         // Persisted chat agent wins over workspace routing, so a custom agent
         // keeps its identity on every follow-up turn.
-        let persisted = match state.store.get_chat(&chat_id).await {
-            Ok(Some(chat)) => chat
-                .get("agentKey")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .filter(|key| !key.trim().is_empty()),
-            _ => None,
-        };
+        let persisted = prior_chat
+            .as_ref()
+            .and_then(|chat| chat.get("agentKey"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|key| !key.trim().is_empty());
         match persisted {
             Some(key) => registry.get(&key).cloned().ok_or_else(|| {
                 StartRunError::Http(
@@ -2201,23 +2263,65 @@ Attached files:
                 )
             })?,
             None => {
-                let decision = registry.route_decision(
-                    &request.workspace_kind,
-                    &workspace,
-                    &state.harness_root,
-                );
-                if let Some(warning) = &decision.warning {
-                    tracing::warn!(
-                        workspace = %workspace.display(),
-                        workspace_kind = %request.workspace_kind,
-                        "agent routing ambiguity: {warning}"
-                    );
-                    route_warning = Some(warning.clone());
+                let binding_key = workspace_binding_key(&workspace);
+                let bound = state
+                    .store
+                    .workspace_agent_binding(&binding_key)
+                    .await
+                    .ok()
+                    .flatten();
+                match bound.as_deref().and_then(|key| registry.get(key).cloned()) {
+                    Some(agent) => agent,
+                    None => {
+                        if let Some(key) = bound {
+                            let warning = format!(
+                                "workspace is pinned to agent '{key}', which no longer exists; using routing"
+                            );
+                            tracing::warn!(
+                                workspace = %workspace.display(),
+                                "agent binding is stale: {warning}"
+                            );
+                            route_warning = Some(warning);
+                        }
+                        route_agent(
+                            &registry,
+                            &request.workspace_kind,
+                            &workspace,
+                            &state.harness_root,
+                            &mut route_warning,
+                        )
+                    }
                 }
-                decision.agent
             }
         }
     };
+    let _ = state
+        .store
+        .record_audit(
+            Some(&chat_id),
+            None,
+            "route_decision",
+            Some(&agent.key),
+            Some(&workspace.to_string_lossy()),
+            &json!({
+                "workspace_kind": request.workspace_kind,
+                "explicit": !requested_agent.is_empty(),
+                "builtin": agent.builtin,
+                "route_warning": route_warning,
+            }),
+        )
+        .await;
+    let previous_key = prior_chat
+        .as_ref()
+        .and_then(|chat| chat.get("agentKey"))
+        .and_then(Value::as_str);
+    let previous_hash = prior_chat
+        .as_ref()
+        .and_then(|chat| chat.get("agentHash"))
+        .and_then(Value::as_str)
+        .filter(|hash| !hash.is_empty());
+    let agent_changed = previous_key.is_some_and(|key| key.eq_ignore_ascii_case(&agent.key))
+        && previous_hash.is_some_and(|hash| hash != agent.definition_hash);
     let mut effective = agent.clone();
     let model = if request.model.trim().is_empty() {
         effective.model.clone()
@@ -2407,6 +2511,8 @@ Attached files:
         run_id,
         after_seq,
         route_warning,
+        agent_hash: agent.definition_hash.clone(),
+        agent_changed,
     })
 }
 
@@ -2433,6 +2539,8 @@ async fn run_command_handler(
             "run_id": started.run_id,
             "after_seq": started.after_seq,
             "route_warning": started.route_warning,
+            "agent_hash": started.agent_hash,
+            "agent_changed": started.agent_changed,
         })),
     ))
 }
@@ -3082,6 +3190,10 @@ fn rollout_event(line: &stark_store::rollout::RolloutLine) -> (&'static str, Str
         RolloutItem::EventMsg { payload } => match payload {
             EventMsgPayload::Error { message, .. } => ("error", json!({"message": message}).to_string()),
             EventMsgPayload::Warning { message } => ("warning", json!({"message": message}).to_string()),
+            EventMsgPayload::AgentContext { agent_key, agent_hash } => (
+                "agent_context",
+                json!({"agent_key": agent_key, "agent_hash": agent_hash}).to_string(),
+            ),
             EventMsgPayload::TurnStarted { turn_id, .. } => ("turn_started", json!({"turn_id": turn_id}).to_string()),
             EventMsgPayload::TurnComplete { turn_id, error, last_agent_message, .. } => (
                 "turn_complete",
@@ -3457,7 +3569,12 @@ async fn abort_handler(
     Json(json!({"ok": top || child}))
 }
 
-async fn health_handler() -> Json<Value> {
+async fn health_handler(State(state): State<ServerState>) -> Json<Value> {
+    let audit = state
+        .store
+        .audit_counts()
+        .await
+        .unwrap_or_else(|_| json!({}));
     Json(json!({
         "ok": true,
         "code_version": "stark-rs-0.1",
@@ -3467,7 +3584,55 @@ async fn health_handler() -> Json<Value> {
         "build": std::env::var("STARK_BUILD_SHA").unwrap_or_default(),
         "origin": server_origin(),
         "cap": concurrent_cap(),
+        "code_mode": stark_tools::code_mode_runtime_status(&state.harness_root),
+        "audit": audit,
     }))
+}
+
+#[derive(Debug, Deserialize)]
+struct AuditQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    chat_id: Option<String>,
+    #[serde(default)]
+    since: Option<String>,
+}
+
+async fn audit_handler(
+    State(state): State<ServerState>,
+    Query(query): Query<AuditQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let events = state
+        .store
+        .list_audit(
+            query.limit.unwrap_or(200),
+            query
+                .kind
+                .as_deref()
+                .map(str::trim)
+                .filter(|kind| !kind.is_empty()),
+            query
+                .chat_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|chat| !chat.is_empty()),
+            query
+                .since
+                .as_deref()
+                .map(str::trim)
+                .filter(|since| !since.is_empty()),
+        )
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error.to_string()})),
+            )
+        })?;
+    Ok(Json(json!({"events": events})))
 }
 
 /// Which machine this server is: "local" by default, "vps" when
@@ -4883,6 +5048,10 @@ async fn agents_config_handler(State(state): State<ServerState>) -> Json<Value> 
             "custom_agents": true,
             "custom_code_mode": true,
             "custom_routing": true,
+            "routing_repos": true,
+            "skill_pins": true,
+            "agent_binding": true,
+            "audit": true,
             "schema_version": 2,
         },
     }))
@@ -4983,6 +5152,20 @@ async fn save_agent_handler(
     warnings.extend(agent_warnings(&registry, &canonical));
     warnings.sort();
     warnings.dedup();
+    let _ = state
+        .store
+        .record_audit(
+            None,
+            None,
+            "agent_saved",
+            Some(&canonical),
+            None,
+            &json!({
+                "builtin": builtin_spec(&canonical).is_some(),
+                "definition_hash": effective.as_ref().map(|agent| agent.definition_hash.as_str()),
+            }),
+        )
+        .await;
     Ok(Json(json!({
         "ok": true,
         "key": canonical,
@@ -5025,6 +5208,24 @@ async fn delete_agent_handler(
     }
     let registry = agent_registry(&state);
     let effective = registry.get(&canonical).cloned();
+    let _ = state
+        .store
+        .record_audit(
+            None,
+            None,
+            if builtin {
+                "agent_reset"
+            } else {
+                "agent_deleted"
+            },
+            Some(&canonical),
+            None,
+            &json!({
+                "builtin": builtin,
+                "definition_hash": effective.as_ref().map(|agent| agent.definition_hash.as_str()),
+            }),
+        )
+        .await;
     Ok(Json(json!({
         "ok": true,
         "key": canonical,
@@ -5120,6 +5321,9 @@ async fn preview_agent_handler(
         mode,
     )
     .await;
+    let skills =
+        stark_tools::catalog_entries(&workspace, &state.harness_root, effective.skills.as_deref())
+            .await;
     let code_mode = effective
         .code_mode
         .as_deref()
@@ -5159,6 +5363,7 @@ async fn preview_agent_handler(
         "effective": effective,
         "system_prompt": system_prompt,
         "prompt_tokens": stark_core::estimate_prompt_tokens(&system_prompt),
+        "skills": skills,
         "tools": {
             "direct": tool_names(&direct),
             "program": tool_names(&program),
@@ -5274,11 +5479,14 @@ async fn duplicate_agent_handler(
         visible: Some(source.ui_visible),
         order: Some(source.ui_order),
     });
-    file.routing = (!source.routing_workspace_kinds.is_empty() || !source.routing_paths.is_empty())
-        .then(|| stark_config::AgentRoutingFile {
-            workspace_kinds: source.routing_workspace_kinds.clone(),
-            paths: source.routing_paths.clone(),
-        });
+    file.routing = (!source.routing_workspace_kinds.is_empty()
+        || !source.routing_paths.is_empty()
+        || !source.routing_repos.is_empty())
+    .then(|| stark_config::AgentRoutingFile {
+        workspace_kinds: source.routing_workspace_kinds.clone(),
+        paths: source.routing_paths.clone(),
+        repos: source.routing_repos.clone(),
+    });
     file.code_mode = Some(if copy_code_mode { "hybrid" } else { "off" }.to_string());
     file.full_codemode = None;
     let check = validate_definition(
@@ -5362,6 +5570,10 @@ async fn agent_catalog_handler(State(state): State<ServerState>) -> Json<Value> 
             "custom_agents": true,
             "custom_code_mode": true,
             "custom_routing": true,
+            "routing_repos": true,
+            "skill_pins": true,
+            "agent_binding": true,
+            "audit": true,
             "duplicate": true,
             "preview": true,
         },
@@ -6672,6 +6884,126 @@ async fn delete_note_handler(
     }
 }
 
+fn workspace_record_or_404(
+    state: &ServerState,
+    workspace_id: &str,
+) -> Result<stark_store::WorkspaceRecord, (StatusCode, Json<Value>)> {
+    state.registry.get(workspace_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("unknown workspace '{workspace_id}'")})),
+        )
+    })
+}
+
+async fn workspace_agent_binding_handler(
+    State(state): State<ServerState>,
+    Path(workspace_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let workspace = workspace_record_or_404(&state, &workspace_id)?;
+    let key = workspace_binding_key(FsPath::new(&workspace.path));
+    let agent_key = state
+        .store
+        .workspace_agent_binding(&key)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error.to_string()})),
+            )
+        })?;
+    Ok(Json(json!({
+        "workspace_id": workspace.id,
+        "workspace_path": workspace.path,
+        "agent_key": agent_key,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentBindingRequest {
+    #[serde(default, alias = "agent")]
+    agent_key: String,
+}
+
+async fn set_workspace_agent_binding_handler(
+    State(state): State<ServerState>,
+    Path(workspace_id): Path<String>,
+    Json(request): Json<AgentBindingRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let workspace = workspace_record_or_404(&state, &workspace_id)?;
+    let registry = agent_registry(&state);
+    let requested = request.agent_key.trim();
+    let Some(canonical) = registry.canonical_key(requested) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("unknown agent '{requested}'")})),
+        ));
+    };
+    let key = workspace_binding_key(FsPath::new(&workspace.path));
+    state
+        .store
+        .set_workspace_agent_binding(&key, &canonical)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error.to_string()})),
+            )
+        })?;
+    let _ = state
+        .store
+        .record_audit(
+            None,
+            None,
+            "agent_binding_set",
+            Some(&canonical),
+            Some(&workspace.path),
+            &json!({"workspace_id": workspace.id}),
+        )
+        .await;
+    Ok(Json(json!({
+        "ok": true,
+        "workspace_id": workspace.id,
+        "workspace_path": workspace.path,
+        "agent_key": canonical,
+    })))
+}
+
+async fn clear_workspace_agent_binding_handler(
+    State(state): State<ServerState>,
+    Path(workspace_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let workspace = workspace_record_or_404(&state, &workspace_id)?;
+    let key = workspace_binding_key(FsPath::new(&workspace.path));
+    state
+        .store
+        .clear_workspace_agent_binding(&key)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error.to_string()})),
+            )
+        })?;
+    let _ = state
+        .store
+        .record_audit(
+            None,
+            None,
+            "agent_binding_cleared",
+            None,
+            Some(&workspace.path),
+            &json!({"workspace_id": workspace.id}),
+        )
+        .await;
+    Ok(Json(json!({
+        "ok": true,
+        "workspace_id": workspace.id,
+        "workspace_path": workspace.path,
+        "agent_key": null,
+    })))
+}
+
 async fn workspace_handler(
     State(state): State<ServerState>,
     Path(workspace_id): Path<String>,
@@ -7925,6 +8257,7 @@ mod tests {
             provider_health: Arc::new(Mutex::new(HashMap::new())),
             questions: Arc::new(QuestionBroker::new()),
             runs: Arc::new(RunManager::default()),
+            registry_cache: Arc::new(Mutex::new(None)),
             registry: WorkspaceRegistry::new(root),
             pairing: Arc::new(PairingStore::new(root)),
             ui_state_path: root.join(".deep_agents").join("ui_state.json"),
@@ -8359,6 +8692,7 @@ mod tests {
             provider_health: Arc::new(Mutex::new(HashMap::new())),
             questions: Arc::new(QuestionBroker::new()),
             runs: Arc::new(RunManager::default()),
+            registry_cache: Arc::new(Mutex::new(None)),
             registry: WorkspaceRegistry::new(dir.path()),
             pairing: Arc::new(PairingStore::new(dir.path())),
             ui_state_path: dir.path().join("ui_state.json"),

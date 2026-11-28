@@ -57,6 +57,9 @@ Schema: [`backend-rs/specs/agent-def.schema.json`](../backend-rs/specs/agent-def
   },
   "tools": ["bash", "read", "apply_patch", "edit", "glob", "grep", "update_plan"],
   "skills": ["supabase"],
+  "skill_hashes": {
+    "supabase": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  },
   "mcp": ["github"],
   "delegation": {
     "delegatable": true,
@@ -66,7 +69,8 @@ Schema: [`backend-rs/specs/agent-def.schema.json`](../backend-rs/specs/agent-def
   "ui": { "visible": true, "order": 25 },
   "routing": {
     "workspace_kinds": ["coding"],
-    "paths": ["D:/work/backend/**"]
+    "paths": ["D:/work/backend/**"],
+    "repos": ["github.com/acme/backend"]
   },
   "code_mode": "off"
 }
@@ -101,6 +105,18 @@ Notes:
   separators are ignored, and matching is case-insensitive on Windows and
   macOS. Empty or relative globs fail save validation; on load they are
   dropped with a warning instead of quarantining the agent.
+- `routing.repos` matches the workspace's `remote.origin.url` as
+  `host/owner/repo`. HTTPS, SSH, and `git@host:owner/repo` forms are
+  normalized. If both `paths` and `repos` are present, both must match.
+- A workspace can be pinned explicitly through
+  `PUT /api/workspaces/{id}/agent-binding`. Binding precedence is: explicit
+  run agent → chat `agentKey` → workspace binding → routing → built-in
+  fallback. Routing never creates a binding on its own.
+- `skill_hashes` optionally pins a skill name to the SHA-256 of its
+  `SKILL.md` bytes. A changed pinned skill is refused at dispatch. The
+  preview response includes each resolved skill's `source` and `sha256`.
+- Every run response includes `agent_hash`; `agent_changed` is true when the
+  chat was already using that agent key but its definition hash changed.
 
 ## Endpoints
 
@@ -116,6 +132,10 @@ Returns the builder's pick lists and capability flags:
     "custom_agents": true,
     "custom_code_mode": true,
     "custom_routing": true,
+    "routing_repos": true,
+    "skill_pins": true,
+    "agent_binding": true,
+    "audit": true,
     "duplicate": true,
     "preview": true
   },
@@ -170,7 +190,15 @@ Lists built-ins and custom agents. Invalid custom files are listed with
     }
   }],
   "issues": [],
-  "capabilities": { "custom_agents": true, "custom_code_mode": true, "custom_routing": true }
+  "capabilities": {
+    "custom_agents": true,
+    "custom_code_mode": true,
+    "custom_routing": true,
+    "routing_repos": true,
+    "skill_pins": true,
+    "agent_binding": true,
+    "audit": true
+  }
 }
 ```
 
@@ -239,6 +267,12 @@ The response is the exact runtime view:
   "effective": {},
   "system_prompt": "You are ...",
   "prompt_tokens": 1234,
+  "skills": [{
+    "name": "review",
+    "description": "Review code.",
+    "source": "D:/project/.agents/skills",
+    "sha256": "0123..."
+  }],
   "tools": {
     "direct": ["read", "grep"],
     "program": [],
@@ -279,11 +313,77 @@ Existing request plus optional `agent` (alias: `agent_key`):
 }
 ```
 
-If `agent` is omitted, the registry routes by workspace kind/path **unless**
-the chat already has an `agentKey`; the persisted agent wins. The resolved key
-is stored on the chat and returned as `agentKey` by chat reads. An ambiguous
-custom routing match falls back to the built-in heuristic and returns
-`route_warning` in the run acceptance response.
+If `agent` is omitted, precedence is: chat `agentKey` → explicit workspace
+binding → custom routing → built-in heuristic. The resolved key is stored on
+the chat and returned as `agentKey` by chat reads. An ambiguous custom routing
+match falls back to the built-in heuristic and returns `route_warning`.
+
+Acceptance response:
+
+```json
+{
+  "accepted": true,
+  "chat_id": "...",
+  "run_id": "...",
+  "after_seq": 0,
+  "route_warning": null,
+  "agent_hash": "sha256...",
+  "agent_changed": false
+}
+```
+
+`agent_changed` is true when the chat was already using the same agent key but
+the agent definition changed since the last run.
+
+### Workspace agent binding
+
+`GET /api/workspaces/{id}/agent-binding`
+
+```json
+{ "workspace_id": "ws-...", "workspace_path": "D:/project", "agent_key": null }
+```
+
+`PUT` with `{ "agent_key": "backend" }` pins the workspace. `DELETE` clears
+it. This is explicit user intent; routing does not write bindings.
+
+### `GET /api/audit`
+
+Optional query: `limit`, `kind`, `chat_id`, `since` (ISO timestamp). Returns
+model-invisible audit events:
+
+```json
+{
+  "events": [{
+    "ts": "2026-11-28T12:00:00.000Z",
+    "chat_id": "...",
+    "run_id": null,
+    "kind": "route_decision",
+    "subject": "backend",
+    "workspace_path": "D:/project",
+    "detail": { "workspace_kind": "coding", "route_warning": null }
+  }]
+}
+```
+
+Event kinds include `route_decision`, `acl_denied`, `skill_loaded`,
+`skill_denied`, `worker_kill`, `agent_saved`, `agent_deleted`,
+`agent_reset`, `agent_binding_set`, and `agent_binding_cleared`. Prompt text
+and file contents are never stored.
+
+### `GET /api/health`
+
+Includes Code Mode availability:
+
+```json
+{
+  "ok": true,
+  "code_mode": { "available": true, "kind": "binary" },
+  "audit": { "route_decision": 4, "acl_denied": 1 }
+}
+```
+
+`kind` is `binary` for the packaged worker, `source` for the dev Bun fallback,
+and `missing` with an error when neither is available.
 
 ## Errors
 

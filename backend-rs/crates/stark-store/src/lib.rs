@@ -311,6 +311,48 @@ impl ChatStore {
         // The resolved agent key, so a custom agent survives every follow-up
         // turn instead of being re-derived from the workspace path.
         migrate::ensure_column(&self.pool, "chats", "agent_key", "TEXT").await?;
+        // Hash of the agent definition used for the last run. A later run with
+        // the same key but a different hash reports `agent_changed`.
+        migrate::ensure_column(&self.pool, "chats", "agent_hash", "TEXT").await?;
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS workspace_agent_bindings (
+                workspace_path TEXT PRIMARY KEY,
+                agent_key TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS audit_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                chat_id TEXT,
+                run_id TEXT,
+                kind TEXT NOT NULL,
+                subject TEXT,
+                workspace_path TEXT,
+                detail_json TEXT
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_events(ts)")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_kind ON audit_events(kind)")
+            .execute(&self.pool)
+            .await?;
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(90))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        sqlx::query("DELETE FROM audit_events WHERE ts < ?")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await?;
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS messages (
@@ -623,14 +665,190 @@ impl ChatStore {
     /// Persist the canonical agent key for a chat. Follow-up turns read this
     /// instead of re-deriving an agent from the workspace path.
     pub async fn set_chat_agent(&self, chat_id: &str, agent_key: &str) -> Result<(), StoreError> {
+        self.set_chat_agent_with_hash(chat_id, agent_key, None)
+            .await
+    }
+
+    pub async fn set_chat_agent_with_hash(
+        &self,
+        chat_id: &str,
+        agent_key: &str,
+        agent_hash: Option<&str>,
+    ) -> Result<(), StoreError> {
         validate_chat_id(chat_id)?;
-        sqlx::query("UPDATE chats SET agent_key = ?, updated_at = ? WHERE id = ?")
+        sqlx::query("UPDATE chats SET agent_key = ?, agent_hash = ?, updated_at = ? WHERE id = ?")
             .bind(agent_key.trim().to_ascii_lowercase())
+            .bind(agent_hash.map(str::trim).filter(|hash| !hash.is_empty()))
             .bind(now_iso())
             .bind(chat_id)
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    pub async fn chat_agent_hash(&self, chat_id: &str) -> Result<Option<String>, StoreError> {
+        validate_chat_id(chat_id)?;
+        let hash: Option<String> = sqlx::query_scalar("SELECT agent_hash FROM chats WHERE id = ?")
+            .bind(chat_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .flatten();
+        Ok(hash.filter(|hash| !hash.trim().is_empty()))
+    }
+
+    /// Explicit workspace → agent pin. Only written by the user-facing API;
+    /// routing never persists a binding on its own.
+    pub async fn set_workspace_agent_binding(
+        &self,
+        workspace_path: &str,
+        agent_key: &str,
+    ) -> Result<(), StoreError> {
+        let workspace_path = workspace_path.trim();
+        let agent_key = agent_key.trim().to_ascii_lowercase();
+        if workspace_path.is_empty() || agent_key.is_empty() {
+            return Err(StoreError::Invalid(
+                "workspace path and agent key are required".to_string(),
+            ));
+        }
+        sqlx::query(
+            "INSERT INTO workspace_agent_bindings (workspace_path, agent_key, updated_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT(workspace_path) DO UPDATE SET
+               agent_key = excluded.agent_key,
+               updated_at = excluded.updated_at",
+        )
+        .bind(workspace_path)
+        .bind(&agent_key)
+        .bind(now_iso())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn clear_workspace_agent_binding(
+        &self,
+        workspace_path: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM workspace_agent_bindings WHERE workspace_path = ?")
+            .bind(workspace_path.trim())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn workspace_agent_binding(
+        &self,
+        workspace_path: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let key: Option<String> = sqlx::query_scalar(
+            "SELECT agent_key FROM workspace_agent_bindings WHERE workspace_path = ?",
+        )
+        .bind(workspace_path.trim())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(key.filter(|key| !key.trim().is_empty()))
+    }
+
+    /// Append a security/operations audit event. Callers treat this as
+    /// best-effort; audit failures never block a run.
+    pub async fn record_audit(
+        &self,
+        chat_id: Option<&str>,
+        run_id: Option<&str>,
+        kind: &str,
+        subject: Option<&str>,
+        workspace_path: Option<&str>,
+        detail: &Value,
+    ) -> Result<(), StoreError> {
+        let kind = kind.trim();
+        if kind.is_empty() {
+            return Err(StoreError::Invalid("audit kind is required".to_string()));
+        }
+        sqlx::query(
+            "INSERT INTO audit_events
+             (ts, chat_id, run_id, kind, subject, workspace_path, detail_json)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(now_iso())
+        .bind(chat_id)
+        .bind(run_id)
+        .bind(kind)
+        .bind(subject)
+        .bind(workspace_path)
+        .bind(serde_json::to_string(detail).unwrap_or_else(|_| "null".to_string()))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn audit_counts(&self) -> Result<Value, StoreError> {
+        let rows = sqlx::query("SELECT kind, COUNT(*) AS n FROM audit_events GROUP BY kind")
+            .fetch_all(&self.pool)
+            .await?;
+        let mut counts = serde_json::Map::new();
+        for row in rows {
+            let kind: String = row.try_get("kind")?;
+            let count: i64 = row.try_get("n")?;
+            counts.insert(kind, json!(count));
+        }
+        Ok(Value::Object(counts))
+    }
+
+    pub async fn list_audit(
+        &self,
+        limit: usize,
+        kind: Option<&str>,
+        chat_id: Option<&str>,
+        since: Option<&str>,
+    ) -> Result<Vec<Value>, StoreError> {
+        let mut sql = String::from(
+            "SELECT ts, chat_id, run_id, kind, subject, workspace_path, detail_json
+             FROM audit_events WHERE 1 = 1",
+        );
+        if kind.is_some() {
+            sql.push_str(" AND kind = ?");
+        }
+        if chat_id.is_some() {
+            sql.push_str(" AND chat_id = ?");
+        }
+        if since.is_some() {
+            sql.push_str(" AND ts >= ?");
+        }
+        sql.push_str(" ORDER BY id DESC LIMIT ?");
+        // Only fixed clauses and `?` placeholders are appended; values are
+        // bound, never interpolated.
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+        if let Some(kind) = kind {
+            query = query.bind(kind);
+        }
+        if let Some(chat_id) = chat_id {
+            query = query.bind(chat_id);
+        }
+        if let Some(since) = since {
+            query = query.bind(since);
+        }
+        query = query.bind(limit.clamp(1, 1_000) as i64);
+        let rows = query.fetch_all(&self.pool).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let detail = row
+                    .try_get::<Option<String>, _>("detail_json")
+                    .ok()
+                    .flatten()
+                    .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                    .unwrap_or(Value::Null);
+                json!({
+                    "ts": row.try_get::<String, _>("ts").ok(),
+                    "chat_id": row.try_get::<Option<String>, _>("chat_id").ok().flatten(),
+                    "run_id": row.try_get::<Option<String>, _>("run_id").ok().flatten(),
+                    "kind": row.try_get::<String, _>("kind").ok(),
+                    "subject": row.try_get::<Option<String>, _>("subject").ok().flatten(),
+                    "workspace_path": row.try_get::<Option<String>, _>("workspace_path").ok().flatten(),
+                    "detail": detail,
+                })
+            })
+            .collect())
     }
 
     pub async fn append_message(
@@ -1291,7 +1509,7 @@ impl ChatStore {
     pub async fn get_chat(&self, chat_id: &str) -> Result<Option<Value>, StoreError> {
         validate_chat_id(chat_id)?;
         let row = sqlx::query(
-            "SELECT id, workspace_id, workspace_path, title, model, created_at, updated_at, pinned, token_usage_json, parent_chat_id, parent_workspace_id, agent_key FROM chats WHERE id = ?",
+            "SELECT id, workspace_id, workspace_path, title, model, created_at, updated_at, pinned, token_usage_json, parent_chat_id, parent_workspace_id, agent_key, agent_hash FROM chats WHERE id = ?",
         )
         .bind(chat_id)
         .fetch_optional(&self.pool)
@@ -1377,6 +1595,14 @@ impl ChatStore {
             .filter(|key| !key.trim().is_empty())
         {
             chat["agentKey"] = Value::String(agent_key);
+        }
+        if let Some(agent_hash) = row
+            .try_get::<Option<String>, _>("agent_hash")
+            .ok()
+            .flatten()
+            .filter(|hash| !hash.trim().is_empty())
+        {
+            chat["agentHash"] = Value::String(agent_hash);
         }
         if let Some(raw) = row
             .try_get::<Option<String>, _>("token_usage_json")
@@ -2227,8 +2453,97 @@ mod tests {
         store.set_chat_agent(chat_id, "backend").await.unwrap();
         let loaded = store.get_chat(chat_id).await.unwrap().unwrap();
         assert_eq!(loaded["agentKey"], "backend");
+        store
+            .set_chat_agent_with_hash(chat_id, "backend", Some("sha256:test"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.chat_agent_hash(chat_id).await.unwrap().as_deref(),
+            Some("sha256:test")
+        );
+        let loaded = store.get_chat(chat_id).await.unwrap().unwrap();
+        assert_eq!(loaded["agentHash"], "sha256:test");
         assert!(store.delete_chat(chat_id).await.unwrap());
         assert!(store.list_chats(&record.id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn workspace_agent_binding_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        assert!(
+            store
+                .workspace_agent_binding("C:/work")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        store
+            .set_workspace_agent_binding("C:/work", "Backend")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .workspace_agent_binding("C:/work")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("backend")
+        );
+        store
+            .clear_workspace_agent_binding("C:/work")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .workspace_agent_binding("C:/work")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_events_round_trip_and_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        store
+            .record_audit(
+                Some("chat-a"),
+                Some("run-1"),
+                "acl_denied",
+                Some("bash"),
+                Some("C:/work"),
+                &json!({"reason": "read_only"}),
+            )
+            .await
+            .unwrap();
+        store
+            .record_audit(
+                Some("chat-b"),
+                None,
+                "route_decision",
+                Some("backend"),
+                None,
+                &json!({"workspace_kind": "coding"}),
+            )
+            .await
+            .unwrap();
+        let all = store.list_audit(20, None, None, None).await.unwrap();
+        assert_eq!(all.len(), 2);
+        let denied = store
+            .list_audit(20, Some("acl_denied"), None, None)
+            .await
+            .unwrap();
+        assert_eq!(denied.len(), 1);
+        assert_eq!(denied[0]["subject"], "bash");
+        assert_eq!(denied[0]["detail"]["reason"], "read_only");
+        let chat = store
+            .list_audit(20, None, Some("chat-b"), None)
+            .await
+            .unwrap();
+        assert_eq!(chat.len(), 1);
+        assert_eq!(chat[0]["kind"], "route_decision");
     }
 
     #[tokio::test]

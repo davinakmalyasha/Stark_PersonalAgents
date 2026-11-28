@@ -13,7 +13,11 @@ on:
 
 jobs:
   rust:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     defaults:
       run:
         working-directory: backend-rs
@@ -38,6 +42,9 @@ jobs:
       - name: Test Code Mode worker
         working-directory: backend-rs/codemode-worker
         run: bun test
+      - name: Build standalone Code Mode worker
+        working-directory: backend-rs/codemode-worker
+        run: bun run build
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace

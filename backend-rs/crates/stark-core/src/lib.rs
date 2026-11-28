@@ -635,7 +635,15 @@ async fn run_agent_inner(
         .await?;
     // Snapshot the resolved agent on the chat so follow-up turns and the
     // picker keep the custom agent instead of re-deriving Developer/General.
-    ctx.store.set_chat_agent(&ctx.chat_id, &ctx.scope).await?;
+    // The definition hash lets the next run detect that the agent changed.
+    let agent_hash = ctx
+        .config
+        .as_ref()
+        .map(|agent| agent.definition_hash.as_str())
+        .filter(|hash| !hash.is_empty());
+    ctx.store
+        .set_chat_agent_with_hash(&ctx.chat_id, &ctx.scope, agent_hash)
+        .await?;
 
     // Canonical trace: one rollout file per chat. Open (or resume) first so
     // every subsequent event is recorded, even when the provider fails.
@@ -730,6 +738,18 @@ async fn run_agent_inner(
     if let Some(writer) = rollout.as_mut() {
         rollout_trace::record_turn_started(&ctx.store, writer, &ctx.chat_id, &turn_id, &ctx.model)
             .await;
+        if let Some(agent) = ctx.config.as_ref()
+            && !agent.definition_hash.is_empty()
+        {
+            rollout_trace::record_agent_context(
+                &ctx.store,
+                writer,
+                &ctx.chat_id,
+                &ctx.scope,
+                &agent.definition_hash,
+            )
+            .await;
+        }
     }
     let plan_store = PlanStore::new(ctx.store.harness_root().to_path_buf());
     let mode = ctx
@@ -860,6 +880,31 @@ async fn run_agent_inner(
     ctx.emit_state(&mut state);
 
     let agent_label = ctx.agent_label();
+    let audit_store = ctx.store.clone();
+    let audit_chat = ctx.chat_id.clone();
+    let audit_workspace = ctx.workspace.to_string_lossy().to_string();
+    let audit_hook: stark_tools::AuditHook = Arc::new(move |kind, subject, detail| {
+        let store = audit_store.clone();
+        let chat = audit_chat.clone();
+        let workspace = audit_workspace.clone();
+        let kind = kind.to_string();
+        let subject = subject.to_string();
+        tokio::spawn(async move {
+            if let Err(error) = store
+                .record_audit(
+                    Some(&chat),
+                    None,
+                    &kind,
+                    Some(&subject),
+                    Some(&workspace),
+                    &detail,
+                )
+                .await
+            {
+                tracing::warn!("audit write failed: {error}");
+            }
+        });
+    });
     let mut tools = ToolContext::new(
         ctx.workspace.clone(),
         ctx.chat_id.clone(),
@@ -872,7 +917,7 @@ async fn run_agent_inner(
     .with_worker_manager(if cfg!(test) {
         stark_tools::WorkerManager::local(ctx.store.harness_root())
     } else {
-        stark_tools::WorkerManager::for_root(ctx.store.harness_root())
+        stark_tools::WorkerManager::for_chat(ctx.store.harness_root(), &ctx.chat_id)
     })
     .with_workspace_id(ctx.workspace_id.clone())
     .with_scope(ctx.scope.clone())
@@ -883,7 +928,14 @@ async fn run_agent_inner(
     .with_depth(ctx.depth)
     .with_allowed_tools(ctx.config.as_ref().and_then(|config| config.tools.clone()))
     .with_allowed_skills(ctx.config.as_ref().and_then(|config| config.skills.clone()))
+    .with_allowed_skill_hashes(
+        ctx.config
+            .as_ref()
+            .map(|config| config.skill_hashes.clone())
+            .filter(|hashes| !hashes.is_empty()),
+    )
     .with_mcp_servers(ctx.config.as_ref().and_then(|config| config.mcp.clone()))
+    .with_audit_hook(Some(audit_hook))
     .with_cancel(ctx.cancel.clone());
     if let Some(checkpoint) = &ctx.checkpoint {
         tools = tools.with_checkpoint(checkpoint.clone());

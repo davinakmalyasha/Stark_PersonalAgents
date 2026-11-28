@@ -30,8 +30,7 @@ mod skills;
 mod truncate;
 mod verify;
 
-use std::collections::BTreeMap;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -41,7 +40,7 @@ use tokio_util::sync::CancellationToken;
 
 pub use approvals::ApprovalCache;
 pub use checkpoint::{Checkpoint, RestoreReport, SnapshotGroup};
-pub use codemode::worker::WorkerManager;
+pub use codemode::worker::{WorkerManager, runtime_status as code_mode_runtime_status};
 pub use codemode::{
     execute_description as code_mode_execute_description,
     instructions::Rendered as CodeModeInstructions,
@@ -87,7 +86,9 @@ pub use retention::{RetentionPolicy, RetentionReport, free_bytes, sweep_harness}
 pub use screen::{
     PendingImage, ScreenBridge, drain_images, latest_continuous_image, queue_image, screen_bridge,
 };
-pub use skills::{catalog_block_for, catalog_block_for_agent, skill_names};
+pub use skills::{
+    SkillEntry, catalog_block_for, catalog_block_for_agent, catalog_entries, skill_names,
+};
 pub use verify::{AcceptanceVerdict, CriterionStatus, CriterionVerdict, evaluate_acceptance};
 
 /// Tool membership and guard flags live in [`inventory`]: one `ToolMeta`
@@ -166,6 +167,7 @@ pub fn default_code_mode(scope: &str) -> CodeMode {
 /// (`<background-result kind="codemode" ...>`). Stark-core wires the run's
 /// `on_job_done` hook here; the worker never blocks on it.
 pub type BackgroundHook = Arc<dyn Fn(String) + Send + Sync>;
+pub type AuditHook = Arc<dyn Fn(&str, &str, serde_json::Value) + Send + Sync>;
 
 /// Whether the frozen contract for this scope exposes `execute`. Guards
 /// against an agent config enabling Code Mode on a scope that has no program
@@ -232,10 +234,15 @@ pub struct ToolContext {
     /// Optional per-agent skill allowlist. `None` means every discovered
     /// skill; `Some(empty)` disables skill loading even if the tool is listed.
     pub allowed_skills: Option<Arc<HashSet<String>>>,
+    /// Optional pinned SHA-256 per skill name.
+    pub allowed_skill_hashes: Option<Arc<HashMap<String, String>>>,
     /// Optional per-agent MCP server allowlist (`["github"]`). Tool names are
     /// shaped `mcp__<server>__<tool>`.
     pub mcp_servers: Option<Arc<HashSet<String>>>,
     pub code_delta: Option<Arc<dyn Fn(stark_contract::Delta) + Send + Sync>>,
+    /// Durable, model-invisible security audit sink. Best-effort: a sink
+    /// failure must never block a tool.
+    pub audit_hook: Option<AuditHook>,
     /// Shared Code Mode worker manager for this harness. Production runs set
     /// this in `stark-core`; tests and one-shot contexts leave it `None` and
     /// get a disposable worker (killed on drop).
@@ -279,8 +286,10 @@ impl ToolContext {
             active_mcp: Arc::new(Mutex::new(HashSet::new())),
             allowed_tools: None,
             allowed_skills: None,
+            allowed_skill_hashes: None,
             mcp_servers: None,
             code_delta: None,
+            audit_hook: None,
             worker_manager: None,
             background_hook: None,
             cancel: CancellationToken::new(),
@@ -370,6 +379,37 @@ impl ToolContext {
             )
         });
         self
+    }
+
+    pub fn with_allowed_skill_hashes(mut self, hashes: Option<BTreeMap<String, String>>) -> Self {
+        self.allowed_skill_hashes = hashes.map(|hashes| {
+            Arc::new(
+                hashes
+                    .into_iter()
+                    .map(|(name, hash)| {
+                        (
+                            name.trim().to_ascii_lowercase(),
+                            hash.trim()
+                                .trim_start_matches("sha256:")
+                                .to_ascii_lowercase(),
+                        )
+                    })
+                    .filter(|(name, hash)| !name.is_empty() && !hash.is_empty())
+                    .collect(),
+            )
+        });
+        self
+    }
+
+    pub fn with_audit_hook(mut self, hook: Option<AuditHook>) -> Self {
+        self.audit_hook = hook;
+        self
+    }
+
+    pub fn audit_event(&self, kind: &str, subject: &str, detail: serde_json::Value) {
+        if let Some(hook) = &self.audit_hook {
+            hook(kind, subject, detail);
+        }
     }
 
     pub fn with_mcp_servers(mut self, servers: Option<Vec<String>>) -> Self {
@@ -1396,6 +1436,11 @@ async fn repair_direct_program_call(name: &str, args: &Value, ctx: &ToolContext)
 
 pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcome {
     if !ctx.tool_allowed(name) {
+        ctx.audit_event(
+            "acl_denied",
+            name,
+            json!({"reason": "agent_tool_list", "scope": ctx.scope}),
+        );
         return ToolOutcome::err_class(
             ToolErrorClass::Blocked,
             format!(
@@ -1435,6 +1480,11 @@ pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcom
                 // hallucination, not a policy denial: say so, and list what
                 // exists.
                 if contract().tool(name).is_none() {
+                    ctx.audit_event(
+                        "acl_denied",
+                        name,
+                        json!({"reason": "unknown_tool", "scope": ctx.scope}),
+                    );
                     return ToolOutcome::err_class(
                         ToolErrorClass::Unknown,
                         format!(
@@ -1443,6 +1493,11 @@ pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcom
                         ),
                     );
                 }
+                ctx.audit_event(
+                    "acl_denied",
+                    name,
+                    json!({"reason": "scope_contract", "scope": ctx.scope}),
+                );
                 return ToolOutcome::err_class(
                     ToolErrorClass::Blocked,
                     format!(
@@ -1521,11 +1576,21 @@ pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcom
         }
     }
     if let Some(reason) = plan_mode_denial(&ctx.mode, name, args) {
+        ctx.audit_event(
+            "acl_denied",
+            name,
+            json!({"reason": "plan_mode", "scope": ctx.scope}),
+        );
         return ToolOutcome::err_class(ToolErrorClass::Blocked, reason);
     }
     if ctx.access == "read"
         && let Some(reason) = read_only_denial(name, args, ctx)
     {
+        ctx.audit_event(
+            "acl_denied",
+            name,
+            json!({"reason": "read_only", "scope": ctx.scope}),
+        );
         return ToolOutcome::err_class(ToolErrorClass::Blocked, reason);
     }
     if name == "execute" {
@@ -1536,6 +1601,11 @@ pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcom
             );
         }
         if !ctx.code_mode.enabled() {
+            ctx.audit_event(
+                "acl_denied",
+                name,
+                json!({"reason": "code_mode_disabled", "scope": ctx.scope}),
+            );
             return ToolOutcome::err_class(
                 ToolErrorClass::Blocked,
                 "[BLOCKED] Code Mode is disabled for this agent. Call tools directly.",
@@ -1562,6 +1632,11 @@ pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcom
     }
     if name.starts_with("mcp__") {
         if ctx.access == "read" {
+            ctx.audit_event(
+                "acl_denied",
+                name,
+                json!({"reason": "read_only_mcp", "scope": ctx.scope}),
+            );
             return ToolOutcome::err_class(
                 ToolErrorClass::Blocked,
                 "[BLOCKED] Read-only agent cannot call MCP tools. Report findings instead.",
@@ -2860,6 +2935,52 @@ mod code_mode_policy_tests {
             "the other inventory's initialize must not change this call: {}",
             result.text
         );
+    }
+
+    #[tokio::test]
+    async fn code_mode_workers_are_isolated_per_chat() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager_a = crate::WorkerManager::for_chat(dir.path(), "chat-a");
+        let manager_b = crate::WorkerManager::for_chat(dir.path(), "chat-b");
+        let cleanup_a = manager_a.clone();
+        let cleanup_b = manager_b.clone();
+        assert!(!Arc::ptr_eq(&manager_a, &manager_b));
+        assert!(Arc::ptr_eq(
+            &manager_a,
+            &crate::WorkerManager::for_chat(dir.path(), "chat-a")
+        ));
+
+        let ctx_a = coding(dir.path()).with_worker_manager(manager_a);
+        let cancel = ctx_a.cancel.clone();
+        let blocking = tokio::spawn(async move {
+            dispatch(
+                "execute",
+                &json!({"code": "for (;;) {}", "timeout": 600_000}),
+                &ctx_a,
+            )
+            .await
+        });
+        // Let A start its synchronous loop before testing B.
+        tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+
+        // Chat B must keep working while A is stuck.
+        let ctx_b = coding(dir.path()).with_worker_manager(manager_b);
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            dispatch("execute", &json!({"code": "return 2"}), &ctx_b),
+        )
+        .await
+        .expect("chat B must not wait on chat A");
+        assert!(!out.is_error, "{}", out.content);
+
+        cancel.cancel();
+        let out = tokio::time::timeout(std::time::Duration::from_secs(15), blocking)
+            .await
+            .expect("chat A cancel must not hang")
+            .unwrap();
+        assert_eq!(out.class, Some(ToolErrorClass::Cancelled));
+        cleanup_a.shutdown().await;
+        cleanup_b.shutdown().await;
     }
 
     #[tokio::test]

@@ -15,7 +15,7 @@
 //! - Custom Code Mode is opt-in hybrid and requires the explicit `execute`
 //!   tool; custom `only`/`full_codemode` stay built-in Developer features.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use stark_config::{AgentFile, ConfigStore, EffectiveAgent};
@@ -240,11 +240,17 @@ impl AgentRegistry {
                 warning: None,
             };
         }
+        let repo = self
+            .agents
+            .iter()
+            .any(|agent| !agent.builtin && !agent.routing_repos.is_empty())
+            .then(|| workspace_repo(workspace_path))
+            .flatten();
         let matches: Vec<&EffectiveAgent> = self
             .agents
             .iter()
             .filter(|agent| !agent.builtin && agent.ui_visible)
-            .filter(|agent| routing_matches(agent, &kind, workspace_path))
+            .filter(|agent| routing_matches(agent, &kind, workspace_path, repo.as_deref()))
             .collect();
         if matches.len() == 1 {
             let agent = matches[0].clone();
@@ -349,6 +355,7 @@ impl AgentRegistry {
         effective.ui_order = spec.ui_order;
         effective.routing_workspace_kinds.clear();
         effective.routing_paths.clear();
+        effective.routing_repos.clear();
         // Start from the compiled seed. The optional override applies on top,
         // so an ignored/invalid override can never leak a field through.
         effective.display = spec.display.to_string();
@@ -460,6 +467,9 @@ impl AgentRegistry {
         tools.dedup();
         effective.tools = Some(tools);
         effective.skills = file.and_then(|file| file.skills.clone());
+        effective.skill_hashes = file
+            .map(|file| file.skill_hashes.clone())
+            .unwrap_or_default();
         effective.mcp = file.and_then(|file| file.mcp.clone());
         let code_mode = file
             .and_then(|file| file.code_mode.as_deref())
@@ -482,6 +492,7 @@ impl AgentRegistry {
         effective.full_codemode = file
             .and_then(|file| file.full_codemode)
             .filter(|_| code_mode.enabled());
+        effective.definition_hash = agent_definition_hash("builtin", key, file);
     }
 
     fn apply_custom_key(&self, key: &str) -> Result<(), String> {
@@ -535,7 +546,8 @@ impl AgentRegistry {
         effective.prompt_profile = normalize_profile(&effective.prompt_profile)
             .unwrap_or("general")
             .to_string();
-        let (routing_kinds, routing_paths, routing_warnings) = custom_routing(file, false)?;
+        let (routing_kinds, routing_paths, routing_repos, routing_warnings) =
+            custom_routing(file, false)?;
         self.warnings.extend(
             routing_warnings
                 .into_iter()
@@ -543,6 +555,7 @@ impl AgentRegistry {
         );
         effective.routing_workspace_kinds = routing_kinds;
         effective.routing_paths = routing_paths;
+        effective.routing_repos = routing_repos;
         let tools = file.tools.as_ref().ok_or_else(|| {
             "custom agents must declare an explicit tools list (use [] for none)".to_string()
         })?;
@@ -565,7 +578,14 @@ impl AgentRegistry {
         // missing server is dropped with a warning.
         let (skills, _) =
             inspect_custom_skills(None, harness_root, file.skills.as_deref().unwrap_or(&[]));
+        let (skill_hashes, skill_warnings) = custom_skill_hashes(file, &skills, false)?;
+        self.warnings.extend(
+            skill_warnings
+                .into_iter()
+                .map(|warning| format!("{key}: {warning}")),
+        );
         effective.skills = Some(skills);
+        effective.skill_hashes = skill_hashes;
         let (mcp, unknown_mcp) =
             inspect_custom_mcp(harness_root, file.mcp.as_deref().unwrap_or(&[]));
         for server in unknown_mcp {
@@ -583,6 +603,7 @@ impl AgentRegistry {
             effective.ui_visible = ui.visible.unwrap_or(true);
             effective.ui_order = ui.order.unwrap_or(0);
         }
+        effective.definition_hash = agent_definition_hash("custom", key, Some(file));
         Ok(())
     }
 
@@ -672,6 +693,37 @@ fn normalize_routing_pattern(raw: &str) -> String {
     value
 }
 
+#[cfg(windows)]
+fn windows_short_path(path: &Path) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut buffer = vec![0u16; 512];
+    let mut len =
+        unsafe { GetShortPathNameW(wide.as_ptr(), buffer.as_mut_ptr(), buffer.len() as u32) };
+    if len == 0 {
+        return None;
+    }
+    if len as usize >= buffer.len() {
+        buffer.resize(len as usize + 1, 0);
+        len = unsafe { GetShortPathNameW(wide.as_ptr(), buffer.as_mut_ptr(), buffer.len() as u32) };
+        if len == 0 || len as usize >= buffer.len() {
+            return None;
+        }
+    }
+    Some(String::from_utf16_lossy(&buffer[..len as usize]))
+}
+
+#[cfg(not(windows))]
+fn windows_short_path(_path: &Path) -> Option<String> {
+    None
+}
+
 fn routing_pattern_is_absolute(pattern: &str) -> bool {
     if pattern.starts_with('/') {
         return true;
@@ -687,8 +739,43 @@ fn compile_routing_glob(pattern: &str) -> Result<globset::GlobMatcher, globset::
         .map(|glob| glob.compile_matcher())
 }
 
-fn routing_matches(agent: &EffectiveAgent, kind: &str, workspace_path: &Path) -> bool {
-    if agent.routing_workspace_kinds.is_empty() && agent.routing_paths.is_empty() {
+fn agent_definition_hash(kind: &str, key: &str, file: Option<&AgentFile>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"stark-agent-definition-v1\0");
+    hasher.update(kind.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(key.as_bytes());
+    hasher.update(b"\0");
+    if let Some(file) = file {
+        hasher.update(serde_json::to_vec(file).unwrap_or_default());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn workspace_repo(workspace_path: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace_path)
+        .args(["config", "--get", "remote.origin.url"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    stark_config::normalize_repo_identity(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn routing_matches(
+    agent: &EffectiveAgent,
+    kind: &str,
+    workspace_path: &Path,
+    repo: Option<&str>,
+) -> bool {
+    if agent.routing_workspace_kinds.is_empty()
+        && agent.routing_paths.is_empty()
+        && agent.routing_repos.is_empty()
+    {
         return false;
     }
     if !agent.routing_workspace_kinds.is_empty()
@@ -699,20 +786,39 @@ fn routing_matches(agent: &EffectiveAgent, kind: &str, workspace_path: &Path) ->
     {
         return false;
     }
+    if !agent.routing_repos.is_empty() {
+        let Some(repo) = repo else {
+            return false;
+        };
+        if !agent
+            .routing_repos
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(repo))
+        {
+            return false;
+        }
+    }
     if agent.routing_paths.is_empty() {
         return true;
     }
-    let normalized = normalize_routing_pattern(&workspace_path.to_string_lossy());
-    let canonical = workspace_path
-        .canonicalize()
-        .ok()
-        .map(|path| normalize_routing_pattern(&path.to_string_lossy()));
+    let mut candidates = vec![normalize_routing_pattern(&workspace_path.to_string_lossy())];
+    if let Ok(canonical) = workspace_path.canonicalize() {
+        let canonical = normalize_routing_pattern(&canonical.to_string_lossy());
+        if !candidates.contains(&canonical) {
+            candidates.push(canonical);
+        }
+    }
+    if let Some(short) = windows_short_path(workspace_path) {
+        let short = normalize_routing_pattern(&short);
+        if !candidates.contains(&short) {
+            candidates.push(short);
+        }
+    }
     agent.routing_paths.iter().any(|pattern| {
         compile_routing_glob(pattern).is_ok_and(|matcher| {
-            matcher.is_match(&normalized)
-                || canonical
-                    .as_deref()
-                    .is_some_and(|path| matcher.is_match(path))
+            candidates
+                .iter()
+                .any(|candidate| matcher.is_match(candidate))
         })
     })
 }
@@ -734,6 +840,7 @@ fn builtin_runtime(key: &str, registry: &AgentRegistry) -> EffectiveAgent {
     effective.can_spawn = spec.can_spawn;
     effective.ui_order = spec.ui_order;
     effective.tools = contract().scope_map.get(spec.key).cloned();
+    effective.definition_hash = agent_definition_hash("builtin", key, None);
     let _ = registry;
     effective
 }
@@ -822,11 +929,11 @@ fn validate_custom_tools(
     Ok(out)
 }
 
-type RoutingRules = (Vec<String>, Vec<String>, Vec<String>);
+type RoutingRules = (Vec<String>, Vec<String>, Vec<String>, Vec<String>);
 
 fn custom_routing(file: &AgentFile, strict: bool) -> Result<RoutingRules, String> {
     let Some(routing) = &file.routing else {
-        return Ok((Vec::new(), Vec::new(), Vec::new()));
+        return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new()));
     };
     let mut kinds: Vec<String> = routing
         .workspace_kinds
@@ -868,16 +975,74 @@ fn custom_routing(file: &AgentFile, strict: bool) -> Result<RoutingRules, String
     }
     paths.sort();
     paths.dedup();
-    if kinds.is_empty() && paths.is_empty() {
-        let message = "routing has no usable workspace kinds or path globs; ignored".to_string();
+    let mut repos = Vec::new();
+    for raw in &routing.repos {
+        let Some(repo) = stark_config::normalize_repo_identity(raw) else {
+            let message = format!("routing repo '{raw}' must be a git remote like host/owner/repo");
+            if strict {
+                return Err(message);
+            }
+            warnings.push(message);
+            continue;
+        };
+        repos.push(repo);
+    }
+    repos.sort();
+    repos.dedup();
+    if kinds.is_empty() && paths.is_empty() && repos.is_empty() {
+        let message =
+            "routing has no usable workspace kinds, path globs, or repos; ignored".to_string();
         if strict {
             return Err(
-                "routing needs at least one workspace kind or absolute path glob".to_string(),
+                "routing needs at least one workspace kind, absolute path glob, or repo"
+                    .to_string(),
             );
         }
         warnings.push(message);
     }
-    Ok((kinds, paths, warnings))
+    Ok((kinds, paths, repos, warnings))
+}
+
+fn normalize_skill_hash(raw: &str) -> Option<String> {
+    let value = raw.trim().to_ascii_lowercase();
+    let value = value.strip_prefix("sha256:").unwrap_or(&value);
+    (value.len() == 64 && value.chars().all(|character| character.is_ascii_hexdigit()))
+        .then(|| value.to_string())
+}
+
+fn custom_skill_hashes(
+    file: &AgentFile,
+    skills: &[String],
+    strict: bool,
+) -> Result<(BTreeMap<String, String>, Vec<String>), String> {
+    let allowed: HashSet<String> = skills
+        .iter()
+        .map(|skill| skill.trim().to_ascii_lowercase())
+        .filter(|skill| !skill.is_empty())
+        .collect();
+    let mut hashes = BTreeMap::new();
+    let mut warnings = Vec::new();
+    for (name, raw) in &file.skill_hashes {
+        let name = name.trim().to_ascii_lowercase();
+        if !allowed.contains(&name) {
+            let message = format!("skill hash for '{name}' has no matching skills entry");
+            if strict {
+                return Err(message);
+            }
+            warnings.push(message);
+            continue;
+        }
+        let Some(hash) = normalize_skill_hash(raw) else {
+            let message = format!("skill hash for '{name}' must be a SHA-256 hex digest");
+            if strict {
+                return Err(message);
+            }
+            warnings.push(message);
+            continue;
+        };
+        hashes.insert(name, hash);
+    }
+    Ok((hashes, warnings))
 }
 
 fn custom_code_mode(file: &AgentFile, tools: &[String]) -> Result<stark_tools::CodeMode, String> {
@@ -1245,6 +1410,10 @@ pub fn validate_definition_in(
                     .push(format!("{message}; it may be workspace-local"));
             }
         }
+        match custom_skill_hashes(file, file.skills.as_deref().unwrap_or(&[]), true) {
+            Ok((_, warnings)) => check.warnings.extend(warnings),
+            Err(error) => check.errors.push(error),
+        }
         let (_, unknown_mcp) = inspect_custom_mcp(harness_root, file.mcp.as_deref().unwrap_or(&[]));
         for server in unknown_mcp {
             check.errors.push(format!("unknown MCP server '{server}'"));
@@ -1328,6 +1497,29 @@ mod tests {
                 .contains(&"house_get_state".to_string())
         );
         assert!(!house.tools.as_ref().unwrap().contains(&"edit".to_string()));
+    }
+
+    #[test]
+    fn definition_hash_tracks_agent_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = custom("backend", &["read"], "read");
+        write_agent(dir.path(), "backend", serde_json::to_value(&file).unwrap());
+        let config = ConfigStore::open(dir.path());
+        let first = AgentRegistry::load(&config, dir.path())
+            .get("backend")
+            .unwrap()
+            .definition_hash
+            .clone();
+        assert_eq!(first.len(), 64);
+
+        file.display = "Backend v2".to_string();
+        write_agent(dir.path(), "backend", serde_json::to_value(&file).unwrap());
+        let second = AgentRegistry::load(&config, dir.path())
+            .get("backend")
+            .unwrap()
+            .definition_hash
+            .clone();
+        assert_ne!(first, second);
     }
 
     #[test]
@@ -1646,6 +1838,7 @@ mod tests {
         backend.routing = Some(stark_config::AgentRoutingFile {
             workspace_kinds: vec!["coding".to_string()],
             paths: vec![path_pattern.clone()],
+            repos: Vec::new(),
         });
         write_agent(
             dir.path(),
@@ -1675,6 +1868,7 @@ mod tests {
             file.routing = Some(stark_config::AgentRoutingFile {
                 workspace_kinds: vec!["coding".to_string()],
                 paths: vec![path_pattern.clone()],
+                repos: Vec::new(),
             });
             write_agent(dir.path(), key, serde_json::to_value(file).unwrap());
         }
@@ -1707,6 +1901,7 @@ mod tests {
         backend.routing = Some(stark_config::AgentRoutingFile {
             workspace_kinds: Vec::new(),
             paths: vec!["relative/**".to_string()],
+            repos: Vec::new(),
         });
         write_agent(
             dir.path(),
@@ -1741,6 +1936,7 @@ mod tests {
         empty.routing = Some(stark_config::AgentRoutingFile {
             workspace_kinds: Vec::new(),
             paths: vec![String::new()],
+            repos: Vec::new(),
         });
         assert!(
             custom_routing(&empty, true)
@@ -1750,7 +1946,7 @@ mod tests {
         assert!(
             custom_routing(&empty, false)
                 .unwrap()
-                .2
+                .3
                 .iter()
                 .any(|warning| warning.contains("cannot be empty"))
         );
@@ -1763,6 +1959,7 @@ mod tests {
         backend.routing = Some(stark_config::AgentRoutingFile {
             workspace_kinds: vec!["coding".to_string()],
             paths: vec!["[".to_string()],
+            repos: Vec::new(),
         });
         write_agent(
             dir.path(),
@@ -1794,6 +1991,7 @@ mod tests {
         backend.routing = Some(stark_config::AgentRoutingFile {
             workspace_kinds: vec!["coding".to_string()],
             paths: vec![canonical.to_string_lossy().replace('\\', "/")],
+            repos: Vec::new(),
         });
         write_agent(
             dir.path(),
@@ -1806,7 +2004,7 @@ mod tests {
         // The literal path still contains `sub/../`; only the canonical
         // fallback matches the exact (non-glob) pattern.
         let dotted = work.join("sub").join("..").join("project");
-        assert!(routing_matches(agent, "coding", &dotted));
+        assert!(routing_matches(agent, "coding", &dotted, None));
     }
 
     #[cfg(windows)]
@@ -1817,6 +2015,7 @@ mod tests {
         backend.routing = Some(stark_config::AgentRoutingFile {
             workspace_kinds: vec!["coding".to_string()],
             paths: vec!["C:/Work/**".to_string()],
+            repos: Vec::new(),
         });
         write_agent(
             dir.path(),
@@ -1829,8 +2028,50 @@ mod tests {
         assert!(routing_matches(
             agent,
             "coding",
-            Path::new(r"c:\work\project")
+            Path::new(r"c:\work\project"),
+            None
         ));
+    }
+
+    #[test]
+    fn routing_matches_git_repo_identity() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("work");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::process::Command::new("git")
+            .arg("init")
+            .arg(&workspace)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&workspace)
+            .args(["remote", "add", "origin", "git@github.com:Org/Repo.git"])
+            .output()
+            .unwrap();
+        let mut backend = custom("backend", &["read"], "read");
+        backend.routing = Some(stark_config::AgentRoutingFile {
+            workspace_kinds: vec!["coding".to_string()],
+            paths: Vec::new(),
+            repos: vec!["https://github.com/org/repo".to_string()],
+        });
+        write_agent(
+            dir.path(),
+            "backend",
+            serde_json::to_value(&backend).unwrap(),
+        );
+        let config = ConfigStore::open(dir.path());
+        let registry = AgentRegistry::load(&config, dir.path());
+        let decision = registry.route_decision("coding", &workspace, dir.path());
+        assert_eq!(decision.agent.key, "backend");
+        assert!(decision.warning.is_none());
     }
 
     #[test]
@@ -1842,6 +2083,7 @@ mod tests {
         file.routing = Some(stark_config::AgentRoutingFile {
             workspace_kinds: Vec::new(),
             paths: vec!["[".to_string()],
+            repos: Vec::new(),
         });
         let check = validate_definition(&config, dir.path(), "backend", &file, &registry);
         assert!(check.errors.iter().any(|error| error.contains("glob")));

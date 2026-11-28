@@ -4725,6 +4725,7 @@ dependencies = [
  "globset",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "stark-config",
  "stark-contract",
  "stark-policy",
@@ -4738,6 +4739,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

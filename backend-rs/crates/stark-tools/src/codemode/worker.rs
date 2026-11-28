@@ -125,6 +125,8 @@ impl WorkerInner {
 pub struct WorkerManager {
     inner: AsyncMutex<Option<Arc<WorkerInner>>>,
     harness_root: PathBuf,
+    /// Milliseconds since the Unix epoch; drives idle pruning.
+    last_used: AtomicU64,
     /// Serializes lazy startup so concurrent parallel tool calls share one
     /// worker instead of spawning two and kill-dropping the loser.
     starting: AsyncMutex<()>,
@@ -154,17 +156,72 @@ impl WorkerManager {
         MANAGERS.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
-    /// One manager per harness root (production). The manager owns the worker
-    /// child, so it must outlive background scripts.
+    /// One manager per harness root. Kept for callers that do not have a chat
+    /// identity (tests, one-shot tooling).
     pub fn for_root(harness_root: &Path) -> Arc<Self> {
-        let key = harness_root.to_string_lossy().to_string();
+        Self::for_chat(harness_root, "__root__")
+    }
+
+    /// One worker per chat, so a synchronous program in one conversation
+    /// cannot block or kill another conversation's worker. Idle managers are
+    /// reaped when a new chat asks for one; the process cap falls back to the
+    /// least-recently-used manager rather than failing a run.
+    pub fn for_chat(harness_root: &Path, chat_id: &str) -> Arc<Self> {
+        let root = harness_root.to_string_lossy().to_string();
+        let key = format!("{root}\0{}", chat_id.trim());
         let mut managers = Self::global().lock().unwrap();
+        prune_workers(&mut managers, &root);
         if let Some(manager) = managers.get(&key) {
+            manager.touch();
             return manager.clone();
+        }
+        if managers.len() >= worker_limit()
+            && let Some((_, lru)) = managers
+                .iter()
+                .min_by_key(|(_, manager)| manager.last_used.load(Ordering::Relaxed))
+        {
+            tracing::warn!(
+                chat_id = %chat_id,
+                "Code Mode worker cap reached; sharing the least-recently-used worker"
+            );
+            lru.touch();
+            return lru.clone();
         }
         let manager = Arc::new(Self::new(harness_root));
         managers.insert(key, manager.clone());
         manager
+    }
+
+    /// Reap idle chat workers. Called periodically by the server so an idle
+    /// conversation does not keep a Bun process alive forever.
+    pub fn sweep_idle() {
+        let mut managers = Self::global().lock().unwrap();
+        prune_workers(&mut managers, "");
+    }
+
+    fn touch(&self) {
+        self.last_used.store(now_millis(), Ordering::Relaxed);
+    }
+
+    fn idle(&self) -> bool {
+        let Ok(inner) = self.inner.try_lock() else {
+            return false;
+        };
+        inner
+            .as_ref()
+            .map(|inner| {
+                inner
+                    .runs
+                    .lock()
+                    .map(|runs| runs.is_empty())
+                    .unwrap_or(false)
+                    && inner
+                        .pending
+                        .lock()
+                        .map(|pending| pending.is_empty())
+                        .unwrap_or(false)
+            })
+            .unwrap_or(true)
     }
 
     /// Disposable manager for tests and one-shot calls. Dropping it kills the
@@ -177,10 +234,26 @@ impl WorkerManager {
         Self {
             inner: AsyncMutex::new(None),
             harness_root: harness_root.to_path_buf(),
+            last_used: AtomicU64::new(now_millis()),
             starting: AsyncMutex::new(()),
             initializing: AsyncMutex::new(()),
             initialized: Mutex::new(None),
             _child: AsyncMutex::new(None),
+        }
+    }
+
+    /// Stop this manager's worker without removing it from the chat map.
+    /// Tests use this so a global manager cannot keep the runtime alive.
+    pub async fn shutdown(&self) {
+        let inner = { self.inner.lock().await.clone() };
+        if let Some(inner) = inner {
+            self.kill(&inner, "manager shutdown").await;
+            return;
+        }
+        let child = { self._child.lock().await.take() };
+        if let Some(mut child) = child {
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
         }
     }
 
@@ -237,26 +310,25 @@ impl WorkerManager {
 
     async fn spawn(&self) -> Result<Arc<WorkerInner>, String> {
         *self.initialized.lock().unwrap() = None;
-        let worker_dir = discover_worker_dir(&self.harness_root);
-        let main = worker_dir.join("src").join("main.ts");
-        if !main.exists() {
-            return Err(format!(
-                "code mode worker missing at {}. Set STARK_CODEMODE_WORKER_DIR.",
-                main.display()
-            ));
-        }
-        let bun = discover_bun();
-        let mut child: Child = Command::new(&bun)
-            .arg("run")
-            .arg("--silent")
-            .arg("./src/main.ts")
-            .current_dir(&worker_dir)
+        let launch = discover_launch(&self.harness_root)?;
+        tracing::debug!(
+            runtime = launch.kind(),
+            worker = %launch.description(),
+            "spawning code mode worker"
+        );
+        let mut command = launch.command(&self.harness_root);
+        let mut child: Child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|error| format!("failed to spawn code mode worker ({bun}): {error}"))?;
+            .map_err(|error| {
+                format!(
+                    "failed to spawn code mode worker ({}): {error}",
+                    launch.description()
+                )
+            })?;
         let stdin = child.stdin.take().ok_or("worker stdin unavailable")?;
         let stdout = child.stdout.take().ok_or("worker stdout unavailable")?;
         let stderr = child.stderr.take().ok_or("worker stderr unavailable")?;
@@ -578,6 +650,11 @@ impl WorkerManager {
                             error = %error,
                             "code mode worker cancel failed; killing it"
                         );
+                        ctx.audit_event(
+                            "worker_kill",
+                            run_id,
+                            json!({"reason": "cancel_failed", "error": error}),
+                        );
                         self.kill(&inner, "code mode worker cancel failed").await;
                     }
                     Err(_) => {
@@ -585,6 +662,11 @@ impl WorkerManager {
                         tracing::warn!(
                             run_id = %run_id,
                             "code mode worker did not acknowledge cancel; killing it"
+                        );
+                        ctx.audit_event(
+                            "worker_kill",
+                            run_id,
+                            json!({"reason": "cancel_timeout"}),
                         );
                         self.kill(&inner, "code mode worker did not acknowledge cancel")
                             .await;
@@ -694,6 +776,170 @@ fn parse_execute_result(value: &Value) -> Result<WorkerExecuteResult, String> {
             .cloned()
             .unwrap_or_default(),
     })
+}
+
+enum WorkerLaunch {
+    Binary(PathBuf),
+    Source { bun: String, dir: PathBuf },
+}
+
+impl WorkerLaunch {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Binary(_) => "binary",
+            Self::Source { .. } => "source",
+        }
+    }
+
+    fn description(&self) -> String {
+        match self {
+            Self::Binary(path) => path.display().to_string(),
+            Self::Source { bun, dir } => format!("{} {}", bun, dir.join("src/main.ts").display()),
+        }
+    }
+
+    fn command(&self, harness_root: &Path) -> Command {
+        match self {
+            Self::Binary(path) => {
+                let mut command = Command::new(path);
+                command.current_dir(harness_root);
+                command
+            }
+            Self::Source { bun, dir } => {
+                let mut command = Command::new(bun);
+                command
+                    .arg("run")
+                    .arg("--silent")
+                    .arg("./src/main.ts")
+                    .current_dir(dir);
+                command
+            }
+        }
+    }
+}
+
+/// Runtime availability for `/api/health`; discovery only, never spawns.
+pub fn runtime_status(harness_root: &Path) -> Value {
+    match discover_launch(harness_root) {
+        Ok(launch) => json!({
+            "available": true,
+            "kind": launch.kind(),
+        }),
+        Err(error) => json!({
+            "available": false,
+            "kind": "missing",
+            "error": error,
+        }),
+    }
+}
+
+fn worker_binary_name() -> &'static str {
+    if cfg!(windows) {
+        "codemode-worker.exe"
+    } else {
+        "codemode-worker"
+    }
+}
+
+fn binary_candidates(harness_root: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(raw) = std::env::var("STARK_CODEMODE_WORKER_BIN") {
+        let path = PathBuf::from(raw.trim());
+        if path.is_dir() {
+            candidates.push(path.join(worker_binary_name()));
+        } else if !path.as_os_str().is_empty() {
+            candidates.push(path);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent()
+    {
+        candidates.push(parent.join(worker_binary_name()));
+        candidates.push(parent.join("resources").join(worker_binary_name()));
+        if let Some(parent) = parent.parent() {
+            candidates.push(parent.join("Resources").join(worker_binary_name()));
+            candidates.push(parent.join(worker_binary_name()));
+        }
+    }
+    for root in [
+        harness_root.join(".deep_agents").join("bin"),
+        harness_root
+            .join("backend-rs")
+            .join("codemode-worker")
+            .join("dist"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../codemode-worker")
+            .join("dist"),
+        PathBuf::from("backend-rs/codemode-worker/dist"),
+    ] {
+        candidates.push(root.join(worker_binary_name()));
+    }
+    candidates
+}
+
+fn discover_launch(harness_root: &Path) -> Result<WorkerLaunch, String> {
+    if let Some(binary) = binary_candidates(harness_root)
+        .into_iter()
+        .find(|path| path.is_file())
+    {
+        return Ok(WorkerLaunch::Binary(binary));
+    }
+    let worker_dir = discover_worker_dir(harness_root);
+    let main = worker_dir.join("src").join("main.ts");
+    if main.is_file() {
+        return Ok(WorkerLaunch::Source {
+            bun: discover_bun(),
+            dir: worker_dir,
+        });
+    }
+    Err(format!(
+        "code mode worker missing. Set STARK_CODEMODE_WORKER_BIN to the packaged binary, or STARK_CODEMODE_WORKER_DIR to the source tree (checked {}).",
+        harness_root.display()
+    ))
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn worker_limit() -> usize {
+    std::env::var("STARK_CODEMODE_MAX_WORKERS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(8)
+}
+
+fn worker_idle_ms() -> u64 {
+    std::env::var("STARK_CODEMODE_WORKER_IDLE_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1_800)
+        .saturating_mul(1_000)
+}
+
+fn prune_workers(managers: &mut HashMap<String, Arc<WorkerManager>>, _root: &str) {
+    let now = now_millis();
+    let idle_ms = worker_idle_ms();
+    managers.retain(|_, manager| {
+        now.saturating_sub(manager.last_used.load(Ordering::Relaxed)) < idle_ms || !manager.idle()
+    });
+    let limit = worker_limit();
+    while managers.len() >= limit {
+        let oldest = managers
+            .iter()
+            .filter(|(_, manager)| manager.idle())
+            .min_by_key(|(_, manager)| manager.last_used.load(Ordering::Relaxed))
+            .map(|(key, _)| key.clone());
+        let Some(oldest) = oldest else {
+            break;
+        };
+        managers.remove(&oldest);
+    }
 }
 
 fn discover_worker_dir(harness_root: &Path) -> PathBuf {

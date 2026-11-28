@@ -77,7 +77,15 @@ fn fallback_description(text: &str) -> String {
     String::new()
 }
 
-async fn read_skill(path: &Path) -> Option<(String, String, String)> {
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct SkillEntry {
+    pub name: String,
+    pub description: String,
+    pub source: String,
+    pub sha256: String,
+}
+
+async fn read_skill(path: &Path) -> Option<(String, String, String, String)> {
     let metadata = tokio::fs::symlink_metadata(path).await.ok()?;
     if !metadata.file_type().is_file() {
         return None;
@@ -89,6 +97,8 @@ async fn read_skill(path: &Path) -> Option<(String, String, String)> {
         }
     }
     let text = tokio::fs::read_to_string(path).await.ok()?;
+    use sha2::{Digest, Sha256};
+    let sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
     let fields = parse_frontmatter(&text);
     let name = fields
         .get("name")
@@ -104,7 +114,7 @@ async fn read_skill(path: &Path) -> Option<(String, String, String)> {
         .cloned()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| fallback_description(&text));
-    Some((name, description, text))
+    Some((name, description, text, sha256))
 }
 
 /// Discovered skill names, sync, for agent-definition validation.
@@ -157,13 +167,13 @@ pub async fn catalog_block_for(workspace: &Path, harness_root: &Path) -> Option<
     catalog_block_for_agent(workspace, harness_root, None).await
 }
 
-/// Same catalog, filtered to an agent's configured skill names. `None` means
-/// all discovered skills.
-pub async fn catalog_block_for_agent(
+/// Discovered skills with the source root and content hash. Used by preview
+/// and audit; the prompt catalog only needs name/description.
+pub async fn catalog_entries(
     workspace: &Path,
     harness_root: &Path,
     allowed: Option<&[String]>,
-) -> Option<String> {
+) -> Vec<SkillEntry> {
     let allowed: Option<std::collections::HashSet<String>> = allowed.map(|names| {
         names
             .iter()
@@ -199,7 +209,7 @@ pub async fn catalog_block_for_agent(
             }
             let path = entry.path();
             let skill_path = path.join("SKILL.md");
-            let Some((name, description, _)) = read_skill(&skill_path).await else {
+            let Some((name, description, _, sha256)) = read_skill(&skill_path).await else {
                 continue;
             };
             if let Some(allowed) = &allowed
@@ -210,30 +220,34 @@ pub async fn catalog_block_for_agent(
             if !seen.insert(name.to_ascii_lowercase()) {
                 continue;
             }
-            entries.push(serde_json::json!({
-                "name": name,
-                "description": description,
-            }));
+            entries.push(SkillEntry {
+                name,
+                description,
+                source: root.to_string_lossy().replace('\\', "/"),
+                sha256,
+            });
         }
     }
+    entries.sort_by(|left, right| left.name.cmp(&right.name));
+    entries
+}
+
+/// Same catalog, filtered to an agent's configured skill names. `None` means
+/// all discovered skills.
+pub async fn catalog_block_for_agent(
+    workspace: &Path,
+    harness_root: &Path,
+    allowed: Option<&[String]>,
+) -> Option<String> {
+    let entries = catalog_entries(workspace, harness_root, allowed).await;
     if entries.is_empty() {
         return None;
     }
-    entries.sort_by(|left, right| {
-        left["name"]
-            .as_str()
-            .unwrap_or("")
-            .cmp(right["name"].as_str().unwrap_or(""))
-    });
     let mut text = String::from(
         "[SKILLS]\nLoad a skill with the skill tool before acting on a matching task.\n",
     );
     for entry in entries {
-        text.push_str(&format!(
-            "- {}: {}\n",
-            entry["name"].as_str().unwrap_or(""),
-            entry["description"].as_str().unwrap_or("")
-        ));
+        text.push_str(&format!("- {}: {}\n", entry.name, entry.description));
     }
     Some(text)
 }
@@ -253,6 +267,11 @@ pub async fn skill(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         && !allowed.contains(&name.to_ascii_lowercase())
     {
         tracing::debug!(skill = %name, "skill is not enabled for this agent");
+        ctx.audit_event(
+            "skill_denied",
+            name,
+            serde_json::json!({"reason": "allowlist"}),
+        );
         return ToolOutcome::err(format!(
             "Error: skill '{name}' is not enabled for this agent"
         ));
@@ -272,12 +291,49 @@ pub async fn skill(ctx: &ToolContext, args: &Value) -> ToolOutcome {
             continue;
         }
         let path = skill_dir.join("SKILL.md");
-        let Some((_, _, text)) = read_skill(&path).await else {
+        let Some((_, _, text, sha256)) = read_skill(&path).await else {
             continue;
         };
+        if let Some(hashes) = &ctx.allowed_skill_hashes
+            && let Some(expected) = hashes.get(&name.to_ascii_lowercase())
+            && expected != &sha256
+        {
+            tracing::warn!(
+                skill = %name,
+                expected = %expected,
+                found = %sha256,
+                "skill content does not match its pinned hash"
+            );
+            ctx.audit_event(
+                "skill_denied",
+                name,
+                serde_json::json!({
+                    "reason": "pin_mismatch",
+                    "expected": expected,
+                    "found": sha256,
+                    "source": root.to_string_lossy().replace('\\', "/"),
+                }),
+            );
+            return ToolOutcome::err(format!(
+                "Error: skill '{name}' changed (expected sha256 {expected}, found {sha256}); update the agent's skill_hashes"
+            ));
+        }
         let text: String = text.chars().take(MAX_SKILL_CHARS).collect();
+        ctx.audit_event(
+            "skill_loaded",
+            name,
+            serde_json::json!({
+                "sha256": sha256,
+                "source": root.to_string_lossy().replace('\\', "/"),
+            }),
+        );
         return ToolOutcome::ok(format!("[SKILL] {name}\n\n{text}"));
     }
+    ctx.audit_event(
+        "skill_denied",
+        name,
+        serde_json::json!({"reason": "unknown"}),
+    );
     ToolOutcome::err(format!("Error: unknown skill '{name}'"))
 }
 
@@ -311,6 +367,73 @@ mod tests {
         let loaded = skill(&ctx, &serde_json::json!({"name": "review"})).await;
         assert!(!loaded.is_error, "{}", loaded.content);
         assert!(loaded.content.contains("# Review"), "{}", loaded.content);
+    }
+
+    #[tokio::test]
+    async fn skill_load_and_denial_emit_audit_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join(".agents/skills/review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: review\ndescription: Review.\n---\n# Review\n",
+        )
+        .unwrap();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let hook = Arc::new(move |kind: &str, subject: &str, detail: Value| {
+            sink.lock()
+                .unwrap()
+                .push((kind.to_string(), subject.to_string(), detail));
+        });
+        let ctx = context(dir.path()).with_audit_hook(Some(hook));
+        let out = skill(&ctx, &serde_json::json!({"name": "review"})).await;
+        assert!(!out.is_error, "{}", out.content);
+        let out = skill(&ctx, &serde_json::json!({"name": "missing"})).await;
+        assert!(out.is_error);
+        let events = events.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|(kind, subject, _)| { kind == "skill_loaded" && subject == "review" })
+        );
+        assert!(
+            events
+                .iter()
+                .any(|(kind, subject, _)| { kind == "skill_denied" && subject == "missing" })
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_skill_hash_blocks_changed_content() {
+        use sha2::{Digest, Sha256};
+        use std::collections::BTreeMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join(".agents/skills/review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let path = skill_dir.join("SKILL.md");
+        let original = "---\nname: review\ndescription: Review.\n---\n# Review\n";
+        std::fs::write(&path, original).unwrap();
+        let hash = format!("{:x}", Sha256::digest(original.as_bytes()));
+        let mut pins = BTreeMap::new();
+        pins.insert("review".to_string(), hash.clone());
+        let ctx = context(dir.path()).with_allowed_skill_hashes(Some(pins));
+        let out = skill(&ctx, &serde_json::json!({"name": "review"})).await;
+        assert!(!out.is_error, "{}", out.content);
+
+        let entries = catalog_entries(dir.path(), dir.path(), None).await;
+        assert_eq!(entries[0].sha256, hash);
+        assert!(entries[0].source.ends_with(".agents/skills"));
+
+        std::fs::write(
+            &path,
+            "---\nname: review\ndescription: Review.\n---\n# Changed\n",
+        )
+        .unwrap();
+        let out = skill(&ctx, &serde_json::json!({"name": "review"})).await;
+        assert!(out.is_error, "{}", out.content);
+        assert!(out.content.contains("changed"), "{}", out.content);
     }
 
     #[tokio::test]

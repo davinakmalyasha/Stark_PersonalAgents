@@ -540,6 +540,27 @@ fn now_secs() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
+pub async fn record_agent_context(
+    store: &stark_store::ChatStore,
+    writer: &mut RolloutWriter,
+    chat_id: &str,
+    agent_key: &str,
+    agent_hash: &str,
+) {
+    record(
+        store,
+        writer,
+        chat_id,
+        RolloutItem::EventMsg {
+            payload: EventMsgPayload::AgentContext {
+                agent_key: agent_key.to_string(),
+                agent_hash: agent_hash.to_string(),
+            },
+        },
+    )
+    .await;
+}
+
 pub async fn record_turn_started(
     store: &stark_store::ChatStore,
     writer: &mut RolloutWriter,

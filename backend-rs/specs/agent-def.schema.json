@@ -87,6 +87,14 @@
         "type": "string"
       }
     },
+    "skill_hashes": {
+      "type": "object",
+      "description": "Optional SHA-256 pins for skill content. Keys must be in `skills`; values are 64 hex characters, optionally prefixed with sha256:. A changed pinned skill is refused at dispatch.",
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^(sha256:)?[0-9a-fA-F]{64}$"
+      }
+    },
     "mcp": {
       "type": "array",
       "description": "Configured MCP server names. Built-ins: null/omitted means all. Custom: omitted means none.",
@@ -142,7 +150,7 @@
     "routing": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Custom-agent auto-routing. Applied only when no explicit agent/chat agentKey exists and the workspace kind is generic. A unique match wins; multiple matches fall back to the built-in heuristic with a warning. Both lists non-empty means both must match.",
+      "description": "Custom-agent auto-routing. Applied only when no explicit agent/chat agentKey or workspace binding exists and the workspace kind is generic. A unique match wins; multiple matches fall back to the built-in heuristic with a warning. Non-empty path and repo lists are ANDed.",
       "properties": {
         "workspace_kinds": {
           "type": "array",
@@ -154,6 +162,15 @@
         "paths": {
           "type": "array",
           "description": "Absolute glob patterns over the normalised workspace path. Backslashes are accepted and normalised to '/'. Matching is case-insensitive on Windows and macOS. Empty and relative patterns are rejected.",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "repos": {
+          "type": "array",
+          "description": "Repository identities as host/owner/repo. HTTPS, SSH, and git@host:owner/repo forms are normalised. When both paths and repos are present, both must match.",
           "uniqueItems": true,
           "items": {
             "type": "string",

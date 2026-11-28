@@ -539,8 +539,8 @@ pub struct AgentUiFile {
     pub order: Option<i32>,
 }
 
-/// Opt-in routing for custom agents. Empty fields match any value; both
-/// non-empty means both must match.
+/// Opt-in routing for custom agents. Empty fields match any value; non-empty
+/// path and repo lists are ANDed.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AgentRoutingFile {
@@ -548,6 +548,9 @@ pub struct AgentRoutingFile {
     pub workspace_kinds: Vec<String>,
     #[serde(default)]
     pub paths: Vec<String>,
+    /// Normalized repository identities (`host/owner/repo`).
+    #[serde(default)]
+    pub repos: Vec<String>,
 }
 
 /// Per-agent overrides for built-ins, or a full custom definition.
@@ -580,6 +583,10 @@ pub struct AgentFile {
     /// Skill names to include. Built-ins: `null` = all discovered skills.
     /// Custom: `null` = none.
     pub skills: Option<Vec<String>>,
+    /// Optional pinned SHA-256 for a skill's `SKILL.md` bytes. Names are
+    /// matched case-insensitively.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub skill_hashes: BTreeMap<String, String>,
     /// MCP servers. Built-ins: `null` = all configured servers. Custom:
     /// `null` = none.
     pub mcp: Option<Vec<String>>,
@@ -621,6 +628,7 @@ pub struct EffectiveAgent {
     pub reasoning: bool,
     pub tools: Option<Vec<String>>,
     pub skills: Option<Vec<String>>,
+    pub skill_hashes: BTreeMap<String, String>,
     pub mcp: Option<Vec<String>>,
     pub system_prompt: Option<String>,
     /// `coding` or `general`.
@@ -643,6 +651,7 @@ pub struct EffectiveAgent {
     /// Custom-agent routing filters. Empty for built-ins unless compiled.
     pub routing_workspace_kinds: Vec<String>,
     pub routing_paths: Vec<String>,
+    pub routing_repos: Vec<String>,
     /// Resolved Code Mode partition (`off`, `hybrid`, or `only`).
     pub code_mode: Option<String>,
     /// Resolved OpenCode `full_codemode` override. `None` inherits the scope
@@ -653,6 +662,9 @@ pub struct EffectiveAgent {
     /// Environment variable names that can hold this provider's key.
     pub key_env: Vec<String>,
     pub has_key: bool,
+    /// Stable hash of the raw agent definition (built-in spec + override, or
+    /// the custom file). Empty only for legacy ad-hoc effective agents.
+    pub definition_hash: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -719,6 +731,19 @@ struct Signature {
 }
 
 impl Signature {
+    fn revision(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.providers.hash(&mut hasher);
+        self.keys.hash(&mut hasher);
+        self.agents.len().hash(&mut hasher);
+        for (key, stamp) in &self.agents {
+            key.hash(&mut hasher);
+            stamp.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
     fn read(root: &Path) -> Self {
         let dir = root.join(".deep_agents").join("config");
         let providers = file_stamp(&dir.join("providers.json"));
@@ -800,6 +825,60 @@ fn file_stamp(path: &Path) -> Option<(u64, u128)> {
     Some((metadata.len(), modified))
 }
 
+/// Normalize a git remote or repository URL to `host/owner/repo`.
+///
+/// Accepts HTTPS, SSH, `git@host:owner/repo`, and already-normalized values.
+/// Local filesystem remotes are rejected: routing identities are portable.
+pub fn normalize_repo_identity(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let bytes = raw.as_bytes();
+    if raw.starts_with('/')
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && bytes[2] == b'/')
+    {
+        return None;
+    }
+    let mut value = raw
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .to_string();
+    if let Some((_, rest)) = value.split_once("://") {
+        value = rest.to_string();
+    }
+    if let Some((user, rest)) = value.split_once('@')
+        && !user.contains('/')
+    {
+        value = rest.to_string();
+    }
+    // `git@host:owner/repo` has a colon before the first slash.
+    if !raw.contains("://")
+        && let Some((host, path)) = value.split_once(':')
+        && !host.contains('/')
+    {
+        value = format!("{host}/{path}");
+    }
+    // Drop a port from `host:port/...`.
+    if let Some((host, rest)) = value.split_once('/') {
+        let host = host.split(':').next().unwrap_or(host);
+        value = format!("{host}/{rest}");
+    }
+    let value = value
+        .trim_matches('/')
+        .trim_end_matches(".git")
+        .trim_end_matches('/')
+        .to_ascii_lowercase();
+    let parts: Vec<&str> = value.split('/').filter(|part| !part.is_empty()).collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    Some(parts.join("/"))
+}
+
 pub fn builtin_effective(tier: &str) -> EffectiveAgent {
     let providers = ProvidersFile::builtin();
     let provider_id = providers.active_id();
@@ -841,6 +920,7 @@ pub fn builtin_effective(tier: &str) -> EffectiveAgent {
         freeform,
         tools: None,
         skills: None,
+        skill_hashes: BTreeMap::new(),
         mcp: None,
         system_prompt: None,
         prompt_profile: "general".to_string(),
@@ -856,10 +936,12 @@ pub fn builtin_effective(tier: &str) -> EffectiveAgent {
         ui_order: 0,
         routing_workspace_kinds: Vec::new(),
         routing_paths: Vec::new(),
+        routing_repos: Vec::new(),
         code_mode: None,
         full_codemode: None,
         key_env: provider.key_names(),
         has_key: false,
+        definition_hash: String::new(),
     }
 }
 
@@ -1198,6 +1280,7 @@ impl ConfigStore {
             freeform,
             tools: agent.tools.clone(),
             skills: agent.skills.clone(),
+            skill_hashes: agent.skill_hashes.clone(),
             mcp: agent.mcp.clone(),
             system_prompt: agent.system_prompt.clone(),
             prompt_profile,
@@ -1223,10 +1306,16 @@ impl ConfigStore {
                 .map(|path| path.trim().replace('\\', "/"))
                 .filter(|path| !path.is_empty())
                 .collect(),
+            routing_repos: routing
+                .repos
+                .iter()
+                .filter_map(|repo| normalize_repo_identity(repo))
+                .collect(),
             code_mode: agent.code_mode.clone(),
             full_codemode: agent.full_codemode,
             key_env,
             has_key,
+            definition_hash: String::new(),
         })
     }
 
@@ -1639,6 +1728,17 @@ impl ConfigStore {
             .read()
             .map(|state| state.has_file)
             .unwrap_or(false)
+    }
+
+    /// Cheap generation marker for caches keyed by config files. It covers
+    /// providers, agent files, and provider keys; unrelated config changes
+    /// simply invalidate once.
+    pub fn revision(&self) -> u64 {
+        self.ensure_fresh();
+        self.signature
+            .lock()
+            .map(|signature| signature.revision())
+            .unwrap_or(0)
     }
 
     pub fn root(&self) -> &Path {
@@ -2269,6 +2369,7 @@ mod tests {
                     routing: Some(AgentRoutingFile {
                         workspace_kinds: vec!["Coding".to_string()],
                         paths: vec!["D:\\work\\**".to_string()],
+                        repos: vec!["git@github.com:Org/Repo.git".to_string()],
                     }),
                     ..AgentFile::default()
                 },
@@ -2287,6 +2388,47 @@ mod tests {
         assert_eq!(effective.ui_order, 3);
         assert_eq!(effective.routing_workspace_kinds, vec!["coding"]);
         assert_eq!(effective.routing_paths, vec!["D:/work/**"]);
+        assert_eq!(effective.routing_repos, vec!["github.com/org/repo"]);
+    }
+
+    #[test]
+    fn revision_tracks_agent_file_changes() {
+        let (_dir, store) = temp_root();
+        let before = store.revision();
+        store
+            .save_agent(
+                "backend",
+                AgentFile {
+                    display: "Backend".to_string(),
+                    tools: Some(vec!["read".to_string()]),
+                    ..AgentFile::default()
+                },
+            )
+            .unwrap();
+        let after = store.revision();
+        assert_ne!(before, after);
+        assert_eq!(after, store.revision());
+    }
+
+    #[test]
+    fn repo_identities_normalize_across_url_forms() {
+        for raw in [
+            "https://github.com/Org/Repo.git",
+            "git@github.com:Org/Repo.git",
+            "ssh://git@github.com/Org/Repo",
+            "github.com/org/repo",
+            "https://github.com:8443/org/repo/",
+        ] {
+            assert_eq!(
+                normalize_repo_identity(raw).as_deref(),
+                Some("github.com/org/repo"),
+                "{raw}"
+            );
+        }
+        assert!(normalize_repo_identity("").is_none());
+        assert!(normalize_repo_identity("repo").is_none());
+        assert!(normalize_repo_identity("/home/me/repo").is_none());
+        assert!(normalize_repo_identity("C:\\work\\repo").is_none());
     }
 
     #[test]

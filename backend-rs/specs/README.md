@@ -112,9 +112,18 @@ Rules for custom definitions:
   list. Custom `only`/`full_codemode` are rejected and remain built-in
   Developer features.
 - `routing` is custom-only, unique-match, and ignored when an explicit agent
-  or chat agent key exists. Paths are normalized absolute globs; relative or
-  empty rules fail save validation and are dropped with a warning on load.
+  or chat agent key exists. Paths are normalized absolute globs; `repos`
+  match a normalized `host/owner/repo` git remote. When both are present,
+  both must match. Relative or empty rules fail save validation and are
+  dropped with a warning on load.
+- Explicit workspace → agent bindings are user-written only; routing never
+  persists one.
+- `skill_hashes` optionally pins a skill to the SHA-256 of its `SKILL.md`.
 - Symlinked skill directories and `SKILL.md` files are ignored.
+- Agent definitions have a stable `definition_hash`; chats remember the hash
+  used by their last run.
+- Audit events are durable, model-invisible, and contain no prompt or file
+  contents.
 - Built-ins can narrow their compiled caps but never widen them.
 
 Schema: `agent-def.schema.json`. API: `docs/agent-builder-api.md`.

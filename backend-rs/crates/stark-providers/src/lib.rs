@@ -1,4 +1,5 @@
 use std::pin::Pin;
+use std::sync::LazyLock;
 
 use eventsource_stream::Eventsource;
 use futures_util::{Stream, StreamExt};
@@ -327,6 +328,10 @@ pub struct ToolCall {
     #[serde(rename = "type")]
     pub kind: String,
     pub function: FunctionCall,
+    /// Exact OpenAI custom-tool options line (`// @options: ...`) replayed for
+    /// a freeform call. Never sent on the function-tool wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_header: Option<String>,
 }
 
 impl ToolCall {
@@ -342,7 +347,13 @@ impl ToolCall {
                 name: name.into(),
                 arguments: arguments.into(),
             },
+            custom_header: None,
         }
+    }
+
+    pub fn with_custom_header(mut self, header: Option<&str>) -> Self {
+        self.custom_header = header.map(str::to_string);
+        self
     }
 }
 
@@ -374,6 +385,9 @@ impl Serialize for ChatMessage {
         if self.images.is_empty() {
             if let Some(content) = &self.content {
                 state.serialize_field("content", content)?;
+            } else if self.role == "assistant" && self.tool_calls.is_some() {
+                // OpenCode lowers a textless tool-call turn to `content: null`.
+                state.serialize_field("content", &Value::Null)?;
             }
         } else {
             let mut parts = Vec::new();
@@ -543,6 +557,22 @@ pub enum ProviderEvent {
         id: Option<String>,
         name: Option<String>,
         arguments: Option<String>,
+    },
+    /// A raw OpenAI custom-tool chunk, flattened into JSON arguments by the
+    /// provider's freeform stream adapter.
+    CustomTool {
+        index: usize,
+        id: Option<String>,
+        name: Option<String>,
+        input: Option<String>,
+    },
+    /// The final parsed arguments and exact custom-tool header for one call.
+    ToolCallFinal {
+        index: usize,
+        id: Option<String>,
+        name: Option<String>,
+        arguments: String,
+        header: Option<String>,
     },
     Usage(Usage),
     Done {
@@ -797,6 +827,9 @@ pub struct Provider {
     /// Optional second provider used when the primary handshake fails or its
     /// circuit is open. The fallback keeps its own base URL, key, and model.
     fallback: Option<ProviderConfig>,
+    /// OpenCode freeform formats this model advertises (`text`, `lark`,
+    /// `regex`). Empty keeps JSON function tools.
+    freeform: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -926,6 +959,826 @@ fn models_url(base_url: &str) -> String {
     format!("{}/models", base_url.trim_end_matches('/'))
 }
 
+const FREEFORM_PREFIX: &str = "// @options:";
+
+#[derive(Clone)]
+struct FreeformField {
+    name: String,
+    schema: Value,
+    required: bool,
+}
+
+/// OpenCode `OpenAIFreeform.resolve` for the one host tool that declares
+/// freeform: `execute` with its required `code` string. Returns the custom
+/// tool when the model advertises `text` (and `lark` when there are other
+/// parameters).
+fn freeform_execute(tool: &Value, formats: &[String]) -> Option<Value> {
+    if !formats.iter().any(|format| format == "text") {
+        return None;
+    }
+    let function = tool.get("function")?;
+    if function.get("name")?.as_str()? != "execute" {
+        return None;
+    }
+    let input = function.get("parameters")?;
+    let properties = input.get("properties")?.as_object()?;
+    let required = input
+        .get("required")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !required.iter().any(|value| value.as_str() == Some("code"))
+        || properties
+            .get("code")
+            .and_then(|schema| schema.get("type"))
+            .and_then(Value::as_str)
+            != Some("string")
+    {
+        return None;
+    }
+    let mut ordered: Vec<String> = ["timeout", "background"]
+        .into_iter()
+        .filter(|name| properties.contains_key(*name))
+        .map(str::to_string)
+        .collect();
+    let extras: Vec<String> = properties
+        .keys()
+        .filter(|name| name.as_str() != "code" && !ordered.contains(name))
+        .cloned()
+        .collect();
+    ordered.extend(extras);
+    let fields: Vec<FreeformField> = ordered
+        .into_iter()
+        .filter_map(|name| {
+            let schema = properties.get(&name)?.clone();
+            Some(FreeformField {
+                required: required
+                    .iter()
+                    .any(|value| value.as_str() == Some(name.as_str())),
+                name,
+                schema,
+            })
+        })
+        .collect();
+    let lark = formats.iter().any(|format| format == "lark");
+    let description = function
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let description = if fields.is_empty() {
+        description.to_string()
+    } else {
+        format!("{description}\n\n{}", freeform_options_description(&fields))
+    };
+    let format = if fields.is_empty() || !lark {
+        json!({"type": "text"})
+    } else {
+        json!({
+            "type": "grammar",
+            "grammar": {"syntax": "lark", "definition": freeform_line_grammar(&fields)},
+        })
+    };
+    Some(json!({
+        "type": "custom",
+        "custom": {
+            "name": "execute",
+            "description": description,
+            "format": format,
+        },
+    }))
+}
+
+/// OpenCode `OpenAIFreeform.resolve` for Stark's two freeform tools:
+/// `execute` (raw text, optional options line) and `apply_patch` (fixed Lark
+/// grammar). Other tools keep their JSON function schema.
+fn freeform_tools(
+    tools: &[Value],
+    formats: &[String],
+) -> (
+    Vec<Value>,
+    std::collections::HashMap<String, FreeformCustom>,
+) {
+    if formats.is_empty() {
+        return (tools.to_vec(), std::collections::HashMap::new());
+    }
+    let mut customs = std::collections::HashMap::new();
+    let out = tools
+        .iter()
+        .map(|tool| {
+            if let Some(custom) = freeform_execute(tool, formats) {
+                customs.insert(
+                    "execute".to_string(),
+                    FreeformCustom {
+                        field: "code".to_string(),
+                        options: freeform_tool_has_options(tool),
+                    },
+                );
+                return custom;
+            }
+            if let Some((custom, definition)) = freeform_patch(tool, formats) {
+                customs.insert("apply_patch".to_string(), definition);
+                return custom;
+            }
+            tool.clone()
+        })
+        .collect();
+    (out, customs)
+}
+
+/// OpenCode `OpenAIFreeform.resolve` for the patch tool: a Lark-only freeform
+/// with OpenCode's fixed grammar. Text-only models keep the JSON tool.
+fn freeform_patch(tool: &Value, formats: &[String]) -> Option<(Value, FreeformCustom)> {
+    if !formats.iter().any(|format| format == "lark") {
+        return None;
+    }
+    let function = tool.get("function")?;
+    if function.get("name")?.as_str()? != "apply_patch" {
+        return None;
+    }
+    let input = function.get("parameters")?;
+    let properties = input.get("properties")?.as_object()?;
+    if properties.len() != 1 {
+        return None;
+    }
+    let (field, schema) = properties.iter().next()?;
+    if schema.get("type").and_then(Value::as_str) != Some("string") {
+        return None;
+    }
+    let required = input.get("required")?.as_array()?;
+    if !required.iter().any(|value| value.as_str() == Some(field)) {
+        return None;
+    }
+    let description = function
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let custom = json!({
+        "type": "custom",
+        "custom": {
+            "name": "apply_patch",
+            "description": description,
+            "format": {
+                "type": "grammar",
+                "grammar": {"syntax": "lark", "definition": patch_grammar()},
+            },
+        },
+    });
+    Some((
+        custom,
+        FreeformCustom {
+            field: field.clone(),
+            options: false,
+        },
+    ))
+}
+
+/// OpenCode's fixed `packages/core/src/tool/patch-grammar.txt` (MIT).
+///
+/// Git may materialize the file with CRLF on Windows, but the grammar sent to
+/// providers must be byte-identical across platforms.
+fn patch_grammar() -> &'static str {
+    static GRAMMAR: LazyLock<String> =
+        LazyLock::new(|| include_str!("patch_grammar.lark").replace("\r\n", "\n"));
+    GRAMMAR.as_str()
+}
+
+/// One declared custom tool: the required string field and whether the first
+/// line carries the tool's other parameters (`// @options: {...}`).
+#[derive(Clone, Debug)]
+struct FreeformCustom {
+    field: String,
+    options: bool,
+}
+
+fn freeform_tool_has_options(tool: &Value) -> bool {
+    tool.get("function")
+        .and_then(|function| function.get("parameters"))
+        .and_then(|parameters| parameters.get("properties"))
+        .and_then(Value::as_object)
+        .is_some_and(|properties| properties.keys().any(|name| name != "code"))
+}
+
+/// ECMAScript `Number::toString` for the values JSON carries. `JSON.stringify`
+/// is what OpenCode uses to re-encode parsed tool input, so integral floats
+/// lose their `.0` and exponent forms gain an explicit sign.
+fn js_number(number: &serde_json::Number) -> String {
+    if let Some(value) = number.as_i64() {
+        return value.to_string();
+    }
+    if let Some(value) = number.as_u64() {
+        return value.to_string();
+    }
+    let value = number.as_f64().unwrap_or(0.0);
+    if value == 0.0 {
+        return "0".to_string();
+    }
+    let abs = value.abs();
+    if abs >= 1e21 || abs < 1e-6 {
+        let formatted = format!("{value:e}");
+        if let Some((mantissa, exponent)) = formatted.split_once('e') {
+            let sign = if exponent.starts_with('-') { "" } else { "+" };
+            return format!("{mantissa}e{sign}{exponent}");
+        }
+        return formatted;
+    }
+    if value.fract() == 0.0 {
+        return format!("{value:.0}");
+    }
+    format!("{value}")
+}
+
+/// Compact JSON with JavaScript semantics (key order and number rendering),
+/// matching OpenCode's `ProviderShared.encodeJson`.
+fn js_json(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(number) => js_number(number),
+        Value::String(text) => serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string()),
+        Value::Array(items) => format!(
+            "[{}]",
+            items.iter().map(js_json).collect::<Vec<_>>().join(",")
+        ),
+        Value::Object(object) => format!(
+            "{{{}}}",
+            object
+                .iter()
+                .map(|(key, value)| format!(
+                    "{}:{}",
+                    serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_string()),
+                    js_json(value)
+                ))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    }
+}
+
+fn freeform_json(value: &Value) -> String {
+    js_json(value)
+}
+
+fn freeform_lark_string(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
+}
+
+fn freeform_minimum(schema: &Value) -> i64 {
+    let minimum = schema.get("minimum").and_then(Value::as_i64);
+    let exclusive = schema
+        .get("exclusiveMinimum")
+        .and_then(Value::as_i64)
+        .map(|value| value + 1);
+    minimum
+        .into_iter()
+        .chain(exclusive)
+        .max()
+        .unwrap_or(i64::MIN)
+}
+
+fn freeform_value_rule(schema: &Value) -> Option<String> {
+    if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+        if values.is_empty() {
+            return None;
+        }
+        return Some(format!(
+            "({})",
+            values
+                .iter()
+                .map(freeform_json)
+                .collect::<Vec<_>>()
+                .join(" | ")
+        ));
+    }
+    match schema.get("type").and_then(Value::as_str) {
+        Some("boolean") => Some("(\"true\" | \"false\")".to_string()),
+        Some("number") => {
+            Some("/-?(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?/".to_string())
+        }
+        Some("string") => Some(
+            "/\"(?:[^\"\\\\\\x00-\\x1f]|\\\\[\"\\\\\\/bfnrt]|\\\\u[0-9a-fA-F]{4})*\"/".to_string(),
+        ),
+        Some("integer") => {
+            let lowest = freeform_minimum(schema);
+            if lowest >= 1 {
+                Some("/[1-9][0-9]*/".to_string())
+            } else if lowest >= 0 {
+                Some("/0|[1-9][0-9]*/".to_string())
+            } else {
+                Some("/-?(?:0|[1-9][0-9]*)/".to_string())
+            }
+        }
+        _ => None,
+    }
+}
+
+fn freeform_sample(schema: &Value) -> Value {
+    if let Some(value) = schema
+        .get("enum")
+        .and_then(Value::as_array)
+        .and_then(|values| values.first())
+    {
+        return value.clone();
+    }
+    match schema.get("type").and_then(Value::as_str) {
+        Some("boolean") => json!(true),
+        Some("string") => json!("..."),
+        _ => json!(freeform_minimum(schema).max(1)),
+    }
+}
+
+fn freeform_options_description(fields: &[FreeformField]) -> String {
+    let required: Vec<&FreeformField> = fields.iter().filter(|field| field.required).collect();
+    let sample = if required.is_empty() {
+        fields
+            .iter()
+            .find(|field| field.schema.get("type").and_then(Value::as_str) == Some("boolean"))
+            .or_else(|| fields.first())
+    } else {
+        required.first().copied()
+    };
+    let example = sample
+        .map(|field| {
+            format!(
+                "{}: {}",
+                freeform_json(&Value::String(field.name.clone())),
+                freeform_json(&freeform_sample(&field.schema))
+            )
+        })
+        .unwrap_or_default();
+    let mut out = vec![if required.is_empty() {
+        "To set the parameters below, start with a `// @options:` line holding a JSON object of them, then write `code` from the next line. Leave the line out to use the defaults.".to_string()
+    } else {
+        "Start with a `// @options:` line holding a JSON object of the parameters below, then write `code` from the next line.".to_string()
+    }];
+    for field in fields {
+        let kind = field
+            .schema
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let description = field
+            .schema
+            .get("description")
+            .and_then(Value::as_str)
+            .map(|description| format!(": {description}"))
+            .unwrap_or_default();
+        out.push(format!(
+            "- `{}` ({}{}){description}",
+            field.name,
+            kind,
+            if field.required { ", required" } else { "" }
+        ));
+    }
+    out.push("For example:".to_string());
+    out.push(format!("{FREEFORM_PREFIX} {{{example}}}"));
+    out.push("<code>".to_string());
+    out.join("\n")
+}
+
+fn freeform_line_grammar(fields: &[FreeformField]) -> String {
+    let rules: Vec<String> = fields
+        .iter()
+        .filter_map(|field| freeform_value_rule(&field.schema))
+        .collect();
+    if rules.len() != fields.len() {
+        return String::new();
+    }
+    let has_required = fields.iter().any(|field| field.required);
+    let pairs = fields
+        .iter()
+        .zip(rules.iter())
+        .map(|(field, rule)| {
+            format!(
+                "{} \" \"* \":\" \" \"* {}",
+                freeform_lark_string(&freeform_json(&Value::String(field.name.clone()))),
+                rule
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+    [
+        format!(
+            "start: ff_line ff_body{}",
+            if has_required { "" } else { " | ff_plain" }
+        ),
+        format!(
+            "ff_line: {} \" \"* \"{{\" \" \"* ff_pair (\" \"* \",\" \" \"* ff_pair)* \" \"* \"}}\" \"\\n\"",
+            freeform_lark_string(FREEFORM_PREFIX)
+        ),
+        format!("ff_pair: {pairs}"),
+        "ff_body: /[\\s\\S]+/".to_string(),
+        format!("ff_plain: /{}/", freeform_not_starting_with(FREEFORM_PREFIX)),
+    ]
+    .join("\n")
+}
+
+fn freeform_not_starting_with(prefix: &str) -> String {
+    let chars: Vec<char> = prefix.chars().collect();
+    let head = |end: usize| {
+        chars[..end]
+            .iter()
+            .map(|character| freeform_escape_regex(&character.to_string()))
+            .collect::<String>()
+    };
+    let differs = chars
+        .iter()
+        .enumerate()
+        .map(|(index, character)| {
+            format!(
+                "{}[^{}]",
+                head(index),
+                freeform_escape_class(&character.to_string())
+            )
+        })
+        .collect::<Vec<_>>();
+    let shorter = (0..chars.len().saturating_sub(1))
+        .map(|index| head(index + 1))
+        .collect::<Vec<_>>();
+    format!(
+        "(?:{})[\\s\\S]*{}",
+        differs.join("|"),
+        if shorter.is_empty() {
+            String::new()
+        } else {
+            format!("|{}", shorter.join("|"))
+        }
+    )
+}
+
+fn freeform_escape_regex(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if matches!(
+                character,
+                '\\' | '^'
+                    | '$'
+                    | '.'
+                    | '*'
+                    | '+'
+                    | '?'
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '|'
+                    | '/'
+            ) {
+                format!("\\{character}")
+            } else {
+                character.to_string()
+            }
+        })
+        .collect()
+}
+
+fn freeform_escape_class(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if matches!(character, '\\' | ']' | '^' | '-' | '/') {
+                format!("\\{character}")
+            } else {
+                character.to_string()
+            }
+        })
+        .collect()
+}
+
+/// OpenCode `OpenAIFreeform.parse`: the raw call text becomes JSON arguments
+/// for the tool's field, and a valid first-line options object is returned as
+/// the replay header. Malformed options text stays raw, exactly like OpenCode,
+/// so downstream JSON parsing rejects the call instead of running the line.
+fn freeform_parse(raw: &str, options: bool, field: &str) -> (String, Option<String>) {
+    let plain = || (js_json(&json!({ field: raw })), None);
+    if !options {
+        return plain();
+    }
+    let Some(end) = raw.find('\n') else {
+        return plain();
+    };
+    let header = &raw[..end];
+    let Some(options_text) = header.strip_prefix(FREEFORM_PREFIX) else {
+        return plain();
+    };
+    let Ok(Value::Object(mut object)) = serde_json::from_str::<Value>(options_text) else {
+        return (raw.to_string(), None);
+    };
+    object.insert(field.to_string(), Value::String(raw[end + 1..].to_string()));
+    (js_json(&Value::Object(object)), Some(header.to_string()))
+}
+
+fn freeform_options(object: &serde_json::Map<String, Value>) -> Option<String> {
+    let mut options = Vec::new();
+    for name in ["timeout", "background"] {
+        if let Some(value) = object.get(name) {
+            options.push(format!(
+                "{}:{}",
+                freeform_json(&Value::String(name.to_string())),
+                freeform_json(value)
+            ));
+        }
+    }
+    (!options.is_empty()).then(|| options.join(","))
+}
+
+fn freeform_header_matches(header: &str, input: &Value) -> bool {
+    let Some(saved) = header
+        .strip_prefix(FREEFORM_PREFIX)
+        .and_then(|value| serde_json::from_str::<Value>(value.trim()).ok())
+        .and_then(|value| value.as_object().cloned())
+    else {
+        return false;
+    };
+    let Some(object) = input.as_object() else {
+        return false;
+    };
+    ["timeout", "background"]
+        .iter()
+        .all(|name| saved.get(*name) == object.get(*name))
+}
+
+fn freeform_raw(input: &Value, header: Option<&str>, custom: &FreeformCustom) -> String {
+    let Some(object) = input.as_object() else {
+        return freeform_json(input);
+    };
+    let Some(value) = object.get(&custom.field).and_then(Value::as_str) else {
+        return freeform_json(input);
+    };
+    if !custom.options {
+        return value.to_string();
+    }
+    let Some(options) = freeform_options(object) else {
+        return value.to_string();
+    };
+    if let Some(header) = header
+        && freeform_header_matches(header, input)
+    {
+        return format!("{header}\n{value}");
+    }
+    format!("{FREEFORM_PREFIX} {{{options}}}\n{value}")
+}
+
+fn freeform_messages(
+    messages: &[ChatMessage],
+    customs: &std::collections::HashMap<String, FreeformCustom>,
+) -> Value {
+    let mut value = serde_json::to_value(messages).unwrap_or_else(|_| Value::Array(Vec::new()));
+    let Some(items) = value.as_array_mut() else {
+        return value;
+    };
+    for message in items {
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for call in calls.iter_mut() {
+            let name = call
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let Some(custom) = name.as_deref().and_then(|name| customs.get(name)) else {
+                if let Some(object) = call.as_object_mut() {
+                    object.remove("custom_header");
+                }
+                continue;
+            };
+            let Some(arguments) = call
+                .get("function")
+                .and_then(|function| function.get("arguments"))
+                .and_then(Value::as_str)
+            else {
+                if let Some(object) = call.as_object_mut() {
+                    object.remove("custom_header");
+                }
+                continue;
+            };
+            let Ok(input) = serde_json::from_str::<Value>(arguments) else {
+                if let Some(object) = call.as_object_mut() {
+                    object.remove("custom_header");
+                }
+                continue;
+            };
+            let id = call.get("id").cloned().unwrap_or(Value::Null);
+            let header = call
+                .get("custom_header")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            *call = json!({
+                "id": id,
+                "type": "custom",
+                "custom": {
+                    "name": name,
+                    "input": freeform_raw(&input, header.as_deref(), custom),
+                },
+            });
+        }
+    }
+    value
+}
+
+/// OpenCode's OpenAI Chat lowering for chronological `Message.system(...)`
+/// updates: XML-escape the text, wrap it in `<system-update>`, and merge it
+/// into the preceding user message when one is last, exactly like
+/// `ProviderShared.wrappedSystemUpdate` + `lowerMessages`.
+fn wrap_system_update(text: &str) -> String {
+    let escaped = text
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    format!("<system-update>\n{escaped}\n</system-update>")
+}
+
+/// OpenCode re-encodes a replayed function call from its parsed input
+/// (`encodeJson(part.input)`), which drops insignificant whitespace, normalizes
+/// escapes/numbers, and keeps key order. Malformed arguments never became a
+/// tool call upstream, so they are left untouched.
+fn normalize_function_arguments(value: &mut Value) {
+    let Some(messages) = value.as_array_mut() else {
+        return;
+    };
+    for message in messages {
+        let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for call in calls {
+            if call.get("type").and_then(Value::as_str) != Some("function") {
+                continue;
+            }
+            let Some(constructed) = call.get("function") else {
+                continue;
+            };
+            let Some(arguments) = constructed.get("arguments").and_then(Value::as_str) else {
+                continue;
+            };
+            let Ok(parsed) = serde_json::from_str::<Value>(arguments) else {
+                continue;
+            };
+            if let Some(function) = call.get_mut("function") {
+                function["arguments"] = Value::String(js_json(&parsed));
+            }
+        }
+    }
+}
+
+fn lower_system_updates(value: &mut Value) {
+    let Some(messages) = value.as_array_mut() else {
+        return;
+    };
+    let mut out: Vec<Value> = Vec::with_capacity(messages.len());
+    for (index, message) in std::mem::take(messages).into_iter().enumerate() {
+        if index > 0 && message.get("role").and_then(Value::as_str) == Some("system") {
+            let wrapped = wrap_system_update(
+                message
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            );
+            if let Some(previous) = out.last_mut()
+                && previous.get("role").and_then(Value::as_str) == Some("user")
+            {
+                match previous.get_mut("content") {
+                    Some(Value::String(content)) => {
+                        content.push('\n');
+                        content.push_str(&wrapped);
+                        continue;
+                    }
+                    Some(Value::Array(parts)) => {
+                        parts.push(json!({"type": "text", "text": wrapped}));
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            out.push(json!({"role": "user", "content": wrapped}));
+            continue;
+        }
+        out.push(message);
+    }
+    *messages = out;
+}
+
+fn freeform_strip_headers(value: &mut Value) {
+    let Some(items) = value.as_array_mut() else {
+        return;
+    };
+    for message in items {
+        let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for call in calls {
+            if let Some(object) = call.as_object_mut() {
+                object.remove("custom_header");
+            }
+        }
+    }
+}
+
+fn freeform_stream_delta(raw: &str) -> String {
+    let encoded = serde_json::to_string(raw).unwrap_or_else(|_| "\"\"".to_string());
+    encoded[1..encoded.len().saturating_sub(1)].to_string()
+}
+
+fn freeform_stream_start(field: &str, raw: &str) -> String {
+    format!(
+        "{{{}:\"{}",
+        js_json(&Value::String(field.to_string())),
+        freeform_stream_delta(raw)
+    )
+}
+
+fn freeform_stream_close() -> &'static str {
+    "\"}"
+}
+
+fn freeform_stream(
+    stream: EventStream,
+    customs: std::collections::HashMap<String, FreeformCustom>,
+) -> EventStream {
+    let out = async_stream::try_stream! {
+        let mut stream = stream;
+        let mut order: Vec<usize> = Vec::new();
+        let mut pending: std::collections::BTreeMap<
+            usize,
+            (Option<String>, Option<String>, String, bool),
+        > = std::collections::BTreeMap::new();
+        while let Some(event) = stream.next().await {
+            match event? {
+                ProviderEvent::CustomTool {
+                    index,
+                    id,
+                    name,
+                    input,
+                } => {
+                    let entry = pending.entry(index).or_insert_with(|| {
+                        order.push(index);
+                        (None, None, String::new(), false)
+                    });
+                    if id.is_some() {
+                        entry.0 = id.clone();
+                    }
+                    if name.is_some() {
+                        entry.1 = name.clone();
+                    }
+                    let chunk = input.unwrap_or_default();
+                    entry.2.push_str(&chunk);
+                    let first = !entry.3;
+                    entry.3 = true;
+                    let field = entry
+                        .1
+                        .as_deref()
+                        .and_then(|name| customs.get(name))
+                        .map(|custom| custom.field.as_str())
+                        .unwrap_or("input");
+                    let arguments = if first {
+                        freeform_stream_start(field, &chunk)
+                    } else {
+                        freeform_stream_delta(&chunk)
+                    };
+                    yield ProviderEvent::ToolCall {
+                        index,
+                        id,
+                        name,
+                        arguments: Some(arguments),
+                    };
+                }
+                ProviderEvent::Done { finish_reason } => {
+                    for index in order.drain(..) {
+                        if let Some((id, name, raw, _opened)) = pending.remove(&index) {
+                            yield ProviderEvent::ToolCall {
+                                index,
+                                id: None,
+                                name: None,
+                                arguments: Some(freeform_stream_close().to_string()),
+                            };
+                            let custom = name.as_deref().and_then(|name| customs.get(name));
+                            let (arguments, header) = match custom {
+                                Some(custom) => {
+                                    freeform_parse(&raw, custom.options, &custom.field)
+                                }
+                                None => freeform_parse(&raw, false, "input"),
+                            };
+                            yield ProviderEvent::ToolCallFinal {
+                                index,
+                                id,
+                                name,
+                                arguments,
+                                header,
+                            };
+                        }
+                    }
+                    yield ProviderEvent::Done { finish_reason };
+                }
+                other => yield other,
+            }
+        }
+    };
+    Box::pin(out)
+}
+
 impl Provider {
     /// Fetch model metadata (context window) from the OpenAI-compatible
     /// `/models` endpoint and cache it for compaction. Best-effort: failures
@@ -968,6 +1821,7 @@ impl Provider {
             client,
             config,
             fallback: None,
+            freeform: Vec::new(),
         })
     }
 
@@ -975,6 +1829,17 @@ impl Provider {
     /// circuit breaker is open.
     pub fn with_fallback(mut self, fallback: ProviderConfig) -> Self {
         self.fallback = Some(fallback);
+        self
+    }
+
+    /// OpenCode model capability: freeform tool formats (`text`, `lark`,
+    /// `regex`). An empty list keeps the JSON function schema.
+    pub fn with_freeform(mut self, formats: Vec<String>) -> Self {
+        self.freeform = formats
+            .into_iter()
+            .map(|format| format.trim().to_ascii_lowercase())
+            .filter(|format| matches!(format.as_str(), "text" | "lark" | "regex"))
+            .collect();
         self
     }
 
@@ -998,6 +1863,13 @@ impl Provider {
         config.model = self.config.resolve_model(model);
         let mut provider = Self::new(config)?;
         provider.fallback = self.fallback.clone();
+        if provider
+            .config
+            .model
+            .eq_ignore_ascii_case(&self.config.model)
+        {
+            provider.freeform = self.freeform.clone();
+        }
         Ok(provider)
     }
 
@@ -1020,7 +1892,10 @@ impl Provider {
                 ProviderEvent::Text(chunk) => text.push_str(&chunk),
                 ProviderEvent::Usage(value) => usage = value,
                 ProviderEvent::Done { .. } => break,
-                ProviderEvent::Reasoning(_) | ProviderEvent::ToolCall { .. } => {}
+                ProviderEvent::Reasoning(_)
+                | ProviderEvent::ToolCall { .. }
+                | ProviderEvent::CustomTool { .. }
+                | ProviderEvent::ToolCallFinal { .. } => {}
             }
         }
         Ok(Completion {
@@ -1127,16 +2002,35 @@ impl Provider {
             return Err(ProviderError::MissingApiKey);
         }
 
+        let formats: &[String] = if config.model.eq_ignore_ascii_case(&self.config.model) {
+            &self.freeform
+        } else {
+            &[]
+        };
+        let (outgoing_tools, customs) = freeform_tools(tools, formats);
+        let freeform = !customs.is_empty();
+        let mut outgoing_messages = if freeform {
+            freeform_messages(messages, &customs)
+        } else {
+            let mut value =
+                serde_json::to_value(messages).unwrap_or_else(|_| Value::Array(Vec::new()));
+            freeform_strip_headers(&mut value);
+            value
+        };
+        normalize_function_arguments(&mut outgoing_messages);
+        lower_system_updates(&mut outgoing_messages);
         let mut body = json!({
             "model": config.model,
-            "messages": messages,
+            "messages": outgoing_messages,
             "stream": true,
             "temperature": temperature,
             "stream_options": {"include_usage": true},
         });
-        // No max_tokens by default: the provider applies the model's own
-        // limit, exactly like Codex. Only an explicit env cap or a 402 retry
-        // adds one.
+        // OpenCode computes `max_tokens` from its models.dev output limit and
+        // context estimate. Stark has no output-limit catalog, so it leaves
+        // the cap to the provider unless `STARK_MAX_OUTPUT_TOKENS` is set, or
+        // a 402 retry fits it to the affordable balance. This is a model-policy
+        // difference outside the Code Mode tools/messages surface.
         let mut max_output = max_output_tokens();
         if let Some(cap) = max_output {
             body["max_tokens"] = json!(cap);
@@ -1151,9 +2045,11 @@ impl Provider {
                 body["reasoning_effort"] = json!(effort);
             }
         }
-        if !tools.is_empty() {
-            body["tools"] = Value::Array(tools.to_vec());
-            body["tool_choice"] = Value::String("auto".to_string());
+        if !outgoing_tools.is_empty() {
+            // OpenCode omits `tool_choice` unless the caller selected one
+            // (its step-limit "none" is the only such case). The provider
+            // default is already `auto`.
+            body["tools"] = Value::Array(outgoing_tools);
         }
 
         let headers = session_headers(config, session);
@@ -1292,7 +2188,11 @@ impl Provider {
             }
         };
 
-        Ok(Box::pin(stream))
+        Ok(if freeform {
+            freeform_stream(Box::pin(stream), customs)
+        } else {
+            Box::pin(stream)
+        })
     }
 }
 
@@ -1376,6 +2276,21 @@ pub fn parse_sse_data(data: &str) -> Result<Vec<ProviderEvent>, ProviderError> {
                     .get("id")
                     .and_then(Value::as_str)
                     .map(str::to_string);
+                if let Some(custom) = tool_call.get("custom") {
+                    out.push(ProviderEvent::CustomTool {
+                        index,
+                        id,
+                        name: custom
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        input: custom
+                            .get("input")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    });
+                    continue;
+                }
                 let function = tool_call.get("function");
                 let name = function
                     .and_then(|function| function.get("name"))
@@ -1916,6 +2831,816 @@ mod tests {
         assert!(circuit_open(key));
         record_success(key);
         assert!(!circuit_open(key));
+    }
+
+    fn execute_tool() -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": "execute",
+                "description": "desc",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "code": {"type": "string"},
+                        "timeout": {
+                            "type": "integer",
+                            "maximum": 9_007_199_254_740_991u64,
+                            "exclusiveMinimum": 0,
+                            "description": "Optional time in milliseconds to wait for the script before moving it to the background (default 120000). The script keeps running in the background after that; it is never stopped. With `background: true` the call returns immediately instead."
+                        },
+                        "background": {
+                            "type": "boolean",
+                            "description": "Run the script in the background and return immediately with its job ID (useful for long-running work). You will be notified when it completes. DO NOT poll for completion."
+                        }
+                    },
+                    "required": ["code"],
+                    "additionalProperties": true
+                }
+            }
+        })
+    }
+
+    fn execute_custom() -> FreeformCustom {
+        FreeformCustom {
+            field: "code".to_string(),
+            options: true,
+        }
+    }
+
+    fn execute_customs() -> std::collections::HashMap<String, FreeformCustom> {
+        std::collections::HashMap::from([("execute".to_string(), execute_custom())])
+    }
+
+    #[test]
+    fn freeform_tool_wire_matches_opencode_source() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../testdata/opencode_freeform_sequence.json"))
+                .unwrap();
+        for case in fixture["tools"].as_array().unwrap() {
+            let formats = case["formats"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_str().unwrap().to_string())
+                .collect::<Vec<_>>();
+            let tools = case["tools"].as_array().unwrap().clone();
+            let (converted, customs) = freeform_tools(&tools, &formats);
+            assert_eq!(
+                Value::Array(converted),
+                case["expected"],
+                "tools {}",
+                case["name"]
+            );
+            let custom_names = case["expected"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|tool| tool["type"] == "custom")
+                .map(|tool| tool["custom"]["name"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                customs
+                    .keys()
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>(),
+                custom_names.into_iter().collect(),
+                "custom map {}",
+                case["name"]
+            );
+        }
+    }
+
+    #[test]
+    fn freeform_execute_matches_opencode_wire() {
+        let full = serde_json::from_str::<Value>(include_str!(
+            "../testdata/opencode_freeform_execute.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            freeform_execute(&execute_tool(), &["text".into(), "lark".into()]),
+            Some(full.clone())
+        );
+        // A lark-only model does not accept `execute`'s `text` freeform.
+        assert_eq!(freeform_execute(&execute_tool(), &["lark".into()]), None);
+        // Text-only models get the options line as unconstrained text, not a
+        // Lark grammar.
+        let mut text_full = full.clone();
+        text_full["custom"]["format"] = json!({"type": "text"});
+        assert_eq!(
+            freeform_execute(&execute_tool(), &["text".into()]),
+            Some(text_full)
+        );
+
+        let text = serde_json::from_str::<Value>(include_str!(
+            "../testdata/opencode_freeform_execute_text.json"
+        ))
+        .unwrap();
+        let mut simple = execute_tool();
+        simple["function"]["parameters"] = json!({"type": "object", "properties": {"code": {"type": "string"}}, "required": ["code"]});
+        assert_eq!(freeform_execute(&simple, &["text".into()]), Some(text));
+    }
+
+    fn apply_patch_tool() -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": "apply_patch",
+                "description": "Apply a unified patch.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "input": {
+                            "type": "string",
+                            "description": "Patch text. Start with *** Begin Patch and end with *** End Patch."
+                        }
+                    },
+                    "required": ["input"]
+                }
+            }
+        })
+    }
+
+    fn patch_custom() -> FreeformCustom {
+        FreeformCustom {
+            field: "input".to_string(),
+            options: false,
+        }
+    }
+
+    #[test]
+    fn apply_patch_uses_opencode_patch_grammar() {
+        let tools = vec![execute_tool(), apply_patch_tool()];
+        let (converted, customs) = freeform_tools(&tools, &["text".into(), "lark".into()]);
+        assert!(customs.contains_key("execute"));
+        assert!(customs.contains_key("apply_patch"));
+        let patch = converted
+            .iter()
+            .find(|tool| tool["custom"]["name"] == "apply_patch")
+            .expect("patch custom tool");
+        assert_eq!(patch["type"], json!("custom"));
+        assert_eq!(
+            patch["custom"]["description"],
+            json!("Apply a unified patch.")
+        );
+        assert_eq!(patch["custom"]["format"]["type"], json!("grammar"));
+        let grammar = patch_grammar();
+        assert_eq!(
+            patch["custom"]["format"]["grammar"]["definition"],
+            json!(grammar)
+        );
+        assert_eq!(
+            patch["custom"]["format"]["grammar"]["syntax"],
+            json!("lark")
+        );
+        assert!(!grammar.contains("// @options:"));
+        assert!(grammar.starts_with("start: begin_patch hunk+ end_patch\n"));
+        assert!(grammar.ends_with("%import common.LF\n"));
+
+        // Lark-only models accept the patch tool but not text freeform execute.
+        let (converted, customs) = freeform_tools(&tools, &["lark".into()]);
+        assert!(!customs.contains_key("execute"));
+        assert!(customs.contains_key("apply_patch"));
+        assert_eq!(converted[0]["type"], json!("function"));
+        assert_eq!(converted[1]["type"], json!("custom"));
+
+        // Text-only models keep the patch JSON tool.
+        let (converted, customs) = freeform_tools(&tools, &["text".into()]);
+        assert!(customs.contains_key("execute"));
+        assert!(!customs.contains_key("apply_patch"));
+        assert_eq!(converted[1]["type"], json!("function"));
+    }
+
+    #[test]
+    fn apply_patch_replay_and_stream_use_the_input_field() {
+        assert_eq!(
+            freeform_raw(
+                &json!({"input": "*** Begin Patch\n*** End Patch"}),
+                None,
+                &patch_custom()
+            ),
+            "*** Begin Patch\n*** End Patch"
+        );
+        let messages = vec![ChatMessage::assistant_tool_calls(
+            None,
+            vec![ToolCall::function(
+                "call_1",
+                "apply_patch",
+                r#"{"input":"*** Begin Patch\n*** End Patch"}"#,
+            )],
+        )];
+        let customs =
+            std::collections::HashMap::from([("apply_patch".to_string(), patch_custom())]);
+        let value = freeform_messages(&messages, &customs);
+        assert_eq!(
+            value[0]["tool_calls"][0],
+            json!({
+                "id": "call_1",
+                "type": "custom",
+                "custom": {
+                    "name": "apply_patch",
+                    "input": "*** Begin Patch\n*** End Patch"
+                }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_patch_stream_fragments_use_the_input_field() {
+        let events = vec![
+            Ok(ProviderEvent::CustomTool {
+                index: 0,
+                id: Some("c1".to_string()),
+                name: Some("apply_patch".to_string()),
+                input: Some(
+                    "*** Begin Patch
+"
+                    .to_string(),
+                ),
+            }),
+            Ok(ProviderEvent::CustomTool {
+                index: 0,
+                id: None,
+                name: None,
+                input: Some("*** End Patch".to_string()),
+            }),
+            Ok(ProviderEvent::Done {
+                finish_reason: Some("tool_calls".to_string()),
+            }),
+        ];
+        let customs =
+            std::collections::HashMap::from([("apply_patch".to_string(), patch_custom())]);
+        let mut stream = freeform_stream(Box::pin(futures_util::stream::iter(events)), customs);
+        let mut fragments = String::new();
+        let mut final_call = None;
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                ProviderEvent::ToolCall {
+                    arguments: Some(fragment),
+                    ..
+                } => fragments.push_str(&fragment),
+                ProviderEvent::ToolCallFinal {
+                    arguments, header, ..
+                } => final_call = Some((arguments, header)),
+                ProviderEvent::Done { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(fragments, "{\"input\":\"*** Begin Patch\\n*** End Patch\"}");
+        assert_eq!(
+            final_call,
+            Some((
+                "{\"input\":\"*** Begin Patch\\n*** End Patch\"}".to_string(),
+                None
+            ))
+        );
+    }
+
+    #[test]
+    fn freeform_arguments_and_replay_match_opencode() {
+        assert_eq!(
+            freeform_parse(
+                "// @options: {\"timeout\": 1}
+code",
+                true,
+                "code"
+            )
+            .0,
+            json!({"timeout": 1, "code": "code"}).to_string()
+        );
+        assert_eq!(
+            freeform_parse("plain code", false, "code").0,
+            json!({"code": "plain code"}).to_string()
+        );
+        // OpenCode keeps malformed options text raw so JSON parsing rejects it.
+        assert_eq!(
+            freeform_parse(
+                "// @options: {timeout: 1}
+x",
+                true,
+                "code"
+            ),
+            (
+                "// @options: {timeout: 1}
+x"
+                .to_string(),
+                None
+            )
+        );
+        assert_eq!(
+            freeform_parse("// @options: {\"timeout\": 1}", true, "code").0,
+            json!({"code": "// @options: {\"timeout\": 1}"}).to_string()
+        );
+        // An undeclared custom tool falls back to the `input` field.
+        assert_eq!(
+            freeform_parse("raw", false, "input").0,
+            json!({"input": "raw"}).to_string()
+        );
+        assert_eq!(
+            freeform_raw(
+                &json!({"code": "x", "timeout": 1, "background": true}),
+                None,
+                &execute_custom()
+            ),
+            "// @options: {\"timeout\":1,\"background\":true}
+x"
+        );
+        assert_eq!(
+            freeform_raw(&json!({"code": "x"}), None, &execute_custom()),
+            "x"
+        );
+        let exact = "// @options: { \"background\" : true, \"timeout\": 2}";
+        let input = json!({"code": "x", "timeout": 2, "background": true});
+        assert_eq!(
+            freeform_raw(&input, Some(exact), &execute_custom()),
+            format!(
+                "{exact}
+x"
+            )
+        );
+        assert_eq!(
+            freeform_raw(
+                &json!({"code": "x", "timeout": 3, "background": true}),
+                Some(exact),
+                &execute_custom()
+            ),
+            "// @options: {\"timeout\":3,\"background\":true}
+x"
+        );
+
+        let messages = vec![ChatMessage::assistant_tool_calls(
+            None,
+            vec![ToolCall::function(
+                "call_1",
+                "execute",
+                r#"{"code":"x","timeout":1,"background":true}"#,
+            )],
+        )];
+        let value = freeform_messages(&messages, &execute_customs());
+        let expected_input = "// @options: {\"timeout\":1,\"background\":true}
+"
+        .to_string()
+            + "x";
+        assert_eq!(
+            value[0]["tool_calls"][0],
+            json!({
+                "id": "call_1",
+                "type": "custom",
+                "custom": {
+                    "name": "execute",
+                    "input": expected_input
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn custom_tool_deltas_parse() {
+        let events = parse_sse_data(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"custom","custom":{"name":"execute","input":"let x"}}]}}]}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            &events[0],
+            ProviderEvent::CustomTool { index: 0, id: Some(id), name: Some(name), input: Some(input) }
+                if id == "c1" && name == "execute" && input == "let x"
+        ));
+    }
+
+    #[tokio::test]
+    async fn freeform_stream_rebuilds_json_arguments() {
+        let events = vec![
+            Ok(ProviderEvent::CustomTool {
+                index: 0,
+                id: Some("c1".to_string()),
+                name: Some("execute".to_string()),
+                input: Some("let ".to_string()),
+            }),
+            Ok(ProviderEvent::CustomTool {
+                index: 0,
+                id: None,
+                name: None,
+                input: Some("x = 1".to_string()),
+            }),
+            Ok(ProviderEvent::Done {
+                finish_reason: Some("tool_calls".to_string()),
+            }),
+        ];
+        let mut stream = freeform_stream(
+            Box::pin(futures_util::stream::iter(events)),
+            execute_customs(),
+        );
+        let first = stream.next().await.unwrap().unwrap();
+        assert!(matches!(
+            first,
+            ProviderEvent::ToolCall { index: 0, arguments: Some(arguments), .. }
+                if arguments == "{\"code\":\"let "
+        ));
+        let second = stream.next().await.unwrap().unwrap();
+        assert!(matches!(
+            second,
+            ProviderEvent::ToolCall { index: 0, arguments: Some(arguments), .. }
+                if arguments == "x = 1"
+        ));
+        let close = stream.next().await.unwrap().unwrap();
+        assert!(matches!(
+            close,
+            ProviderEvent::ToolCall { index: 0, arguments: Some(arguments), .. }
+                if arguments == "\"}"
+        ));
+        let final_call = stream.next().await.unwrap().unwrap();
+        assert!(matches!(
+            final_call,
+            ProviderEvent::ToolCallFinal { index: 0, arguments, header: None, .. }
+                if arguments == r#"{"code":"let x = 1"}"#
+        ));
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap(),
+            ProviderEvent::Done { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn freeform_stream_keeps_the_exact_options_header() {
+        let header = "// @options: { \"timeout\" : 1}";
+        let raw = format!(
+            "{header}
+x"
+        );
+        let events = vec![
+            Ok(ProviderEvent::CustomTool {
+                index: 0,
+                id: Some("c1".to_string()),
+                name: Some("execute".to_string()),
+                input: Some(raw),
+            }),
+            Ok(ProviderEvent::Done {
+                finish_reason: Some("tool_calls".to_string()),
+            }),
+        ];
+        let mut stream = freeform_stream(
+            Box::pin(futures_util::stream::iter(events)),
+            execute_customs(),
+        );
+        let _opening = stream.next().await.unwrap().unwrap();
+        let _close = stream.next().await.unwrap().unwrap();
+        let final_call = stream.next().await.unwrap().unwrap();
+        match final_call {
+            ProviderEvent::ToolCallFinal {
+                index: 0,
+                arguments,
+                header: Some(saved),
+                ..
+            } => {
+                assert_eq!(arguments, r#"{"timeout":1,"code":"x"}"#);
+                assert_eq!(saved, header);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn textless_tool_turn_serializes_content_null() {
+        let message = ChatMessage::assistant_tool_calls(
+            None,
+            vec![ToolCall::function("c1", "read", r#"{"file_path":"a"}"#)],
+        );
+        let value = serde_json::to_value(&message).unwrap();
+        assert_eq!(value["content"], Value::Null);
+        assert_eq!(value["role"], json!("assistant"));
+        let text = ChatMessage::assistant("thinking");
+        assert_eq!(
+            serde_json::to_value(&text).unwrap()["content"],
+            json!("thinking")
+        );
+    }
+
+    #[test]
+    fn replayed_function_arguments_match_opencode_encode_json() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../testdata/opencode_freeform_sequence.json"))
+                .unwrap();
+        for case in fixture["json"].as_array().unwrap() {
+            let parsed = serde_json::from_str::<Value>(case["raw"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                js_json(&parsed),
+                case["normalized"].as_str().unwrap(),
+                "json {}",
+                case["raw"]
+            );
+        }
+
+        let mut messages = json!([
+            {"role": "system", "content": "base"},
+            {"role": "assistant", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {
+                    "name": "read", "arguments": "{\"file_path\":\"a.txt\", \"limit\": 2}"
+                }},
+                {"id": "c2", "type": "custom", "custom": {"name": "execute", "input": "x"}}
+            ]},
+            {"role": "assistant", "tool_calls": [
+                {"id": "c3", "type": "function", "function": {
+                    "name": "read", "arguments": "{not json"
+                }}
+            ]}
+        ]);
+        normalize_function_arguments(&mut messages);
+        assert_eq!(
+            messages[1]["tool_calls"][0]["function"]["arguments"],
+            json!("{\"file_path\":\"a.txt\",\"limit\":2}")
+        );
+        assert_eq!(messages[1]["tool_calls"][1]["custom"]["input"], json!("x"));
+        assert_eq!(
+            messages[2]["tool_calls"][0]["function"]["arguments"],
+            json!("{not json")
+        );
+    }
+
+    #[test]
+    fn freeform_parse_and_replay_match_opencode_source() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../testdata/opencode_freeform_sequence.json"))
+                .unwrap();
+        for case in fixture["parse"].as_array().unwrap() {
+            let raw = case["raw"].as_str().unwrap();
+            let (options, field) = match case["custom"].as_str().unwrap() {
+                "full" => (true, "code"),
+                "plain" => (false, "code"),
+                _ => (false, "input"),
+            };
+            let (arguments, header) = freeform_parse(raw, options, field);
+            assert_eq!(
+                arguments,
+                case["input"].as_str().unwrap(),
+                "parse {}",
+                case["name"]
+            );
+            assert_eq!(
+                header.as_deref(),
+                case["header"].as_str(),
+                "parse header {}",
+                case["name"]
+            );
+        }
+        for case in fixture["replay"].as_array().unwrap() {
+            let raw = freeform_raw(&case["input"], case["header"].as_str(), &execute_custom());
+            assert_eq!(
+                raw,
+                case["raw"].as_str().unwrap(),
+                "replay {}",
+                case["name"]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn freeform_stream_fragments_match_opencode_source() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../testdata/opencode_freeform_sequence.json"))
+                .unwrap();
+        for case in fixture["stream"].as_array().unwrap() {
+            let chunks = case["chunks"].as_array().unwrap();
+            let mut events = Vec::new();
+            for (index, chunk) in chunks.iter().enumerate() {
+                events.push(Ok(ProviderEvent::CustomTool {
+                    index: 0,
+                    id: (index == 0).then(|| "c1".to_string()),
+                    name: (index == 0).then(|| "execute".to_string()),
+                    input: Some(chunk.as_str().unwrap().to_string()),
+                }));
+            }
+            events.push(Ok(ProviderEvent::Done {
+                finish_reason: Some("tool_calls".to_string()),
+            }));
+            let mut stream = freeform_stream(
+                Box::pin(futures_util::stream::iter(events)),
+                execute_customs(),
+            );
+            let mut fragments = Vec::new();
+            while let Some(event) = stream.next().await {
+                match event.unwrap() {
+                    ProviderEvent::ToolCall {
+                        arguments: Some(fragment),
+                        ..
+                    } => fragments.push(fragment),
+                    ProviderEvent::Done { .. } => break,
+                    _ => {}
+                }
+            }
+            let expected = case["fragments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_str().unwrap().to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(fragments, expected, "stream {}", case["name"]);
+        }
+    }
+
+    #[test]
+    fn system_update_wrapping_matches_opencode_source() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../stark-tools/src/codemode/testdata/opencode_instruction_sequence.json"
+        ))
+        .unwrap();
+        let mut checked = 0;
+        for scenario in fixture["scenarios"].as_array().unwrap() {
+            for step in scenario["steps"].as_array().unwrap() {
+                let Some(update) = step["update"].as_str() else {
+                    continue;
+                };
+                assert_eq!(
+                    wrap_system_update(update),
+                    step["wrapped"].as_str().unwrap(),
+                    "{}",
+                    scenario["name"]
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 6, "checked {checked} updates");
+    }
+
+    #[test]
+    fn chronological_system_updates_match_opencode_lowering() {
+        let messages = vec![
+            ChatMessage::system("base"),
+            ChatMessage::user("first"),
+            ChatMessage::system("use <x> & y"),
+            ChatMessage::assistant("ok"),
+            ChatMessage::system("second"),
+        ];
+        let mut value = serde_json::to_value(&messages).unwrap();
+        lower_system_updates(&mut value);
+        assert_eq!(
+            value,
+            json!([
+                {"role": "system", "content": "base"},
+                {"role": "user", "content": "first\n<system-update>\nuse &lt;x&gt; &amp; y\n</system-update>"},
+                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": "<system-update>\nsecond\n</system-update>"}
+            ])
+        );
+    }
+
+    #[test]
+    fn system_updates_append_to_user_content_parts() {
+        let messages = vec![
+            ChatMessage::system("base"),
+            ChatMessage::user_with_images(
+                "look",
+                vec![ImagePart {
+                    url: "data:image/png;base64,AA==".to_string(),
+                    note: String::new(),
+                }],
+            ),
+            ChatMessage::system("catalog changed"),
+            ChatMessage::user("next"),
+        ];
+        let mut value = serde_json::to_value(&messages).unwrap();
+        lower_system_updates(&mut value);
+        let content = value[1]["content"].as_array().expect("parts");
+        assert_eq!(content[0], json!({"type": "text", "text": "look"}));
+        assert_eq!(content[1]["type"], json!("image_url"));
+        assert_eq!(
+            content[2],
+            json!({"type": "text", "text": "<system-update>\ncatalog changed\n</system-update>"})
+        );
+        assert_eq!(value[2], json!({"role": "user", "content": "next"}));
+    }
+
+    #[tokio::test]
+    async fn freeform_request_and_stream_round_trip() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(serde_json::Value::Null));
+        let seen = captured.clone();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let read = socket.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+                let separator = [13u8, 10u8, 13, 10];
+                let Some(position) = buffer
+                    .windows(separator.len())
+                    .position(|window| window == separator)
+                else {
+                    continue;
+                };
+                let text = String::from_utf8_lossy(&buffer[..position]);
+                let length = text
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if buffer.len() >= position + separator.len() + length {
+                    let body = &buffer[position + separator.len()..];
+                    if let Ok(value) = serde_json::from_slice(body) {
+                        *seen.lock().unwrap() = value;
+                    }
+                    break;
+                }
+            }
+            let blank = String::from_utf8(vec![10, 10]).unwrap();
+            let events = [
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"custom","custom":{"name":"execute","input":"let "}}]}}]}"#,
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"custom":{"input":"x = 1"}}]}}]}"#,
+                r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+                "data: [DONE]",
+                "",
+            ]
+            .join(&blank);
+            let mut response = Vec::new();
+            response.extend_from_slice(b"HTTP/1.1 200 OK");
+            response.extend_from_slice(&[13, 10]);
+            response.extend_from_slice(b"Content-Type: text/event-stream");
+            response.extend_from_slice(&[13, 10]);
+            response.extend_from_slice(format!("Content-Length: {}", events.len()).as_bytes());
+            response.extend_from_slice(&[13, 10]);
+            response.extend_from_slice(b"Connection: close");
+            response.extend_from_slice(&[13, 10, 13, 10]);
+            response.extend_from_slice(events.as_bytes());
+            let _ = socket.write_all(&response).await;
+        });
+
+        let provider = Provider::new(ProviderConfig {
+            mode: "opencode".to_string(),
+            base_url: format!("http://{address}"),
+            api_key: "test".to_string(),
+            model: "mock".to_string(),
+        })
+        .unwrap()
+        .with_freeform(vec!["text".to_string(), "lark".to_string()]);
+        let messages = vec![
+            ChatMessage::assistant_tool_calls(
+                None,
+                vec![
+                    ToolCall::function("c0", "execute", r#"{"code":"old","timeout":1}"#)
+                        .with_custom_header(Some("// @options: { \"timeout\" : 1}")),
+                ],
+            ),
+            ChatMessage::tool("c0", "done"),
+            ChatMessage::user("run it"),
+        ];
+        let mut stream = provider
+            .stream_chat(&messages, &[execute_tool()], 0.0)
+            .await
+            .unwrap();
+        let mut fragments = String::new();
+        let mut final_call = None;
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                ProviderEvent::ToolCall {
+                    arguments: Some(arguments),
+                    ..
+                } => fragments.push_str(&arguments),
+                ProviderEvent::ToolCallFinal {
+                    arguments, header, ..
+                } => final_call = Some((arguments, header)),
+                ProviderEvent::Done { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(fragments, r#"{"code":"let x = 1"}"#);
+        assert_eq!(
+            final_call,
+            Some((r#"{"code":"let x = 1"}"#.to_string(), None))
+        );
+
+        let body = captured.lock().unwrap().clone();
+        assert!(body.get("tool_choice").is_none());
+        assert!(body.get("max_tokens").is_none());
+        assert_eq!(body["stream"], json!(true));
+        assert_eq!(body["stream_options"], json!({"include_usage": true}));
+        assert_eq!(body["temperature"], json!(0.0));
+        assert_eq!(body["messages"][0]["content"], Value::Null);
+        assert_eq!(body["tools"][0]["type"], json!("custom"));
+        assert_eq!(body["tools"][0]["custom"]["name"], json!("execute"));
+        assert_eq!(
+            body["tools"][0]["custom"]["format"]["type"],
+            json!("grammar")
+        );
+        assert_eq!(
+            body["messages"][0]["tool_calls"][0]["type"],
+            json!("custom")
+        );
+        assert_eq!(
+            body["messages"][0]["tool_calls"][0]["custom"]["input"],
+            json!("// @options: { \"timeout\" : 1}\nold")
+        );
+        assert_eq!(body["messages"][2]["content"], json!("run it"));
     }
 
     #[test]

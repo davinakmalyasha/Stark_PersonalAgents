@@ -45,10 +45,9 @@ Make the plan decision-complete: state the goal and success criteria; group impl
 
 When ready, call ask_user_question with the complete plan markdown (starting with a # title) in the question detail and options ["Approve plan", "Keep planning"] with intent {"kind": "plan-review", "approve": "Approve plan"}. Make it the only and final tool call in that assistant response: approval flips the chat to build mode and implementation begins on a later turn; rejection keeps plan mode and returns feedback to incorporate. If the review channel is unavailable or aborted, stay in plan mode and ask the user to switch modes manually; do not proceed with implementation."#;
 
-pub const CODEMODE_SECTION: &str = r#"# Program tool calls
-You have `run_code`: one call runs a JavaScript program that calls Stark tools for you and returns one compact value. Prefer it when the work is a predictable multi-step sequence (read several files, compute over the results, edit, verify) and the program can return a smaller result than the raw tool outputs. Keep using direct tool calls for single lookups, for exploration where each result steers the next step, and for anything needing approval.
-
-Inside a program: tools are synchronous on the global `tools` object (`const text = tools.read({ file_path: "src/lib.rs" });`), and `search("query")` lists available tools by name and description. Return one compact JSON-serializable value; intermediate tool output never enters the conversation, so do the filtering inside the program. Programs have no filesystem, network, process, or import access except through tools. Subagents, user questions, jobs, schedules, and canvas stay outside programs: call those tools directly, never from inside `run_code`."#;
+#[cfg(test)]
+const CODEMODE_SECTION: &str =
+    "# Code Mode\n\n`execute` programs call only the listed tools through `tools`.";
 
 fn platform_label() -> &'static str {
     if cfg!(windows) {
@@ -96,9 +95,18 @@ pub struct AgentPrompt<'a> {
     pub model: &'a str,
     pub mode: &'a str,
     pub depth: u32,
-    pub code_mode: bool,
+    /// Fully rendered `# Code Mode` section, catalog included. `None` keeps
+    /// the agent on direct tool calls.
+    pub code_mode_catalog: Option<&'a str>,
     pub access: &'a str,
     pub skills: Option<&'a [String]>,
+    /// `coding` uses the Developer composer; `general` uses the generic one.
+    pub profile: &'a str,
+    /// Built-in domain instructions for the general profile.
+    pub base_instructions: Option<&'a str>,
+    /// Additive persona from the agent definition.
+    pub persona: Option<&'a str>,
+    pub display: &'a str,
 }
 
 #[cfg(test)]
@@ -117,9 +125,13 @@ pub async fn system_prompt(
         model,
         mode,
         depth,
-        code_mode,
+        code_mode_catalog: code_mode.then_some(CODEMODE_SECTION),
         access: "write",
         skills: None,
+        profile: "coding",
+        base_instructions: None,
+        persona: None,
+        display: "Developer",
     })
     .await
 }
@@ -133,14 +145,36 @@ pub async fn system_prompt_for_agent(context: AgentPrompt<'_>) -> String {
         model,
         mode,
         depth,
-        code_mode,
+        code_mode_catalog,
         access,
         skills,
+        profile,
+        base_instructions,
+        persona,
+        display,
     } = context;
+    let persona = persona.map(str::trim).filter(|value| !value.is_empty());
     // Stable first: identity, persona, project instructions, skills, workspace.
-    let mut prompt = format!(
-        "{IDENTITY}\n\nYou are a coding agent powered by the {model} model, helping the user accomplish their software engineering goals.\n\n{HARNESS}\n\n{COMMUNICATION}\n\n{WORKING_IN_CODEBASES}"
-    );
+    let mut prompt = if profile == "coding" {
+        format!(
+            "{IDENTITY}\n\nYou are a coding agent powered by the {model} model, helping the user accomplish their software engineering goals.\n\n{HARNESS}\n\n{COMMUNICATION}\n\n{WORKING_IN_CODEBASES}"
+        )
+    } else {
+        let base = base_instructions
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("You are {display}, a helpful agent powered by Stark."));
+        format!(
+            "{base} Use the provided tools to inspect and change files. Read before editing. \
+             Never invent tool results. Persist until the task is resolved: if a tool fails, read \
+             the error, fix the arguments or try an alternative tool, and continue. Keep the final answer concise."
+        )
+    };
+    if let Some(persona) = persona {
+        prompt.push_str("\n\n# Agent instructions\n");
+        prompt.push_str(persona);
+    }
     if let Some(instructions) = instructions::load(harness_root, workspace) {
         prompt.push_str("\n\n");
         prompt.push_str(&instructions);
@@ -159,6 +193,13 @@ pub async fn system_prompt_for_agent(context: AgentPrompt<'_>) -> String {
     ));
     prompt.push('\n');
     prompt.push_str(workspace_state::USAGE_HINT);
+    if access == "read" {
+        prompt.push_str(
+            " You are READ-ONLY in this task. Do not edit files, run mutating commands, or call write tools. \
+             Inspect with the read-only tools available to your scope (read/grep/glob, read-only bash, files_changed) and memory. \
+             If the task needs writes, delegate it to a workspace agent instead of doing it yourself.",
+        );
+    }
     if let Some(memory) = memory_block(harness_root, workspace_id).await {
         prompt.push_str("\n\n");
         prompt.push_str(&memory);
@@ -172,9 +213,9 @@ pub async fn system_prompt_for_agent(context: AgentPrompt<'_>) -> String {
         prompt.push_str("\n\n");
         prompt.push_str(SUBAGENT_NOTE);
     }
-    if code_mode {
+    if let Some(catalog) = code_mode_catalog {
         prompt.push_str("\n\n");
-        prompt.push_str(CODEMODE_SECTION);
+        prompt.push_str(catalog);
     }
     // Volatile last: the date changes daily, so the tail recomputes at most
     // once a day instead of breaking the cached prefix every turn.
@@ -222,7 +263,7 @@ mod tests {
         assert!(prompt.contains("Project rule."));
         assert!(prompt.contains("review: Review code."));
         assert!(!prompt.contains("[WORKSPACE MEMORY]"));
-        assert!(!prompt.contains("prefer run_code"));
+        assert!(!prompt.contains("prefer execute"));
         // Stark identity blocks with the software-engineering slant.
         assert!(prompt.contains("# Harness"));
         assert!(prompt.contains("# Communication"));
@@ -260,9 +301,13 @@ mod tests {
             model: "model",
             mode: "build",
             depth: 0,
-            code_mode: false,
+            code_mode_catalog: None,
             access: "read",
             skills: None,
+            profile: "coding",
+            base_instructions: None,
+            persona: None,
+            display: "Developer",
         })
         .await;
         assert!(
@@ -299,12 +344,11 @@ mod tests {
     async fn codemode_section_only_with_flag_and_before_tail() {
         let dir = tempfile::tempdir().unwrap();
         let plain = system_prompt(dir.path(), dir.path(), "model", "build", 0, false).await;
-        assert!(!plain.contains("# Program tool calls"));
+        assert!(!plain.contains("# Code Mode"));
         let coded = system_prompt(dir.path(), dir.path(), "model", "build", 0, true).await;
-        assert!(coded.contains("# Program tool calls"));
-        assert!(coded.contains("`run_code`"));
-        assert!(coded.contains("call those tools directly, never from inside `run_code`"));
-        let section = coded.find("# Program tool calls").unwrap();
+        assert!(coded.contains("# Code Mode"));
+        assert!(coded.contains("`execute`"));
+        let section = coded.find("# Code Mode").unwrap();
         let runtime = coded.find("Current runtime context.").unwrap();
         assert!(section < runtime);
     }

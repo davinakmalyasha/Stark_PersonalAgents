@@ -1,0 +1,105 @@
+{
+  "source": "opencode v2.4.1 (dev 9964772) packages/core/src/codemode/instructions.ts",
+  "scenarios": [
+    {
+      "name": "initial_grow_remove_reenable",
+      "steps": [
+        [
+          { "path": "read.read", "description": "Read a file", "signature": "read(path: string): Promise<string>", "pinned": false }
+        ],
+        [
+          { "path": "read.read", "description": "Read a file", "signature": "read(path: string): Promise<string>", "pinned": false },
+          { "path": "edit.edit", "description": "Edit a file", "signature": "edit(path: string, old: string, new: string): Promise<void>", "pinned": false }
+        ],
+        [
+          { "path": "read.read", "description": "Read a file", "signature": "read(path: string): Promise<string>", "pinned": false },
+          { "path": "edit.edit", "description": "Edit a file", "signature": "edit(path: string, old: string, new: string): Promise<void>", "pinned": false }
+        ],
+        [
+          { "path": "read.read", "description": "Read a file", "signature": "read(path: string): Promise<string>", "pinned": false }
+        ],
+        null,
+        [
+          { "path": "read.read", "description": "Read a file", "signature": "read(path: string): Promise<string>", "pinned": false }
+        ],
+        null
+      ]
+    },
+    {
+      "name": "changed_listing",
+      "steps": [
+        [
+          { "path": "read.read", "description": "Read a file", "signature": "read(path: string): Promise<string>", "pinned": false }
+        ],
+        [
+          { "path": "read.read", "description": "Read a file with line numbers", "signature": "read(path: string, offset?: number): Promise<string>", "pinned": false }
+        ],
+        [
+          { "path": "read.read", "description": "Read a file with line numbers", "signature": "read(path: string, offset?: number): Promise<string>", "pinned": false }
+        ]
+      ]
+    },
+    {
+      "name": "partial_budget_and_search_note",
+      "steps": [
+        [
+          { "path": "github.get", "description": "Get one issue", "signature": "github.get(owner: string, repo: string, number: number): Promise<Issue>", "pinned": false }
+        ],
+        [
+          { "path": "github.get", "description": "Get one issue", "signature": "github.get(owner: string, repo: string, number: number): Promise<Issue>", "pinned": false },
+          {
+            "path": "github.huge",
+            "description": "HUGEDESCRIPTION",
+            "signature": "github.huge(owner: string, repo: string): Promise<Issue[]>",
+            "pinned": false
+          }
+        ],
+        [
+          { "path": "github.get", "description": "Get one issue", "signature": "github.get(owner: string, repo: string, number: number): Promise<Issue>", "pinned": false },
+          {
+            "path": "github.huge",
+            "description": "HUGEDESCRIPTION",
+            "signature": "github.huge(owner: string, repo: string): Promise<Issue[]>",
+            "pinned": false
+          },
+          { "path": "extra.tool", "description": "Extra", "signature": "extra.tool(value: string): Promise<string>", "pinned": false }
+        ],
+        [
+          { "path": "github.get", "description": "Get one issue", "signature": "github.get(owner: string, repo: string, number: number): Promise<Issue>", "pinned": false },
+          { "path": "extra.tool", "description": "Extra", "signature": "extra.tool(value: string): Promise<string>", "pinned": false }
+        ]
+      ]
+    },
+    {
+      "name": "empty_catalog",
+      "steps": [
+        [],
+        [
+          { "path": "read.read", "description": "Read a file", "signature": "read(path: string): Promise<string>", "pinned": false }
+        ],
+        []
+      ]
+    },
+    {
+      "name": "baseline_off_then_on",
+      "steps": [
+        null,
+        [
+          { "path": "read.read", "description": "Read a file", "signature": "read(path: string): Promise<string>", "pinned": false }
+        ],
+        null,
+        null
+      ]
+    },
+    {
+      "name": "pinned_namespace",
+      "steps": [
+        [
+          { "path": "search.search", "description": "Search the catalog", "signature": "search(query: string): Result", "pinned": true },
+          { "path": "search.find", "description": "Find tools\nsecond line", "signature": "search.find(text: string): Result", "pinned": true },
+          { "path": "read.read", "description": "Read a file", "signature": "read(path: string): Promise<string>", "pinned": false }
+        ]
+      ]
+    }
+  ]
+}

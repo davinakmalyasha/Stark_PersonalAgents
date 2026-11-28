@@ -8,6 +8,7 @@
 //! The modal port. Empty board is the honest state when none exist.
 
 use crate::keys::EnterPress;
+use chrono::TimeZone;
 use rune::{col, row, text, El};
 
 fn ink(hex: &'static str) -> rune::Color {
@@ -27,11 +28,48 @@ pub struct GroupProject {
     pub done: u64,
     pub total: u64,
     pub waiting: u64,
+    pub cycle: i64,
+    pub workspace_path: String,
+    pub plan_status: String,
+    pub plan_review: bool,
+    pub recurrence: String,
+    pub repeat_active: bool,
+    pub start_mode: String,
+    pub start_at: Option<f64>,
+    pub next_run_at: Option<f64>,
+    pub members_count: u64,
+    pub spent_usd: Option<f64>,
+}
+
+impl GroupProject {
+    pub fn is_running(&self) -> bool {
+        self.status == "running" || self.status == "planning"
+    }
+
+    pub fn can_start(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            "draft" | "plan_ready" | "scheduled" | "paused" | "blocked"
+        )
+    }
+
+    pub fn repeat_label(&self) -> String {
+        if !self.repeat_active {
+            return String::new();
+        }
+        match self.recurrence.as_str() {
+            "daily" => "Daily".to_string(),
+            "weekly" => "Weekly".to_string(),
+            "monthly" => "Monthly".to_string(),
+            _ => String::new(),
+        }
+    }
 }
 
 impl GroupProject {
     pub fn from_json(v: &serde_json::Value) -> Self {
         let u64_of = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+        let i64_of = |k: &str| v.get(k).and_then(|x| x.as_i64()).unwrap_or(0);
         let title = v
             .get("title")
             .and_then(|x| x.as_str())
@@ -59,6 +97,39 @@ impl GroupProject {
             done,
             total,
             waiting: u64_of("awaiting_approval"),
+            cycle: i64_of("cycle"),
+            workspace_path: v
+                .get("workspace_path")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            plan_status: v
+                .get("plan_status")
+                .and_then(|x| x.as_str())
+                .unwrap_or("none")
+                .to_string(),
+            plan_review: v
+                .get("plan_review")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(true),
+            recurrence: v
+                .get("recurrence")
+                .and_then(|x| x.as_str())
+                .unwrap_or("none")
+                .to_string(),
+            repeat_active: v
+                .get("repeat_active")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false),
+            start_mode: v
+                .get("start_mode")
+                .and_then(|x| x.as_str())
+                .unwrap_or("now")
+                .to_string(),
+            start_at: v.get("start_at").and_then(|x| x.as_f64()),
+            next_run_at: v.get("next_run_at").and_then(|x| x.as_f64()),
+            members_count: u64_of("members_count"),
+            spent_usd: v.get("spent_usd").and_then(|x| x.as_f64()),
         }
     }
 
@@ -106,6 +177,75 @@ impl ProjectsSnapshot {
     }
 }
 
+/// One selectable agent in the create/settings pickers.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ProjectAgentOption {
+    pub key: String,
+    pub display: String,
+    pub description: String,
+    pub valid: bool,
+}
+
+impl ProjectAgentOption {
+    pub fn from_json(v: &serde_json::Value) -> Self {
+        Self {
+            key: v
+                .get("key")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            display: v
+                .get("display")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            description: v
+                .get("description")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            valid: v.get("valid").and_then(|x| x.as_bool()).unwrap_or(true),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TrashProject {
+    pub folder: String,
+    pub id: String,
+    pub title: String,
+    pub deleted_at: Option<f64>,
+    pub workspace_path: String,
+}
+
+impl TrashProject {
+    pub fn from_json(v: &serde_json::Value) -> Self {
+        Self {
+            folder: v
+                .get("folder")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            id: v
+                .get("id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            title: v
+                .get("title")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            deleted_at: v.get("deleted_at").and_then(|x| x.as_f64()),
+            workspace_path: v
+                .get("workspace_path")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+        }
+    }
+}
+
 /// The two-step `NewProjectDialog`'s working mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NewProjectMode {
@@ -125,6 +265,17 @@ pub struct NewProjectDialog {
     pub name: rune::TextEdit,
     pub path: rune::TextEdit,
     pub task: rune::TextEdit,
+    pub team: std::collections::BTreeMap<String, u32>,
+    pub planner: String,
+    pub start_mode: String,
+    pub start_date: rune::TextEdit,
+    pub start_time: rune::TextEdit,
+    pub repeat: String,
+    pub repeat_active: bool,
+    pub review_plan: bool,
+    pub auto_plan: bool,
+    pub max_parallel: u32,
+    pub advanced: bool,
     pub busy: bool,
     pub error: Option<String>,
     pub inbox: Option<std::sync::mpsc::Receiver<Result<NewProjectCreated, String>>>,
@@ -141,6 +292,17 @@ impl Default for NewProjectDialog {
             name: rune::TextEdit::new(""),
             path: rune::TextEdit::new(""),
             task: rune::TextEdit::new(""),
+            team: [("developer".to_string(), 1u32)].into_iter().collect(),
+            planner: "orchestrator".to_string(),
+            start_mode: "now".to_string(),
+            start_date: rune::TextEdit::new(""),
+            start_time: rune::TextEdit::new("09:00"),
+            repeat: "none".to_string(),
+            repeat_active: false,
+            review_plan: true,
+            auto_plan: true,
+            max_parallel: 1,
+            advanced: false,
             busy: false,
             error: None,
             inbox: None,
@@ -158,6 +320,17 @@ impl Clone for NewProjectDialog {
             name: self.name.clone(),
             path: self.path.clone(),
             task: self.task.clone(),
+            team: self.team.clone(),
+            planner: self.planner.clone(),
+            start_mode: self.start_mode.clone(),
+            start_date: self.start_date.clone(),
+            start_time: self.start_time.clone(),
+            repeat: self.repeat.clone(),
+            repeat_active: self.repeat_active,
+            review_plan: self.review_plan,
+            auto_plan: self.auto_plan,
+            max_parallel: self.max_parallel,
+            advanced: self.advanced,
             busy: self.busy,
             error: self.error.clone(),
             inbox: None,
@@ -200,6 +373,19 @@ pub struct ProjectsState {
     pub created: Option<NewProjectCreated>,
     /// Detail modal/chat/rail state (`GroupProjectModal`).
     pub group: crate::group::GroupState,
+    /// Sidebar management: open kebab for this project id.
+    pub menu: Option<String>,
+    /// First press arms Trash; second press moves it.
+    pub confirm_delete: Option<String>,
+    pub action_busy: Option<String>,
+    pub action_inbox: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    pub toast: Option<String>,
+    pub trash: Vec<TrashProject>,
+    pub show_trash: bool,
+    pub trash_inbox: Option<std::sync::mpsc::Receiver<Result<Vec<TrashProject>, String>>>,
+    pub agents: Vec<ProjectAgentOption>,
+    pub agents_loaded: bool,
+    pub agents_inbox: Option<std::sync::mpsc::Receiver<Result<Vec<ProjectAgentOption>, String>>>,
 }
 
 impl std::fmt::Debug for ProjectsState {
@@ -228,6 +414,17 @@ impl Clone for ProjectsState {
             dialog: self.dialog.clone(),
             created: self.created.clone(),
             group: self.group.clone(),
+            menu: self.menu.clone(),
+            confirm_delete: self.confirm_delete.clone(),
+            action_busy: self.action_busy.clone(),
+            action_inbox: None,
+            toast: self.toast.clone(),
+            trash: self.trash.clone(),
+            show_trash: self.show_trash,
+            trash_inbox: None,
+            agents: self.agents.clone(),
+            agents_loaded: self.agents_loaded,
+            agents_inbox: None,
         }
     }
 }
@@ -248,6 +445,17 @@ impl Default for ProjectsState {
             dialog: NewProjectDialog::default(),
             created: None,
             group: crate::group::GroupState::default(),
+            menu: None,
+            confirm_delete: None,
+            action_busy: None,
+            action_inbox: None,
+            toast: None,
+            trash: Vec::new(),
+            show_trash: false,
+            trash_inbox: None,
+            agents: Vec::new(),
+            agents_loaded: false,
+            agents_inbox: None,
         }
     }
 }
@@ -287,6 +495,225 @@ pub fn refresh_projects(s: &mut ProjectsState) {
             let _ = tx.send(ProjectsSnapshot::fetch(&host, port, &ws));
         });
     }
+}
+
+/// Load the visible agents for the create form and settings pickers.
+pub fn load_project_agents(s: &mut ProjectsState) {
+    if s.agents_loaded || s.agents_inbox.is_some() {
+        return;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    s.agents_inbox = Some(rx);
+    #[cfg(not(target_arch = "wasm32"))]
+    let (host, port) = (s.host.clone(), s.port);
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm_bindgen_futures::spawn_local(async move {
+            let result = match crate::transport::fetch_json("/api/config/agents").await {
+                Ok(value) => Ok(parse_agent_options(&value)),
+                Err(error) => Err(error),
+            };
+            let _ = tx.send(result);
+        });
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    std::thread::spawn(move || {
+        let result = crate::transport::get_json(&host, port, "/api/config/agents")
+            .map(|value| parse_agent_options(&value));
+        let _ = tx.send(result);
+    });
+}
+
+fn parse_agent_options(value: &serde_json::Value) -> Vec<ProjectAgentOption> {
+    value
+        .get("agents")
+        .and_then(|x| x.as_array())
+        .map(|agents| {
+            agents
+                .iter()
+                .map(ProjectAgentOption::from_json)
+                .filter(|agent| !agent.key.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub fn refresh_trash(s: &mut ProjectsState) {
+    if s.trash_inbox.is_some() {
+        return;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    s.trash_inbox = Some(rx);
+    #[cfg(not(target_arch = "wasm32"))]
+    let (host, port) = (s.host.clone(), s.port);
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm_bindgen_futures::spawn_local(async move {
+            let result = match crate::transport::fetch_json("/api/groups/trash").await {
+                Ok(value) => Ok(parse_trash(&value)),
+                Err(error) => Err(error),
+            };
+            let _ = tx.send(result);
+        });
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    std::thread::spawn(move || {
+        let result = crate::transport::get_json(&host, port, "/api/groups/trash")
+            .map(|value| parse_trash(&value));
+        let _ = tx.send(result);
+    });
+}
+
+fn parse_trash(value: &serde_json::Value) -> Vec<TrashProject> {
+    value
+        .get("projects")
+        .and_then(|x| x.as_array())
+        .map(|projects| projects.iter().map(TrashProject::from_json).collect())
+        .unwrap_or_default()
+}
+
+/// Start/pause/stop/trash one project without opening its modal.
+pub fn project_action(s: &mut ProjectsState, id: &str, action: &str) {
+    if s.action_busy.is_some() {
+        return;
+    }
+    let id = id.to_string();
+    let action = action.to_string();
+    s.action_busy = Some(format!("{action}:{id}"));
+    s.menu = None;
+    s.confirm_delete = None;
+    s.error = None;
+    let (tx, rx) = std::sync::mpsc::channel();
+    s.action_inbox = Some(rx);
+    #[cfg(not(target_arch = "wasm32"))]
+    let (host, port) = (s.host.clone(), s.port);
+    #[cfg(not(target_arch = "wasm32"))]
+    std::thread::spawn(move || {
+        let path = if action == "trash" {
+            format!("/api/groups/{id}")
+        } else {
+            format!("/api/groups/{id}/{action}")
+        };
+        let method = if action == "trash" { "DELETE" } else { "POST" };
+        let result =
+            crate::transport::send_json(&host, port, method, &path, &serde_json::json!({})).map(
+                |_| match action.as_str() {
+                    "trash" => "Moved to Trash.".to_string(),
+                    "start" => "Project started.".to_string(),
+                    "pause" => "Project paused.".to_string(),
+                    "stop" => "Project stopped.".to_string(),
+                    "close" => "Project closed.".to_string(),
+                    "restart" => "New cycle started.".to_string(),
+                    _ => "Project updated.".to_string(),
+                },
+            );
+        let _ = tx.send(result);
+    });
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm_bindgen_futures::spawn_local(async move {
+            let path = if action == "trash" {
+                format!("/api/groups/{id}")
+            } else {
+                format!("/api/groups/{id}/{action}")
+            };
+            let method = if action == "trash" { "DELETE" } else { "POST" };
+            let result =
+                match crate::transport::fetch_send(method, &path, Some(&serde_json::json!({})))
+                    .await
+                {
+                    Ok(_) => Ok(match action.as_str() {
+                        "trash" => "Moved to Trash.".to_string(),
+                        "start" => "Project started.".to_string(),
+                        "pause" => "Project paused.".to_string(),
+                        "stop" => "Project stopped.".to_string(),
+                        "close" => "Project closed.".to_string(),
+                        _ => "Project updated.".to_string(),
+                    }),
+                    Err(error) => Err(error),
+                };
+            let _ = tx.send(result);
+        });
+    }
+}
+
+pub fn restore_trash(s: &mut ProjectsState, folder: &str) {
+    if s.action_busy.is_some() {
+        return;
+    }
+    let folder = folder.to_string();
+    s.action_busy = Some(format!("restore:{folder}"));
+    let (tx, rx) = std::sync::mpsc::channel();
+    s.action_inbox = Some(rx);
+    #[cfg(not(target_arch = "wasm32"))]
+    let (host, port) = (s.host.clone(), s.port);
+    #[cfg(not(target_arch = "wasm32"))]
+    std::thread::spawn(move || {
+        let result = crate::transport::send_json(
+            &host,
+            port,
+            "POST",
+            &format!("/api/groups/trash/{folder}/restore"),
+            &serde_json::json!({}),
+        )
+        .map(|_| "Project restored.".to_string());
+        let _ = tx.send(result);
+    });
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm_bindgen_futures::spawn_local(async move {
+            let result = crate::transport::fetch_send(
+                "POST",
+                &format!("/api/groups/trash/{folder}/restore"),
+                Some(&serde_json::json!({})),
+            )
+            .await
+            .map(|_| "Project restored.".to_string());
+            let _ = tx.send(result);
+        });
+    }
+}
+
+pub fn delete_trash(s: &mut ProjectsState, folder: &str) {
+    if s.action_busy.is_some() {
+        return;
+    }
+    let folder = folder.to_string();
+    s.action_busy = Some(format!("delete:{folder}"));
+    let (tx, rx) = std::sync::mpsc::channel();
+    s.action_inbox = Some(rx);
+    #[cfg(not(target_arch = "wasm32"))]
+    let (host, port) = (s.host.clone(), s.port);
+    #[cfg(not(target_arch = "wasm32"))]
+    std::thread::spawn(move || {
+        let result = crate::transport::send_json(
+            &host,
+            port,
+            "DELETE",
+            &format!("/api/groups/trash/{folder}"),
+            &serde_json::json!({}),
+        )
+        .map(|_| "Deleted forever.".to_string());
+        let _ = tx.send(result);
+    });
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm_bindgen_futures::spawn_local(async move {
+            let result = crate::transport::fetch_send(
+                "DELETE",
+                &format!("/api/groups/trash/{folder}"),
+                None,
+            )
+            .await
+            .map(|_| "Deleted forever.".to_string());
+            let _ = tx.send(result);
+        });
+    }
+}
+
+pub fn open_project_edit(s: &mut ProjectsState, id: &str) {
+    let (host, port) = (s.host.clone(), s.port);
+    s.group.open_with_settings(host, port, id.to_string());
 }
 
 /// Drain the inbox and auto-refresh at most every 15s (the supervisor ticks
@@ -333,6 +760,41 @@ pub fn poll_projects_state(s: &mut ProjectsState, clock: f64) -> bool {
         }
         changed = true;
     }
+    let (agents, dead_agents) = crate::rooms::drain_results(&mut s.agents_inbox);
+    for result in agents {
+        s.agents_loaded = true;
+        match result {
+            Ok(agents) => s.agents = agents,
+            Err(error) => s.error = Some(error),
+        }
+        changed = true;
+    }
+    if dead_agents && !s.agents_loaded {
+        s.agents_loaded = true;
+        changed = true;
+    }
+    let (actions, _) = crate::rooms::drain_results(&mut s.action_inbox);
+    for result in actions {
+        s.action_busy = None;
+        match result {
+            Ok(message) => {
+                s.toast = Some(message);
+                refresh_projects(s);
+                refresh_trash(s);
+            }
+            Err(error) => s.error = Some(error),
+        }
+        changed = true;
+    }
+    let (trash, dead_trash) = crate::rooms::drain_results(&mut s.trash_inbox);
+    for result in trash {
+        match result {
+            Ok(projects) => s.trash = projects,
+            Err(error) => s.error = Some(error),
+        }
+        changed = true;
+    }
+    let _ = dead_trash;
     if s.auto && !s.loading && clock - s.last_ok > 15.0 {
         refresh_projects(s);
         changed = true;
@@ -355,6 +817,7 @@ fn reset_focus(d: &mut NewProjectDialog) {
 /// Open `NewProjectDialog` on step 1, as a fresh mount: the reference UI's dialog owns
 /// its name/path/task state, so reopening starts empty.
 pub fn open_new_project(s: &mut ProjectsState) {
+    load_project_agents(s);
     let d = &mut s.dialog;
     if d.busy {
         return;
@@ -368,6 +831,19 @@ pub fn open_new_project(s: &mut ProjectsState) {
     d.name.text.clear();
     d.path.text.clear();
     d.task.text.clear();
+    d.team = [("developer".to_string(), 1u32)].into_iter().collect();
+    d.planner = "orchestrator".to_string();
+    d.start_mode = "now".to_string();
+    d.repeat = "none".to_string();
+    d.repeat_active = false;
+    d.review_plan = true;
+    d.auto_plan = true;
+    d.max_parallel = 1;
+    d.advanced = false;
+    if let Some(local) = chrono::Local::now().date_naive().and_hms_opt(9, 0, 0) {
+        d.start_date.text = local.format("%Y-%m-%d").to_string();
+    }
+    d.start_time.text = "09:00".to_string();
     d.name.anchor = 0;
     d.name.focus = 0;
     d.path.anchor = 0;
@@ -487,6 +963,37 @@ fn workspace_from_json(
     })
 }
 
+#[derive(Debug, Clone)]
+struct ProjectSetup {
+    team: std::collections::BTreeMap<String, u32>,
+    planner: String,
+    start_mode: String,
+    start_at: Option<f64>,
+    recurrence: String,
+    repeat_active: bool,
+    review_plan: bool,
+    auto_plan: bool,
+    max_parallel: u32,
+}
+
+fn dialog_start_at(d: &NewProjectDialog) -> Result<Option<f64>, String> {
+    if d.start_mode != "scheduled" {
+        return Ok(None);
+    }
+    let date = d.start_date.text.trim();
+    if date.is_empty() {
+        return Err("Choose a start date.".to_string());
+    }
+    let combined = format!("{date} {}", d.start_time.text.trim());
+    let parsed = chrono::NaiveDateTime::parse_from_str(&combined, "%Y-%m-%d %H:%M")
+        .map_err(|_| "Use date YYYY-MM-DD and time HH:MM.".to_string())?;
+    let local = chrono::Local
+        .from_local_datetime(&parsed)
+        .single()
+        .ok_or_else(|| "That local start time is invalid.".to_string())?;
+    Ok(Some(local.timestamp() as f64))
+}
+
 /// `POST /api/workspaces` → `POST /api/workspaces/{id}/chats` → optional
 /// `POST /api/groups`, the exact sequence behind the reference UI's two-step dialog.
 /// Nothing is created before this point, so Back has no side effects.
@@ -507,21 +1014,45 @@ pub fn create_new_project(s: &mut ProjectsState) {
         d.error = Some("Tell the team what to build.".to_string());
         return;
     }
+    if d.mode == NewProjectMode::Group && d.team.values().copied().sum::<u32>() == 0 {
+        d.error = Some("Add at least one agent.".to_string());
+        return;
+    }
+    let start_at = match dialog_start_at(d) {
+        Ok(value) => value,
+        Err(error) => {
+            d.error = Some(error);
+            return;
+        }
+    };
     d.busy = true;
     d.error = None;
+    let setup = ProjectSetup {
+        team: d.team.clone(),
+        planner: d.planner.clone(),
+        start_mode: d.start_mode.clone(),
+        start_at,
+        recurrence: d.repeat.clone(),
+        repeat_active: d.repeat_active,
+        review_plan: d.review_plan,
+        auto_plan: d.auto_plan,
+        max_parallel: d.max_parallel.clamp(1, 8),
+    };
     let (tx, rx) = std::sync::mpsc::channel();
     d.inbox = Some(rx);
+    #[cfg(not(target_arch = "wasm32"))]
     let (host, port) = (s.host.clone(), s.port);
     let mode = d.mode;
     #[cfg(not(target_arch = "wasm32"))]
     std::thread::spawn(move || {
-        let _ = tx.send(complete_new_project(&host, port, &name, &path, &task, mode));
+        let _ = tx.send(complete_new_project(
+            &host, port, &name, &path, &task, mode, setup,
+        ));
     });
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = (host, port);
         wasm_bindgen_futures::spawn_local(async move {
-            let _ = tx.send(complete_new_project_wasm(name, path, task, mode).await);
+            let _ = tx.send(complete_new_project_wasm(name, path, task, mode, setup).await);
         });
     }
 }
@@ -534,6 +1065,7 @@ fn complete_new_project(
     path: &str,
     task: &str,
     mode: NewProjectMode,
+    setup: ProjectSetup,
 ) -> Result<NewProjectCreated, String> {
     let workspace = crate::transport::send_json(
         host,
@@ -544,33 +1076,52 @@ fn complete_new_project(
     )
     .map_err(|_| "Could not create the project — check the folder path.".to_string())
     .and_then(|v| workspace_from_json(&v, path, name))?;
-    let chat = crate::transport::send_json(
-        host,
-        port,
-        "POST",
-        &format!("/api/workspaces/{}/chats", workspace.id),
-        &serde_json::json!({ "title": "New Chat", "model": "Automatic Fallback" }),
-    )
-    // The reference UI's `handleCreateProject` returns null on any failure, so the
-    // dialog reports the folder-path copy for a failed chat too.
-    .map_err(|_| "Could not create the project — check the folder path.".to_string())?;
-    let chat_id = json_id(&chat)
-        .ok_or_else(|| "Could not create the project — check the folder path.".to_string())?;
-    let chat_title = chat
-        .get("title")
-        .and_then(|x| x.as_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("New Chat")
-        .to_string();
-    let project_id = if mode == NewProjectMode::Group {
-        let project = crate::transport::send_json(
+    let (chat_id, chat_title) = if mode == NewProjectMode::Solo {
+        let chat = crate::transport::send_json(
             host,
             port,
             "POST",
-            "/api/groups",
-            &serde_json::json!({ "goal": task, "workspace_id": workspace.id }),
+            &format!("/api/workspaces/{}/chats", workspace.id),
+            &serde_json::json!({ "title": "New Chat", "model": "Automatic Fallback" }),
         )
-        .map_err(|error| format!("Could not create the group project: {error}"))?;
+        .map_err(|_| "Could not create the project — check the folder path.".to_string())?;
+        (
+            json_id(&chat).ok_or_else(|| {
+                "Could not create the project — check the folder path.".to_string()
+            })?,
+            chat.get("title")
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("New Chat")
+                .to_string(),
+        )
+    } else {
+        (String::new(), String::new())
+    };
+    let project_id = if mode == NewProjectMode::Group {
+        let members: Vec<serde_json::Value> = setup
+            .team
+            .iter()
+            .filter(|(_, amount)| **amount > 0)
+            .map(|(key, amount)| serde_json::json!({"agent_key": key, "amount": amount}))
+            .collect();
+        let payload = serde_json::json!({
+            "title": if name.is_empty() { "Project" } else { name },
+            "goal": task,
+            "workspace_id": workspace.id,
+            "workspace_path": workspace.path,
+            "members": members,
+            "start_mode": setup.start_mode,
+            "start_at": setup.start_at,
+            "recurrence": setup.recurrence,
+            "repeat_active": setup.repeat_active,
+            "plan_review": setup.review_plan,
+            "auto_plan": setup.auto_plan,
+            "planner_agent": setup.planner,
+            "max_parallel": setup.max_parallel,
+        });
+        let project = crate::transport::send_json(host, port, "POST", "/api/groups", &payload)
+            .map_err(|error| format!("Could not create the group project: {error}"))?;
         Some(
             json_id(&project)
                 .ok_or_else(|| "The backend did not return a project id.".to_string())?,
@@ -597,6 +1148,7 @@ async fn complete_new_project_wasm(
     path: String,
     task: String,
     mode: NewProjectMode,
+    setup: ProjectSetup,
 ) -> Result<NewProjectCreated, String> {
     let workspace = crate::transport::fetch_send(
         "POST",
@@ -606,29 +1158,52 @@ async fn complete_new_project_wasm(
     .await
     .map_err(|_| "Could not create the project — check the folder path.".to_string())
     .and_then(|v| workspace_from_json(&v, &path, &name))?;
-    let chat = crate::transport::fetch_send(
-        "POST",
-        &format!("/api/workspaces/{}/chats", workspace.id),
-        Some(&serde_json::json!({ "title": "New Chat", "model": "Automatic Fallback" })),
-    )
-    .await
-    .map_err(|_| "Could not create the project — check the folder path.".to_string())?;
-    let chat_id = json_id(&chat)
-        .ok_or_else(|| "Could not create the project — check the folder path.".to_string())?;
-    let chat_title = chat
-        .get("title")
-        .and_then(|x| x.as_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("New Chat")
-        .to_string();
-    let project_id = if mode == NewProjectMode::Group {
-        let project = crate::transport::fetch_send(
+    let (chat_id, chat_title) = if mode == NewProjectMode::Solo {
+        let chat = crate::transport::fetch_send(
             "POST",
-            "/api/groups",
-            Some(&serde_json::json!({ "goal": &task, "workspace_id": &workspace.id })),
+            &format!("/api/workspaces/{}/chats", workspace.id),
+            Some(&serde_json::json!({ "title": "New Chat", "model": "Automatic Fallback" })),
         )
         .await
-        .map_err(|error| format!("Could not create the group project: {error}"))?;
+        .map_err(|_| "Could not create the project — check the folder path.".to_string())?;
+        (
+            json_id(&chat).ok_or_else(|| {
+                "Could not create the project — check the folder path.".to_string()
+            })?,
+            chat.get("title")
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("New Chat")
+                .to_string(),
+        )
+    } else {
+        (String::new(), String::new())
+    };
+    let project_id = if mode == NewProjectMode::Group {
+        let members: Vec<serde_json::Value> = setup
+            .team
+            .iter()
+            .filter(|(_, amount)| **amount > 0)
+            .map(|(key, amount)| serde_json::json!({"agent_key": key, "amount": amount}))
+            .collect();
+        let payload = serde_json::json!({
+            "title": if name.is_empty() { "Project" } else { &name },
+            "goal": &task,
+            "workspace_id": &workspace.id,
+            "workspace_path": &workspace.path,
+            "members": members,
+            "start_mode": setup.start_mode,
+            "start_at": setup.start_at,
+            "recurrence": setup.recurrence,
+            "repeat_active": setup.repeat_active,
+            "plan_review": setup.review_plan,
+            "auto_plan": setup.auto_plan,
+            "planner_agent": setup.planner,
+            "max_parallel": setup.max_parallel,
+        });
+        let project = crate::transport::fetch_send("POST", "/api/groups", Some(&payload))
+            .await
+            .map_err(|error| format!("Could not create the group project: {error}"))?;
         Some(
             json_id(&project)
                 .ok_or_else(|| "The backend did not return a project id.".to_string())?,
@@ -790,7 +1365,7 @@ pub fn projects_section<S: ProjectsHost + 'static>(s: &ProjectsState) -> El {
     let mut ordered: Vec<&GroupProject> = s.projects.iter().collect();
     ordered.sort_by_key(|p| std::cmp::Reverse(p.waiting));
     for p in ordered {
-        body = body.child(project_card::<S>("side-projects", p, true));
+        body = body.child(project_card::<S>("side-projects", p, true, s));
     }
     if p_waiting_note(s) {
         body = body.child(
@@ -799,6 +1374,114 @@ pub fn projects_section<S: ProjectsHost + 'static>(s: &ProjectsState) -> El {
                 .font(rune::tok::TextStyle::new(9.5, 500.0))
                 .color(ink("#a1a1aa")),
         );
+    }
+    if let Some(toast) = &s.toast {
+        body = body.child(
+            text(toast.clone())
+                .key("side-projects-toast")
+                .role("status")
+                .live_region(rune::LiveRegion::Polite)
+                .font(rune::tok::TextStyle::new(9.5, 500.0))
+                .color(ink("#a1a1aa")),
+        );
+    }
+    body = body.child(
+        row()
+            .w_full()
+            .items_center()
+            .gap(5.0)
+            .child(
+                text("Trash".to_string())
+                    .grow(1.0)
+                    .font(rune::tok::TextStyle::new(9.0, 600.0))
+                    .color(ink("#71717a")),
+            )
+            .child(
+                text(format!("{}", s.trash.len()))
+                    .font(rune::tok::TextStyle::new(8.5, 600.0))
+                    .color(ink("#52525b")),
+            )
+            .child(
+                text(if s.show_trash { "Hide" } else { "Show" }.to_string())
+                    .key("side-projects-trash-toggle")
+                    .px(6.0)
+                    .py(2.0)
+                    .radius(5.0)
+                    .font(rune::tok::TextStyle::new(8.5, 600.0))
+                    .color(ink("#a1a1aa"))
+                    .fill(ink("#ffffff08"))
+                    .role("button")
+                    .focusable(true)
+                    .on_press_enter(|s: &mut S| {
+                        let projects = s.projects_mut();
+                        projects.show_trash = !projects.show_trash;
+                        if projects.show_trash {
+                            refresh_trash(projects);
+                        }
+                    }),
+            ),
+    );
+    if s.show_trash {
+        if s.trash.is_empty() {
+            body = body.child(
+                text("Trash is empty.".to_string())
+                    .font(rune::tok::TextStyle::new(9.5, 400.0))
+                    .color(ink("#52525b")),
+            );
+        }
+        for project in &s.trash {
+            let folder = project.folder.clone();
+            let folder_delete = project.folder.clone();
+            body = body.child(
+                col()
+                    .key(format!("side-trash-{}", project.folder))
+                    .w_full()
+                    .gap(3.0)
+                    .padding(8.0)
+                    .radius(8.0)
+                    .fill(ink("#ffffff05"))
+                    .border(1.0, ink("#ffffff10"))
+                    .border_layout()
+                    .child(
+                        text(project.title.clone())
+                            .truncate()
+                            .font(rune::tok::TextStyle::new(10.0, 600.0))
+                            .color(ink("#d4d4d8")),
+                    )
+                    .child(
+                        row()
+                            .w_full()
+                            .gap(6.0)
+                            .child(
+                                text("Restore".to_string())
+                                    .px(5.0)
+                                    .py(2.0)
+                                    .radius(4.0)
+                                    .font(rune::tok::TextStyle::new(8.5, 600.0))
+                                    .color(ink("#a1a1aa"))
+                                    .fill(ink("#ffffff08"))
+                                    .role("button")
+                                    .focusable(true)
+                                    .on_press_enter(move |s: &mut S| {
+                                        restore_trash(s.projects_mut(), &folder);
+                                    }),
+                            )
+                            .child(
+                                text("Delete forever".to_string())
+                                    .px(5.0)
+                                    .py(2.0)
+                                    .radius(4.0)
+                                    .font(rune::tok::TextStyle::new(8.5, 600.0))
+                                    .color(ink("#fda4af"))
+                                    .role("button")
+                                    .focusable(true)
+                                    .on_press_enter(move |s: &mut S| {
+                                        delete_trash(s.projects_mut(), &folder_delete);
+                                    }),
+                            ),
+                    ),
+            );
+        }
     }
     if let Some(err) = &s.error {
         body = body.child(
@@ -852,6 +1535,338 @@ fn pick_project_folder<S: ProjectsHost + 'static>(_s: &mut S, tx: &mut rune::Tx)
     }
 }
 
+fn fallback_agents() -> Vec<ProjectAgentOption> {
+    [
+        (
+            "developer",
+            "Developer",
+            "Software implementation and verification",
+        ),
+        (
+            "general",
+            "General",
+            "Research, writing, admin, and signed-in tasks",
+        ),
+        ("ui", "UI", "Frontend design and browser verification"),
+        ("devops", "DevOps", "Deployment, CI, and infrastructure"),
+        ("explore", "Explore", "Read-only codebase mapping"),
+        ("house", "House", "Smart-home control"),
+        ("dfd", "DFD", "Agency clients and scaffolding"),
+    ]
+    .into_iter()
+    .map(|(key, display, description)| ProjectAgentOption {
+        key: key.to_string(),
+        display: display.to_string(),
+        description: description.to_string(),
+        valid: true,
+    })
+    .collect()
+}
+
+fn team_picker<S: ProjectsHost + 'static>(s: &ProjectsState, d: &NewProjectDialog) -> El {
+    let agents = if s.agents.is_empty() {
+        fallback_agents()
+    } else {
+        s.agents.iter().filter(|a| a.valid).cloned().collect()
+    };
+    let total: u32 = d.team.values().copied().sum();
+    let mut list = col().w_full().gap(3.0);
+    for agent in agents {
+        let amount = d.team.get(&agent.key).copied().unwrap_or(0);
+        let add_key = agent.key.clone();
+        let sub_key = agent.key.clone();
+        list = list.child(
+            row()
+                .key(format!("new-project-agent-{}", agent.key))
+                .w_full()
+                .items_center()
+                .gap(7.0)
+                .padding(7.0)
+                .radius(7.0)
+                .fill(ink(if amount > 0 { "#ffffff0c" } else { "#ffffff04" }))
+                .border(1.0, ink(if amount > 0 { "#ffffff20" } else { "#ffffff0c" }))
+                .border_layout()
+                .child(
+                    col()
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .gap(1.0)
+                        .child(
+                            text(agent.display.clone())
+                                .font(rune::tok::TextStyle::new(10.5, 600.0))
+                                .color(ink("#e4e4e7")),
+                        )
+                        .child(
+                            text(agent.description.clone())
+                                .truncate()
+                                .font(rune::tok::TextStyle::new(8.5, 400.0))
+                                .color(ink("#71717a")),
+                        ),
+                )
+                .child(
+                    text("−".to_string())
+                        .key(format!("new-project-agent-minus-{}", agent.key))
+                        .size(22.0, 22.0)
+                        .center()
+                        .radius(5.0)
+                        .fill(ink("#ffffff08"))
+                        .font(rune::tok::TextStyle::new(12.0, 700.0))
+                        .color(ink("#a1a1aa"))
+                        .role("button")
+                        .label(format!("Remove {}", agent.display))
+                        .focusable(true)
+                        .on_press_enter(move |s: &mut S| {
+                            let team = &mut s.projects_mut().dialog.team;
+                            let next = team.get(&sub_key).copied().unwrap_or(0).saturating_sub(1);
+                            if next == 0 {
+                                team.remove(&sub_key);
+                            } else {
+                                team.insert(sub_key.clone(), next);
+                            }
+                        }),
+                )
+                .child(
+                    text(amount.to_string())
+                        .w(20.0)
+                        .center()
+                        .font(rune::tok::TextStyle::new(10.5, 700.0))
+                        .color(ink(if amount > 0 { "#f4f4f5" } else { "#52525b" })),
+                )
+                .child(
+                    text("+".to_string())
+                        .key(format!("new-project-agent-plus-{}", agent.key))
+                        .size(22.0, 22.0)
+                        .center()
+                        .radius(5.0)
+                        .fill(ink("#ffffff12"))
+                        .font(rune::tok::TextStyle::new(12.0, 700.0))
+                        .color(ink("#e4e4e7"))
+                        .role("button")
+                        .label(format!("Add {}", agent.display))
+                        .focusable(true)
+                        .on_press_enter(move |s: &mut S| {
+                            let team = &mut s.projects_mut().dialog.team;
+                            let total: u32 = team.values().copied().sum();
+                            if total < 12 {
+                                let next = team.get(&add_key).copied().unwrap_or(0) + 1;
+                                team.insert(add_key.clone(), next.min(8));
+                            }
+                        }),
+                ),
+        );
+    }
+    col()
+        .w_full()
+        .gap(6.0)
+        .child(
+            row()
+                .w_full()
+                .items_center()
+                .child(
+                    text("TEAM".to_string())
+                        .grow(1.0)
+                        .font(rune::tok::TextStyle::new(9.0, 700.0))
+                        .color(ink("#71717a")),
+                )
+                .child(
+                    text(format!("{total}/12 workers"))
+                        .font(rune::tok::TextStyle::new(8.5, 500.0))
+                        .color(ink("#71717a")),
+                ),
+        )
+        .child(list.max_h(220.0).scroll(rune::ScrollSpec {
+            stick_bottom: false,
+        }))
+        .child(
+            text("Each unit is a separate slot with its own assignments and usage.".to_string())
+                .font(rune::tok::TextStyle::new(8.5, 400.0))
+                .color(ink("#52525b")),
+        )
+}
+
+fn schedule_picker<S: ProjectsHost + 'static>(d: &NewProjectDialog) -> El {
+    let mut start_modes = row().w_full().gap(4.0);
+    for (mode, label) in [
+        ("now", "Start now"),
+        ("scheduled", "Schedule"),
+        ("manual", "Manual"),
+    ] {
+        let active = d.start_mode == mode;
+        let value = mode.to_string();
+        start_modes = start_modes.child(
+            text(label.to_string())
+                .key(format!("new-project-start-{mode}"))
+                .grow(1.0)
+                .h(26.0)
+                .center()
+                .radius(6.0)
+                .font(rune::tok::TextStyle::new(9.5, 600.0))
+                .color(if active {
+                    ink("#f4f4f5")
+                } else {
+                    ink("#71717a")
+                })
+                .fill(if active {
+                    ink("#ffffff12")
+                } else {
+                    ink("#ffffff04")
+                })
+                .role("radio")
+                .focusable(true)
+                .focus_selected(active)
+                .on_press_enter(move |s: &mut S| {
+                    s.projects_mut().dialog.start_mode = value.clone();
+                }),
+        );
+    }
+    let date = rune::text_input(&d.start_date, dialog_style(10.5, 400.0))
+        .key("new-project-start-date")
+        .single_line()
+        .grow(1.0)
+        .radius(7.0)
+        .px(8.0)
+        .py(5.0)
+        .fill(ink("#00000066"))
+        .border(1.0, ink("#ffffff14"))
+        .border_layout()
+        .placeholder("YYYY-MM-DD", ink("#52525b"))
+        .on_edit(|s: &mut S| &mut s.projects_mut().dialog.start_date);
+    let time = rune::text_input(&d.start_time, dialog_style(10.5, 400.0))
+        .key("new-project-start-time")
+        .single_line()
+        .w(88.0)
+        .radius(7.0)
+        .px(8.0)
+        .py(5.0)
+        .fill(ink("#00000066"))
+        .border(1.0, ink("#ffffff14"))
+        .border_layout()
+        .placeholder("HH:MM", ink("#52525b"))
+        .on_edit(|s: &mut S| &mut s.projects_mut().dialog.start_time);
+    let mut repeat_row = row().w_full().gap(3.0);
+    for (value, label) in [
+        ("none", "Never"),
+        ("daily", "Daily"),
+        ("weekly", "Weekly"),
+        ("monthly", "Monthly"),
+    ] {
+        let active = d.repeat == value;
+        let value_owned = value.to_string();
+        repeat_row = repeat_row.child(
+            text(label.to_string())
+                .key(format!("new-project-repeat-{value}"))
+                .grow(1.0)
+                .h(24.0)
+                .center()
+                .radius(5.0)
+                .font(rune::tok::TextStyle::new(8.5, 600.0))
+                .color(if active {
+                    ink("#f4f4f5")
+                } else {
+                    ink("#71717a")
+                })
+                .fill(if active {
+                    ink("#ffffff12")
+                } else {
+                    ink("#ffffff04")
+                })
+                .role("radio")
+                .focusable(true)
+                .focus_selected(active)
+                .on_press_enter(move |s: &mut S| {
+                    let d = &mut s.projects_mut().dialog;
+                    d.repeat = value_owned.clone();
+                    d.repeat_active = value_owned != "none";
+                }),
+        );
+    }
+    let review = d.review_plan;
+    let auto = d.auto_plan;
+    col()
+        .w_full()
+        .gap(7.0)
+        .child(
+            text("START & REPEAT".to_string())
+                .font(rune::tok::TextStyle::new(9.0, 700.0))
+                .color(ink("#71717a")),
+        )
+        .child(start_modes)
+        .child(if d.start_mode == "scheduled" {
+            row().w_full().gap(5.0).child(date).child(time)
+        } else {
+            rune::el().size(0.0, 0.0).inert()
+        })
+        .child(repeat_row)
+        .child(
+            row()
+                .w_full()
+                .items_center()
+                .gap(6.0)
+                .child(
+                    text("Draft the plan with the orchestrator".to_string())
+                        .key("new-project-auto-plan")
+                        .grow(1.0)
+                        .font(rune::tok::TextStyle::new(9.5, 500.0))
+                        .color(ink("#a1a1aa")),
+                )
+                .child(
+                    text(if auto { "On" } else { "Off" }.to_string())
+                        .px(7.0)
+                        .py(2.0)
+                        .radius(5.0)
+                        .font(rune::tok::TextStyle::new(8.5, 700.0))
+                        .color(if auto { ink("#e4e4e7") } else { ink("#71717a") })
+                        .fill(if auto {
+                            ink("#ffffff14")
+                        } else {
+                            ink("#ffffff06")
+                        })
+                        .role("switch")
+                        .focusable(true)
+                        .on_press_enter(|s: &mut S| {
+                            let d = &mut s.projects_mut().dialog;
+                            d.auto_plan = !d.auto_plan;
+                        }),
+                ),
+        )
+        .child(
+            row()
+                .w_full()
+                .items_center()
+                .gap(6.0)
+                .child(
+                    text("Review the plan before work starts".to_string())
+                        .key("new-project-review-plan")
+                        .grow(1.0)
+                        .font(rune::tok::TextStyle::new(9.5, 500.0))
+                        .color(ink("#a1a1aa")),
+                )
+                .child(
+                    text(if review { "On" } else { "Off" }.to_string())
+                        .px(7.0)
+                        .py(2.0)
+                        .radius(5.0)
+                        .font(rune::tok::TextStyle::new(8.5, 700.0))
+                        .color(if review {
+                            ink("#e4e4e7")
+                        } else {
+                            ink("#71717a")
+                        })
+                        .fill(if review {
+                            ink("#ffffff14")
+                        } else {
+                            ink("#ffffff06")
+                        })
+                        .role("switch")
+                        .focusable(true)
+                        .on_press_enter(|s: &mut S| {
+                            let d = &mut s.projects_mut().dialog;
+                            d.review_plan = !d.review_plan;
+                        }),
+                ),
+        )
+}
+
 /// The live New Project dialog from the original design:
 /// a 390 pt two-step card over a 60% blurred backdrop. Step 1 creates
 /// nothing; step 2 registers the workspace, creates its first chat, and (in
@@ -863,7 +1878,7 @@ pub fn new_project_dialog<S: ProjectsHost + 'static>(s: &ProjectsState, w: f32, 
     }
     let busy = d.busy;
     let step = d.step.clamp(1, 2);
-    let panel_w = 390.0f32.min((w - 32.0).max(0.0));
+    let panel_w = 460.0f32.min((w - 32.0).max(0.0));
     let path = d.path.text.trim().to_string();
     let path_empty = path.is_empty();
     let task_empty = d.task.text.trim().is_empty();
@@ -1393,7 +2408,17 @@ pub fn new_project_dialog<S: ProjectsHost + 'static>(s: &ProjectsState, w: f32, 
         .transition(crate::motion::project_step_enter())
         .child(summary)
         .child(modes)
+        .child(if group {
+            team_picker::<S>(s, d)
+        } else {
+            rune::el().size(0.0, 0.0).inert()
+        })
         .child(task)
+        .child(if group {
+            schedule_picker::<S>(d)
+        } else {
+            rune::el().size(0.0, 0.0).inert()
+        })
         .child(info);
     if let Some(error) = &d.error {
         step_two = step_two.child(
@@ -1463,28 +2488,77 @@ pub fn new_project_dialog<S: ProjectsHost + 'static>(s: &ProjectsState, w: f32, 
 
 /// One project card. `prefix` namespaces keys (`projects` board vs
 /// `side-projects` section); `compact` tightens padding/type for the rail.
-fn project_card<S: ProjectsHost + 'static>(prefix: &str, p: &GroupProject, compact: bool) -> El {
+fn menu_row<S: ProjectsHost + 'static>(
+    key: &str,
+    label: &str,
+    danger: bool,
+    on_press: impl Fn(&mut S) + 'static,
+) -> El {
+    text(label.to_string())
+        .key(key.to_string())
+        .w_full()
+        .px(9.0)
+        .py(5.0)
+        .radius(6.0)
+        .font(rune::tok::TextStyle::new(10.5, 500.0))
+        .color(if danger {
+            ink("#fda4af")
+        } else {
+            ink("#d4d4d8")
+        })
+        .hover(ink("#ffffff0d"))
+        .role("menuitem")
+        .focusable(true)
+        .on_press_enter(on_press)
+}
+
+fn project_card<S: ProjectsHost + 'static>(
+    prefix: &str,
+    p: &GroupProject,
+    compact: bool,
+    s: &ProjectsState,
+) -> El {
     let (pad_x, pad_y, title_size) = if compact {
         (11.0, 10.0, 11.5)
     } else {
         (14.0, 12.0, 13.0)
     };
     let open_id = p.id.clone();
+    let menu_id = p.id.clone();
     let status = p.status.to_ascii_lowercase();
     let dot = match status.as_str() {
-        "running" | "doing" | "active" => "#6ee7b7",
+        "running" | "doing" | "active" | "planning" => "#7dd3fc",
         "done" | "complete" | "completed" => "#6ee7b7",
-        "failed" | "error" => "#f87171",
+        "plan_ready" => "#c4b5fd",
+        "scheduled" => "#93c5fd",
+        "failed" | "error" | "blocked" => "#f87171",
+        "paused" => "#fcd34d",
         _ => "#52525b",
     };
     let waiting = p.waiting > 0;
+    let menu_open = s.menu.as_deref() == Some(p.id.as_str());
+    let busy = s
+        .action_busy
+        .as_deref()
+        .is_some_and(|value| value.ends_with(&format!(":{}", p.id)));
     let mut card = col()
         .key(format!("{prefix}-{id}", id = p.id))
         .w_full()
         .gap(7.0)
         .radius(11.0)
-        .fill(ink(if waiting { "#ffffff0a" } else { "#ffffff05" }))
-        .border(1.0, ink(if waiting { "#ffffff24" } else { "#ffffff10" }))
+        .fill(ink(if menu_open || waiting {
+            "#ffffff0a"
+        } else {
+            "#ffffff05"
+        }))
+        .border(
+            1.0,
+            ink(if menu_open || waiting {
+                "#ffffff24"
+            } else {
+                "#ffffff10"
+            }),
+        )
         .px(pad_x)
         .py(pad_y)
         .border_layout()
@@ -1513,6 +2587,32 @@ fn project_card<S: ProjectsHost + 'static>(prefix: &str, p: &GroupProject, compa
                         .truncate()
                         .font(rune::tok::TextStyle::new(title_size, 600.0))
                         .color(ink("#e4e4e7")),
+                )
+                .child(
+                    text(if busy {
+                        "…".to_string()
+                    } else {
+                        "⋯".to_string()
+                    })
+                    .key(format!("{prefix}-{id}-menu", id = p.id))
+                    .size(20.0, 20.0)
+                    .center()
+                    .radius(5.0)
+                    .font(rune::tok::TextStyle::new(13.0, 700.0))
+                    .color(ink("#a1a1aa"))
+                    .hover(ink("#ffffff14"))
+                    .role("button")
+                    .label(format!("Manage {}", p.title))
+                    .focusable(true)
+                    .on_press_enter(move |s: &mut S| {
+                        let projects = s.projects_mut();
+                        projects.menu = if projects.menu.as_deref() == Some(menu_id.as_str()) {
+                            None
+                        } else {
+                            Some(menu_id.clone())
+                        };
+                        projects.confirm_delete = None;
+                    }),
                 )
                 .child(
                     text(p.status.clone())
@@ -1552,13 +2652,123 @@ fn project_card<S: ProjectsHost + 'static>(prefix: &str, p: &GroupProject, compa
         card = card.child(
             text(format!("{} waiting", p.waiting))
                 .key(format!("{prefix}-{id}-waiting", id = p.id))
+                .self_start()
                 .font(rune::tok::TextStyle::new(9.0, 600.0))
                 .px(6.0)
                 .py(2.0)
                 .radius(5.0)
                 .fill(ink("#ffffff10"))
-                .color(ink("#e4e4e7")),
+                .color(ink("#fcd34d")),
         );
+    }
+    if p.repeat_active {
+        card = card.child(
+            text(format!("{} · cycle {}", p.repeat_label(), p.cycle.max(1)))
+                .font(rune::tok::TextStyle::new(8.5, 500.0))
+                .color(ink("#93c5fd")),
+        );
+    }
+    if menu_open {
+        let id_open = p.id.clone();
+        let id_start = p.id.clone();
+        let id_pause = p.id.clone();
+        let id_stop = p.id.clone();
+        let id_edit = p.id.clone();
+        let id_trash = p.id.clone();
+        let confirm = s.confirm_delete.as_deref() == Some(p.id.as_str());
+        let mut menu = col()
+            .key(format!("{prefix}-{id}-actions", id = p.id))
+            .w_full()
+            .gap(1.0)
+            .padding(3.0)
+            .radius(8.0)
+            .fill(ink("#131318"))
+            .border(1.0, ink("#ffffff14"))
+            .border_layout()
+            .child(menu_row::<S>(
+                &format!("{prefix}-{id}-open", id = p.id),
+                "Open project",
+                false,
+                move |s: &mut S| {
+                    let projects = s.projects_mut();
+                    let (host, port) = (projects.host.clone(), projects.port);
+                    projects.menu = None;
+                    projects.group.open(host, port, id_open.clone());
+                },
+            ));
+        if p.can_start() {
+            menu = menu.child(menu_row::<S>(
+                &format!("{prefix}-{id}-start", id = p.id),
+                if p.status == "paused" {
+                    "Resume"
+                } else {
+                    "Start now"
+                },
+                false,
+                move |s: &mut S| {
+                    project_action(s.projects_mut(), &id_start, "start");
+                },
+            ));
+        }
+        if p.is_running() {
+            menu = menu
+                .child(menu_row::<S>(
+                    &format!("{prefix}-{id}-pause", id = p.id),
+                    "Pause",
+                    false,
+                    move |s: &mut S| {
+                        project_action(s.projects_mut(), &id_pause, "pause");
+                    },
+                ))
+                .child(menu_row::<S>(
+                    &format!("{prefix}-{id}-stop", id = p.id),
+                    "Stop",
+                    false,
+                    move |s: &mut S| {
+                        project_action(s.projects_mut(), &id_stop, "stop");
+                    },
+                ));
+        }
+        if p.status == "done" {
+            let id_restart = p.id.clone();
+            menu = menu.child(menu_row::<S>(
+                &format!("{prefix}-{id}-restart", id = p.id),
+                "Run again",
+                false,
+                move |s: &mut S| {
+                    project_action(s.projects_mut(), &id_restart, "restart");
+                },
+            ));
+        }
+        menu = menu
+            .child(menu_row::<S>(
+                &format!("{prefix}-{id}-edit", id = p.id),
+                "Edit project…",
+                false,
+                move |s: &mut S| {
+                    let projects = s.projects_mut();
+                    projects.menu = None;
+                    open_project_edit(projects, &id_edit);
+                },
+            ))
+            .child(menu_row::<S>(
+                &format!("{prefix}-{id}-trash", id = p.id),
+                if confirm {
+                    "Confirm move to Trash"
+                } else {
+                    "Move to Trash"
+                },
+                true,
+                move |s: &mut S| {
+                    let projects = s.projects_mut();
+                    if projects.confirm_delete.as_deref() == Some(id_trash.as_str()) {
+                        project_action(projects, &id_trash, "trash");
+                    } else {
+                        projects.confirm_delete = Some(id_trash.clone());
+                    }
+                },
+            ));
+        card = card.child(menu);
     }
     card
 }

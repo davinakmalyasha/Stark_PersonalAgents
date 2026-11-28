@@ -174,24 +174,39 @@ pub fn status_chip(status: &str, awaiting: bool) -> El {
             _ => (rgba(255.0, 255.0, 255.0, 0.07), ink("#a1a1aa")),
         }
     };
-    text(if awaiting {
+    let label = if awaiting {
         "NEEDS YOU".to_string()
-    } else if status.is_empty() {
-        "unknown".to_string()
     } else {
-        status.to_uppercase()
-    })
-    .font({
-        let mut style = rune::tok::TextStyle::new(9.0, 600.0);
-        style.line_height = 13.5;
-        style.tracking = 0.18;
-        style
-    })
-    .px(6.0)
-    .py(1.0)
-    .radius(5.0)
-    .fill(bg)
-    .color(fg)
+        match status {
+            "" => "unknown".to_string(),
+            "todo" | "pending" => "NEW".to_string(),
+            "active" | "ready" => "ONGOING".to_string(),
+            "doing" => "RUNNING".to_string(),
+            "done" => "DONE".to_string(),
+            "blocked" => "BLOCKED".to_string(),
+            "failed" => "FAILED".to_string(),
+            "cancelled" => "CANCELLED".to_string(),
+            "invalidated" => "INVALIDATED".to_string(),
+            "planning" => "PLANNING".to_string(),
+            "plan_ready" => "PLAN READY".to_string(),
+            "scheduled" => "SCHEDULED".to_string(),
+            "running" => "RUNNING".to_string(),
+            "paused" => "PAUSED".to_string(),
+            other => other.to_uppercase(),
+        }
+    };
+    text(label)
+        .font({
+            let mut style = rune::tok::TextStyle::new(9.0, 600.0);
+            style.line_height = 13.5;
+            style.tracking = 0.18;
+            style
+        })
+        .px(6.0)
+        .py(1.0)
+        .radius(5.0)
+        .fill(bg)
+        .color(fg)
 }
 
 const EVENT_LABELS: &[(&str, &str)] = &[
@@ -199,12 +214,22 @@ const EVENT_LABELS: &[(&str, &str)] = &[
     ("project.paused", "Paused"),
     ("project.resumed", "Resumed"),
     ("project.closed", "Closed"),
+    ("project.updated", "Settings updated"),
+    ("project.stopped", "Stopped"),
+    ("project.blocked", "Blocked"),
     ("project.stalled", "Stalled — no possible progress"),
     ("milestone.created", "Milestone added"),
+    ("milestone.updated", "Milestone updated"),
+    ("milestone.deleted", "Milestone deleted"),
+    ("milestone.blocked", "Milestone blocked"),
     ("milestone.ready", "Milestone started"),
     ("milestone.done", "Milestone done"),
     ("milestone.failed", "Milestone failed"),
     ("item.created", "Item added"),
+    ("item.updated", "Item updated"),
+    ("item.deleted", "Item deleted"),
+    ("item.retried", "Item retried"),
+    ("item.status", "Item status changed"),
     ("item.ready", "Item ready"),
     ("item.claimed", "Item claimed"),
     ("item.released", "Item released"),
@@ -226,6 +251,16 @@ const EVENT_LABELS: &[(&str, &str)] = &[
     ("approval.requested", "Approval requested"),
     ("approval.granted", "Approved"),
     ("approval.rejected", "Rejected"),
+    ("plan.queued", "Planning queued"),
+    ("plan.ready", "Plan ready"),
+    ("plan.approved", "Plan approved"),
+    ("plan.failed", "Planning failed"),
+    ("run.started", "Run started"),
+    ("run.finished", "Run finished"),
+    ("cycle.started", "New cycle started"),
+    ("cycle.completed", "Cycle completed"),
+    ("cycle.skipped", "Cycle skipped"),
+    ("workspace.updated", "Work folder updated"),
     ("member.added", "Member added"),
     ("member.removed", "Member removed"),
     ("member.halted", "Member halted"),
@@ -527,21 +562,6 @@ pub fn participant_names(entries: &[ChatEntry], members: &[GroupMember]) -> Vec<
         add(&member.display);
     }
     out
-}
-
-pub fn active_item_for<'a>(items: &'a [GroupItem], member: &str) -> Option<&'a GroupItem> {
-    let name = display_actor(member).to_lowercase();
-    items.iter().find(|item| {
-        (item.status == "doing" || item.status == "ready")
-            && display_actor(
-                item.lease_owner
-                    .as_deref()
-                    .or(item.owner_member.as_deref())
-                    .unwrap_or(""),
-            )
-            .to_lowercase()
-                == name
-    })
 }
 
 #[cfg(test)]

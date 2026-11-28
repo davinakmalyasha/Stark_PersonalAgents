@@ -1,0 +1,24 @@
+{
+  "name": "stark-codemode-worker",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Stark Code Mode worker: OpenCode v2 Code Mode runtime on psychoscript.",
+  "license": "Apache-2.0",
+  "scripts": {
+    "start": "bun run src/main.ts",
+    "build": "bun run build.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@opencode/codemode": "2.4.1",
+    "effect": "4.1.0",
+    "minimatch": "10.2.5",
+    "psychoscript": "0.2.1"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.3",
+    "typescript": "5.9.3"
+  }
+}

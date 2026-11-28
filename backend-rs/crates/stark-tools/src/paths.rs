@@ -43,7 +43,7 @@ pub fn resolve_workspace_path(workspace: &Path, raw: &str) -> Result<PathBuf, St
     Ok(normalized)
 }
 
-fn canonicalize_best_effort(path: &Path) -> PathBuf {
+pub(crate) fn canonicalize_best_effort(path: &Path) -> PathBuf {
     if let Ok(canonical) = path.canonicalize() {
         return canonical;
     }
@@ -67,6 +67,19 @@ fn canonicalize_best_effort(path: &Path) -> PathBuf {
     normalize(path)
 }
 
+/// Lexically resolves a program path against a base without requiring the
+/// target to exist. Used by the Bun file bridge, which allows external paths
+/// after `external_directory` approval instead of rejecting them.
+pub(crate) fn resolve_lexical(base: &Path, raw: &str) -> PathBuf {
+    let candidate = Path::new(raw);
+    let joined = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        base.join(candidate)
+    };
+    normalize(&joined)
+}
+
 pub fn relative_display(workspace: &Path, path: &Path) -> String {
     if let Ok(relative) = path.strip_prefix(workspace) {
         return relative.to_string_lossy().replace('\\', "/");
@@ -79,7 +92,7 @@ pub fn relative_display(workspace: &Path, path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-fn normalize(path: &Path) -> PathBuf {
+pub(crate) fn normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {
@@ -93,7 +106,7 @@ fn normalize(path: &Path) -> PathBuf {
     out
 }
 
-fn path_starts_with(path: &Path, base: &Path) -> bool {
+pub(crate) fn path_starts_with(path: &Path, base: &Path) -> bool {
     if cfg!(windows) {
         let path = path.to_string_lossy().to_lowercase();
         let base = base.to_string_lossy().to_lowercase();

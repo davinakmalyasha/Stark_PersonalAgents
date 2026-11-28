@@ -10,3 +10,20 @@ Apache-2.0.
 licensed under MIT. It is vendored with two local fixes: ConPTY is created with
 the resize-quirk flag only (avoiding cursor/inherit-input hangs), and
 TerminateProcess result handling is corrected.
+
+Code Mode follows OpenCode v2 (https://github.com/anomalyco/opencode,
+`packages/codemode` 2.4.1, dev commit 9964772), licensed under MIT.
+`backend-rs/codemode-worker` runs `@opencode/codemode` 2.4.1 and
+`psychoscript` 0.2.1 (both MIT) on Bun; `crates/stark-tools/src/codemode`
+ports OpenCode's catalog summary, `# Code Mode` instructions, background-job
+notice and restart recovery, incremental catalog instructions, result
+formatting and `ToolOutput` truncation/spill, progress publications, diff
+budgets, fetch/path/Bun extensions,
+OpenAI freeform/custom-tool wire encoding (including the fixed
+`tool/patch-grammar.txt` Lark grammar and the `<system-update>` lowering), and
+the JSON-Schema-to-TypeScript signature renderer. Differential fixtures in
+`backend-rs/codemode-worker/test/opencode-parity` run the real 2.4.1 source
+under Bun to generate the Rust tests' expected bytes. The runtime's
+tool admission, idempotent calls, and snapshot suspend/resume are unchanged in
+the library; the application, like OpenCode, does not persist Code Mode
+programs across a server restart.

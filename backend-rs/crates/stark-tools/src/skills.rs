@@ -13,6 +13,21 @@ use crate::{ToolContext, ToolOutcome};
 
 const MAX_SKILL_CHARS: usize = 8192;
 
+/// Skills are instructions from the workspace. Reject symlinked entries in
+/// every root: a cloned repo must not be able to point `SKILL.md` at an
+/// arbitrary host file.
+fn is_real_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_dir())
+        .unwrap_or(false)
+}
+
+fn is_real_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_file())
+        .unwrap_or(false)
+}
+
 fn roots(ctx: &ToolContext) -> Vec<PathBuf> {
     let mut roots = vec![
         ctx.workspace.join(".agents").join("skills"),
@@ -62,8 +77,28 @@ fn fallback_description(text: &str) -> String {
     String::new()
 }
 
-async fn read_skill(path: &Path) -> Option<(String, String, String)> {
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct SkillEntry {
+    pub name: String,
+    pub description: String,
+    pub source: String,
+    pub sha256: String,
+}
+
+async fn read_skill(path: &Path) -> Option<(String, String, String, String)> {
+    let metadata = tokio::fs::symlink_metadata(path).await.ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    if let Some(parent) = path.parent() {
+        let metadata = tokio::fs::symlink_metadata(parent).await.ok()?;
+        if !metadata.file_type().is_dir() {
+            return None;
+        }
+    }
     let text = tokio::fs::read_to_string(path).await.ok()?;
+    use sha2::{Digest, Sha256};
+    let sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
     let fields = parse_frontmatter(&text);
     let name = fields
         .get("name")
@@ -79,20 +114,66 @@ async fn read_skill(path: &Path) -> Option<(String, String, String)> {
         .cloned()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| fallback_description(&text));
-    Some((name, description, text))
+    Some((name, description, text, sha256))
+}
+
+/// Discovered skill names, sync, for agent-definition validation.
+pub fn skill_names(workspace: &Path, harness_root: &Path) -> Vec<String> {
+    let mut roots = vec![
+        workspace.join(".agents").join("skills"),
+        harness_root.join(".agents").join("skills"),
+        harness_root.join(".deep_agents").join("skills"),
+    ];
+    roots.sort();
+    roots.dedup();
+    let mut names = std::collections::BTreeSet::new();
+    for root in roots {
+        if !is_real_dir(&root) {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !is_real_dir(&path) {
+                continue;
+            }
+            let skill_path = path.join("SKILL.md");
+            if !is_real_file(&skill_path) {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&skill_path) else {
+                continue;
+            };
+            let fields = parse_frontmatter(&text);
+            let name = fields
+                .get("name")
+                .cloned()
+                .filter(|value| !value.is_empty())
+                .or_else(|| {
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                });
+            if let Some(name) = name {
+                names.insert(name);
+            }
+        }
+    }
+    names.into_iter().collect()
 }
 
 pub async fn catalog_block_for(workspace: &Path, harness_root: &Path) -> Option<String> {
     catalog_block_for_agent(workspace, harness_root, None).await
 }
 
-/// Same catalog, filtered to an agent's configured skill names. `None` means
-/// all discovered skills.
-pub async fn catalog_block_for_agent(
+/// Discovered skills with the source root and content hash. Used by preview
+/// and audit; the prompt catalog only needs name/description.
+pub async fn catalog_entries(
     workspace: &Path,
     harness_root: &Path,
     allowed: Option<&[String]>,
-) -> Option<String> {
+) -> Vec<SkillEntry> {
     let allowed: Option<std::collections::HashSet<String>> = allowed.map(|names| {
         names
             .iter()
@@ -110,19 +191,25 @@ pub async fn catalog_block_for_agent(
     let mut entries = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for root in roots {
+        let Ok(metadata) = tokio::fs::symlink_metadata(&root).await else {
+            continue;
+        };
+        if !metadata.file_type().is_dir() {
+            continue;
+        }
         let Ok(mut dir) = tokio::fs::read_dir(&root).await else {
             continue;
         };
         while let Ok(Some(entry)) = dir.next_entry().await {
+            let Ok(file_type) = entry.file_type().await else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
             let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
             let skill_path = path.join("SKILL.md");
-            if !skill_path.is_file() {
-                continue;
-            }
-            let Some((name, description, _)) = read_skill(&skill_path).await else {
+            let Some((name, description, _, sha256)) = read_skill(&skill_path).await else {
                 continue;
             };
             if let Some(allowed) = &allowed
@@ -133,30 +220,34 @@ pub async fn catalog_block_for_agent(
             if !seen.insert(name.to_ascii_lowercase()) {
                 continue;
             }
-            entries.push(serde_json::json!({
-                "name": name,
-                "description": description,
-            }));
+            entries.push(SkillEntry {
+                name,
+                description,
+                source: root.to_string_lossy().replace('\\', "/"),
+                sha256,
+            });
         }
     }
+    entries.sort_by(|left, right| left.name.cmp(&right.name));
+    entries
+}
+
+/// Same catalog, filtered to an agent's configured skill names. `None` means
+/// all discovered skills.
+pub async fn catalog_block_for_agent(
+    workspace: &Path,
+    harness_root: &Path,
+    allowed: Option<&[String]>,
+) -> Option<String> {
+    let entries = catalog_entries(workspace, harness_root, allowed).await;
     if entries.is_empty() {
         return None;
     }
-    entries.sort_by(|left, right| {
-        left["name"]
-            .as_str()
-            .unwrap_or("")
-            .cmp(right["name"].as_str().unwrap_or(""))
-    });
     let mut text = String::from(
         "[SKILLS]\nLoad a skill with the skill tool before acting on a matching task.\n",
     );
     for entry in entries {
-        text.push_str(&format!(
-            "- {}: {}\n",
-            entry["name"].as_str().unwrap_or(""),
-            entry["description"].as_str().unwrap_or("")
-        ));
+        text.push_str(&format!("- {}: {}\n", entry.name, entry.description));
     }
     Some(text)
 }
@@ -172,17 +263,77 @@ pub async fn skill(ctx: &ToolContext, args: &Value) -> ToolOutcome {
     {
         return ToolOutcome::err("Error: invalid skill name");
     }
+    if let Some(allowed) = &ctx.allowed_skills
+        && !allowed.contains(&name.to_ascii_lowercase())
+    {
+        tracing::debug!(skill = %name, "skill is not enabled for this agent");
+        ctx.audit_event(
+            "skill_denied",
+            name,
+            serde_json::json!({"reason": "allowlist"}),
+        );
+        return ToolOutcome::err(format!(
+            "Error: skill '{name}' is not enabled for this agent"
+        ));
+    }
     for root in roots(ctx) {
-        let path = root.join(name).join("SKILL.md");
-        if !path.is_file() {
-            continue;
-        }
-        let Some((_, _, text)) = read_skill(&path).await else {
+        let Ok(metadata) = tokio::fs::symlink_metadata(&root).await else {
             continue;
         };
+        if !metadata.file_type().is_dir() {
+            continue;
+        }
+        let skill_dir = root.join(name);
+        let Ok(metadata) = tokio::fs::symlink_metadata(&skill_dir).await else {
+            continue;
+        };
+        if !metadata.file_type().is_dir() {
+            continue;
+        }
+        let path = skill_dir.join("SKILL.md");
+        let Some((_, _, text, sha256)) = read_skill(&path).await else {
+            continue;
+        };
+        if let Some(hashes) = &ctx.allowed_skill_hashes
+            && let Some(expected) = hashes.get(&name.to_ascii_lowercase())
+            && expected != &sha256
+        {
+            tracing::warn!(
+                skill = %name,
+                expected = %expected,
+                found = %sha256,
+                "skill content does not match its pinned hash"
+            );
+            ctx.audit_event(
+                "skill_denied",
+                name,
+                serde_json::json!({
+                    "reason": "pin_mismatch",
+                    "expected": expected,
+                    "found": sha256,
+                    "source": root.to_string_lossy().replace('\\', "/"),
+                }),
+            );
+            return ToolOutcome::err(format!(
+                "Error: skill '{name}' changed (expected sha256 {expected}, found {sha256}); update the agent's skill_hashes"
+            ));
+        }
         let text: String = text.chars().take(MAX_SKILL_CHARS).collect();
+        ctx.audit_event(
+            "skill_loaded",
+            name,
+            serde_json::json!({
+                "sha256": sha256,
+                "source": root.to_string_lossy().replace('\\', "/"),
+            }),
+        );
         return ToolOutcome::ok(format!("[SKILL] {name}\n\n{text}"));
     }
+    ctx.audit_event(
+        "skill_denied",
+        name,
+        serde_json::json!({"reason": "unknown"}),
+    );
     ToolOutcome::err(format!("Error: unknown skill '{name}'"))
 }
 
@@ -219,10 +370,233 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn skill_load_and_denial_emit_audit_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join(".agents/skills/review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: review\ndescription: Review.\n---\n# Review\n",
+        )
+        .unwrap();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let hook = Arc::new(move |kind: &str, subject: &str, detail: Value| {
+            sink.lock()
+                .unwrap()
+                .push((kind.to_string(), subject.to_string(), detail));
+        });
+        let ctx = context(dir.path()).with_audit_hook(Some(hook));
+        let out = skill(&ctx, &serde_json::json!({"name": "review"})).await;
+        assert!(!out.is_error, "{}", out.content);
+        let out = skill(&ctx, &serde_json::json!({"name": "missing"})).await;
+        assert!(out.is_error);
+        let events = events.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|(kind, subject, _)| { kind == "skill_loaded" && subject == "review" })
+        );
+        assert!(
+            events
+                .iter()
+                .any(|(kind, subject, _)| { kind == "skill_denied" && subject == "missing" })
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_skill_hash_blocks_changed_content() {
+        use sha2::{Digest, Sha256};
+        use std::collections::BTreeMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join(".agents/skills/review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let path = skill_dir.join("SKILL.md");
+        let original = "---\nname: review\ndescription: Review.\n---\n# Review\n";
+        std::fs::write(&path, original).unwrap();
+        let hash = format!("{:x}", Sha256::digest(original.as_bytes()));
+        let mut pins = BTreeMap::new();
+        pins.insert("review".to_string(), hash.clone());
+        let ctx = context(dir.path()).with_allowed_skill_hashes(Some(pins));
+        let out = skill(&ctx, &serde_json::json!({"name": "review"})).await;
+        assert!(!out.is_error, "{}", out.content);
+
+        let entries = catalog_entries(dir.path(), dir.path(), None).await;
+        assert_eq!(entries[0].sha256, hash);
+        assert!(entries[0].source.ends_with(".agents/skills"));
+
+        std::fs::write(
+            &path,
+            "---\nname: review\ndescription: Review.\n---\n# Changed\n",
+        )
+        .unwrap();
+        let out = skill(&ctx, &serde_json::json!({"name": "review"})).await;
+        assert!(out.is_error, "{}", out.content);
+        assert!(out.content.contains("changed"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn per_agent_skill_allowlist_blocks_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join(".agents/skills/review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: review\ndescription: Review code.\n---\n# Review\n",
+        )
+        .unwrap();
+        let ctx = context(dir.path()).with_allowed_skills(Some(vec!["other".to_string()]));
+        let out = skill(&ctx, &serde_json::json!({"name": "review"})).await;
+        assert!(out.is_error);
+        assert!(out.content.contains("not enabled"));
+        let ctx = context(dir.path()).with_allowed_skills(Some(vec!["review".to_string()]));
+        let out = skill(&ctx, &serde_json::json!({"name": "review"})).await;
+        assert!(!out.is_error, "{}", out.content);
+    }
+
+    #[tokio::test]
     async fn skill_rejects_path_traversal() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
         let out = skill(&ctx, &serde_json::json!({"name": "../secret"})).await;
         assert!(out.is_error);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_skill_entries_are_ignored() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(
+            outside.path().join("SKILL.md"),
+            "---\nname: leaked\ndescription: Leaked.\n---\n# Leaked\n",
+        )
+        .unwrap();
+        let skill_dir = dir.path().join(".agents/skills/leaked");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        symlink(outside.path().join("SKILL.md"), skill_dir.join("SKILL.md")).unwrap();
+        symlink(outside.path(), dir.path().join(".agents/skills/linked-dir")).unwrap();
+
+        let ctx = context(dir.path());
+        assert!(catalog_block_for(dir.path(), dir.path()).await.is_none());
+        let out = skill(&ctx, &serde_json::json!({"name": "leaked"})).await;
+        assert!(out.is_error, "{}", out.content);
+        let out = skill(&ctx, &serde_json::json!({"name": "linked-dir"})).await;
+        assert!(out.is_error, "{}", out.content);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_skill_root_is_ignored() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("review")).unwrap();
+        std::fs::write(
+            outside.path().join("review/SKILL.md"),
+            "---\nname: review\ndescription: Outside.\n---\n# Outside\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join(".agents")).unwrap();
+        symlink(outside.path(), dir.path().join(".agents/skills")).unwrap();
+
+        let ctx = context(dir.path());
+        assert!(catalog_block_for(dir.path(), dir.path()).await.is_none());
+        let out = skill(&ctx, &serde_json::json!({"name": "review"})).await;
+        assert!(out.is_error, "{}", out.content);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn junction_skill_root_is_ignored_on_windows() {
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("review")).unwrap();
+        std::fs::write(
+            outside.path().join("review/SKILL.md"),
+            "---\nname: review\ndescription: Outside.\n---\n# Outside\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join(".agents")).unwrap();
+        let link = dir.path().join(".agents/skills");
+        // Junctions do not need Developer Mode, so this covers the common
+        // Windows reparse-point bypass even when symlink creation is denied.
+        let script = format!(
+            "New-Item -ItemType Junction -Path '{}' -Target '{}' | Out-Null",
+            link.display(),
+            outside.path().display()
+        );
+        let created = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !created {
+            return;
+        }
+
+        let ctx = context(dir.path());
+        assert!(catalog_block_for(dir.path(), dir.path()).await.is_none());
+        let out = skill(&ctx, &serde_json::json!({"name": "review"})).await;
+        assert!(out.is_error, "{}", out.content);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn symlinked_skill_files_are_ignored_on_windows() {
+        use std::os::windows::fs::{symlink_dir, symlink_file};
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(
+            outside.path().join("SKILL.md"),
+            "---\nname: leaked\ndescription: Leaked.\n---\n# Leaked\n",
+        )
+        .unwrap();
+        let skill_dir = dir.path().join(".agents/skills/leaked");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        // Creating symlinks needs Developer Mode or elevation; skip otherwise.
+        if symlink_file(outside.path().join("SKILL.md"), skill_dir.join("SKILL.md")).is_err() {
+            return;
+        }
+        let _ = symlink_dir(outside.path(), dir.path().join(".agents/skills/linked-dir"));
+
+        let ctx = context(dir.path());
+        assert!(catalog_block_for(dir.path(), dir.path()).await.is_none());
+        let out = skill(&ctx, &serde_json::json!({"name": "leaked"})).await;
+        assert!(out.is_error, "{}", out.content);
+        let out = skill(&ctx, &serde_json::json!({"name": "linked-dir"})).await;
+        assert!(out.is_error, "{}", out.content);
+
+        let root_workspace = tempfile::tempdir().unwrap();
+        let root_outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root_outside.path().join("review")).unwrap();
+        std::fs::write(
+            root_outside.path().join("review/SKILL.md"),
+            "---\nname: review\ndescription: Outside.\n---\n# Outside\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root_workspace.path().join(".agents")).unwrap();
+        if symlink_dir(
+            root_outside.path(),
+            root_workspace.path().join(".agents/skills"),
+        )
+        .is_ok()
+        {
+            let ctx = context(root_workspace.path());
+            assert!(
+                catalog_block_for(root_workspace.path(), root_workspace.path())
+                    .await
+                    .is_none()
+            );
+            let out = skill(&ctx, &serde_json::json!({"name": "review"})).await;
+            assert!(out.is_error, "{}", out.content);
+        }
     }
 }

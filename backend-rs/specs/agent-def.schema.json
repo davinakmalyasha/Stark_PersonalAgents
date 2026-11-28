@@ -1,0 +1,192 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://stark.local/specs/agent-def.schema.json",
+  "title": "Stark Agent Definition v2",
+  "description": "One file per agent under .deep_agents/config/agents/<key>.json. Built-in keys are validated overrides with compiled caps; any other key is a full custom definition. Custom agents are closed-world: tools is required (use [] for none); missing skills/mcp means none. Custom Code Mode is opt-in hybrid and requires the execute tool.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "display"],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2,
+      "default": 2,
+      "description": "v1 files are read and migrated on read; every write is v2."
+    },
+    "key": {
+      "type": "string",
+      "pattern": "^[a-z0-9_-]{1,64}$",
+      "description": "Optional in-file copy of the filename key. The filename wins."
+    },
+    "display": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 400
+    },
+    "tier": {
+      "type": "string",
+      "description": "Model matrix tier: workspace, specialist, or orchestrator. Empty inherits the built-in/custom default."
+    },
+    "provider": {
+      "type": ["string", "null"],
+      "description": "Provider id present in providers.json. Null inherits the active provider."
+    },
+    "model": {
+      "type": ["string", "null"],
+      "description": "Model key, id, or alias for the selected provider. Null inherits the tier matrix."
+    },
+    "thinking": {
+      "type": ["string", "null"],
+      "enum": ["inherit", "none", "minimal", "low", "medium", "high", null]
+    },
+    "access": {
+      "type": "string",
+      "enum": ["read", "write"],
+      "default": "read",
+      "description": "Custom agents: root access. write is capped to a worktree when spawned. Built-ins: may narrow, never widen, their compiled cap."
+    },
+    "prompt": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "profile": {
+          "type": "string",
+          "enum": ["coding", "general", "plain"],
+          "default": "general",
+          "description": "coding uses the Developer composer; general uses the generic composer. Built-ins keep their compiled profile."
+        },
+        "persona": {
+          "type": "string",
+          "description": "Appended after harness/safety instructions. Code-enforced guards are never removed by a persona."
+        }
+      }
+    },
+    "system_prompt": {
+      "type": ["string", "null"],
+      "description": "Legacy v1 persona. Do not combine with prompt.persona."
+    },
+    "tools": {
+      "type": "array",
+      "description": "Built-ins: optional subset of the compiled scope contract. Custom agents: the complete closed tool list; required for new custom agents (use [] for none).",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9_]+$"
+      }
+    },
+    "skills": {
+      "type": "array",
+      "description": "Skill names discovered under workspace or harness .agents/skills and .deep_agents/skills. Built-ins: null/omitted means all. Custom: omitted means none. Save/preview accepts workspace_path to validate project-local skills; without it unknown names are warnings.",
+      "uniqueItems": true,
+      "items": {
+        "type": "string"
+      }
+    },
+    "skill_hashes": {
+      "type": "object",
+      "description": "Optional SHA-256 pins for skill content. Keys must be in `skills`; values are 64 hex characters, optionally prefixed with sha256:. A changed pinned skill is refused at dispatch.",
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^(sha256:)?[0-9a-fA-F]{64}$"
+      }
+    },
+    "mcp": {
+      "type": "array",
+      "description": "Configured MCP server names. Built-ins: null/omitted means all. Custom: omitted means none.",
+      "uniqueItems": true,
+      "items": {
+        "type": "string"
+      }
+    },
+    "aliases": {
+      "type": "array",
+      "description": "Compatibility names. Never listed as agents. Must not shadow any key or alias. Built-in aliases are fixed and ignore this field.",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9_-]{1,64}$"
+      }
+    },
+    "delegation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "delegatable": {
+          "type": "boolean",
+          "default": false,
+          "description": "May be selected as a delegate target."
+        },
+        "can_delegate": {
+          "type": "boolean",
+          "default": false,
+          "description": "May call delegate/delegation_status. Built-ins are capped."
+        },
+        "can_spawn": {
+          "type": "boolean",
+          "default": false,
+          "description": "May use spawn_agent and the durable agent tree. Built-ins are capped."
+        }
+      }
+    },
+    "ui": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "visible": {
+          "type": "boolean",
+          "default": true
+        },
+        "order": {
+          "type": "integer",
+          "default": 0
+        }
+      }
+    },
+    "routing": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Custom-agent auto-routing. Applied only when no explicit agent/chat agentKey or workspace binding exists and the workspace kind is generic. A unique match wins; multiple matches fall back to the built-in heuristic with a warning. Non-empty path and repo lists are ANDed.",
+      "properties": {
+        "workspace_kinds": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
+        "paths": {
+          "type": "array",
+          "description": "Absolute glob patterns over the normalised workspace path. Backslashes are accepted and normalised to '/'. Matching is case-insensitive on Windows and macOS. Empty and relative patterns are rejected.",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "repos": {
+          "type": "array",
+          "description": "Repository identities as host/owner/repo. HTTPS, SSH, and git@host:owner/repo forms are normalised. When both paths and repos are present, both must match.",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "code_mode": {
+      "type": "string",
+      "enum": ["off", "none", "disabled", "hybrid", "both", "preferred", "only", "strict"],
+      "description": "Custom agents support off or hybrid. hybrid requires the execute tool. only and full_codemode are built-in Developer features."
+    },
+    "full_codemode": {
+      "type": ["boolean", "null"],
+      "description": "Built-in Developer only. Custom agents cannot enable it; use hybrid Code Mode for the base surface."
+    }
+  }
+}

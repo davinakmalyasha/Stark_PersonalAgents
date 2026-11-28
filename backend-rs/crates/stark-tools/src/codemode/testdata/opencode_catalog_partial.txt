@@ -1,0 +1,37 @@
+# Code Mode
+
+The tools listed below, and `search`, cannot be called directly: they only work as JavaScript inside the `execute` tool. Every other tool you have is a normal tool call: call it directly, never inside `execute`.
+
+The catalog is partial. Before calling a tool that is not listed below, find it with the global `search(...)` function. Do not guess tool names. Each result's `path` is the complete call expression: write it out as code, for example `await tools.ns.tool_name({ ... })`. Do not use it as a key such as `tools[path]`.
+
+- search(query: string | {
+  query?: string,
+  namespace?: string,
+  /** @integer @exclusiveMinimum 0 */
+  limit?: number,
+  /** @integer @minimum 0 */
+  offset?: number,
+}): {
+  items: Array<{
+      path: string,
+      description: string,
+      signature: string,
+    }>,
+  /** @integer @minimum 0 */
+  remaining: number,
+  next: {
+      /** @integer @minimum 0 */
+      offset: number,
+    } | null,
+}
+
+## Code Mode tools (call only inside `execute`)
+
+- github (3 tools, none shown)
+- read (1 tool)
+  - tools.read({
+  file_path: string,
+}): Promise<string | null> // Read a file.
+    // Second line.
+    // Third line.
+- search (1 tool, none shown)

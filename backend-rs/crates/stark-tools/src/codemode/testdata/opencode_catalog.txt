@@ -1,0 +1,24 @@
+# Code Mode
+
+The tools listed below cannot be called directly: they only work as JavaScript inside the `execute` tool. Every other tool you have is a normal tool call: call it directly, never inside `execute`.
+
+The catalog is complete. Do not guess tool names.
+
+## Code Mode tools (call only inside `execute`)
+
+- github (3 tools)
+  - tools.github.create_issue({
+  title: string,
+}): Promise<string | null> // Create an issue.
+  - tools.github.get_issue({
+  id: number,
+}): Promise<string | null> // Get an issue.
+  - tools.github.list_issues({}): Promise<string | null> // List issues.
+- read (1 tool)
+  - tools.read({
+  file_path: string,
+}): Promise<string | null> // Read a file.
+    // Second line.
+    // Third line.
+- search (1 tool)
+  - tools.search({ query: string }): Promise<string | null> // Search ünïcode ✨ and a very long first line that should be clipped only when it exceeds the two thousand character description limit; this one is short enough.

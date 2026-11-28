@@ -95,6 +95,8 @@ pub enum ResponseItemPayload {
         call_id: String,
         name: String,
         arguments: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        custom_header: Option<String>,
     },
     FunctionCallOutput {
         call_id: String,
@@ -121,6 +123,12 @@ pub enum EventMsgPayload {
     },
     Warning {
         message: String,
+    },
+    /// The resolved agent identity at the start of a run. Model-invisible;
+    /// used to tell whether a resumed chat is continuing the same definition.
+    AgentContext {
+        agent_key: String,
+        agent_hash: String,
     },
     TurnStarted {
         turn_id: String,

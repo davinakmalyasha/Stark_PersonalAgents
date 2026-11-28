@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -24,8 +24,11 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use stark_config::{AgentFile, ConfigStore, EffectiveAgent};
 use stark_contract::{AppState, ServerEvent};
-use stark_core::{RunContext, agent_for_scope, resolve_agent, run_agent};
-use stark_providers::{ImagePart, Provider, ProviderConfig};
+use stark_core::{
+    AgentRegistry, RunContext, agent_access_for, preview_system_prompt, resolve_definition,
+    run_agent, validate_definition,
+};
+use stark_providers::{ChatMessage, ImagePart, Provider, ProviderConfig, ProviderSession};
 use stark_store::{
     AgentRecord, AgentStore, CanvasStore, ChatStore, GroupStore, MemoryStore, NewEntry,
     ScheduleRecord, ScheduleStore, WorkspaceRegistry, parse_schedule_time, schedule_json,
@@ -364,6 +367,8 @@ impl RunManager {
     }
 }
 
+type RegistryCache = Arc<Mutex<Option<(u64, Arc<AgentRegistry>)>>>;
+
 #[derive(Clone)]
 struct ServerState {
     store: ChatStore,
@@ -377,7 +382,10 @@ struct ServerState {
     provider_health: Arc<Mutex<HashMap<String, String>>>,
     questions: Arc<QuestionBroker>,
     runs: Arc<RunManager>,
+    /// Registry snapshot keyed by `ConfigStore::revision()`.
+    registry_cache: RegistryCache,
     registry: WorkspaceRegistry,
+    groups: GroupStore,
     pairing: Arc<PairingStore>,
     ui_state_path: PathBuf,
     harness_root: PathBuf,
@@ -468,7 +476,9 @@ impl ServerState {
                 || current.api_key != key
                 || !current.mode.eq_ignore_ascii_case(&effective.provider);
             if !stale && current.model.eq_ignore_ascii_case(&effective.model) {
-                return self.attach_fallback(provider.clone(), effective);
+                return self
+                    .attach_fallback(provider.clone(), effective)
+                    .with_freeform(effective.freeform.clone());
             }
             // Hot reload: rebuild the client with the edited base/key/model.
             let mut config = current.clone();
@@ -483,7 +493,9 @@ impl ServerState {
                 );
                 provider.clone()
             });
-            return self.attach_fallback(rebuilt, effective);
+            return self
+                .attach_fallback(rebuilt, effective)
+                .with_freeform(effective.freeform.clone());
         }
         // A provider added to providers.json after startup is not in the
         // prebuilt map yet. Build it on demand so hot-reload covers new
@@ -502,26 +514,72 @@ impl ServerState {
             self.provider.clone()
         });
         self.attach_fallback(built, effective)
+            .with_freeform(effective.freeform.clone())
     }
 }
 
 /// Resolve an agent's configuration, falling back to the built-in defaults when
 /// a user-edited agent file is invalid. A broken file must not brick a chat.
-fn effective_for(state: &ServerState, scope: &str, tier: &str) -> Arc<EffectiveAgent> {
-    match state.config.effective(scope, tier) {
-        Ok(effective) => Arc::new(effective),
-        Err(error) => {
-            tracing::warn!(
-                "agent config for '{scope}' is invalid: {error}; using built-in defaults"
-            );
-            Arc::new(
-                state
-                    .config
-                    .effective("__default__", tier)
-                    .unwrap_or_else(|_| stark_config::builtin_effective(tier)),
-            )
-        }
+fn agent_registry(state: &ServerState) -> Arc<AgentRegistry> {
+    let revision = state.config.revision();
+    if let Ok(cache) = state.registry_cache.lock()
+        && let Some((cached_revision, registry)) = cache.as_ref()
+        && *cached_revision == revision
+    {
+        return registry.clone();
     }
+    let registry = Arc::new(AgentRegistry::load(&state.config, &state.harness_root));
+    if let Ok(mut cache) = state.registry_cache.lock() {
+        *cache = Some((revision, registry.clone()));
+    }
+    registry
+}
+
+fn route_agent(
+    registry: &AgentRegistry,
+    kind: &str,
+    workspace: &FsPath,
+    harness_root: &FsPath,
+    warning: &mut Option<String>,
+) -> EffectiveAgent {
+    let decision = registry.route_decision(kind, workspace, harness_root);
+    if let Some(message) = &decision.warning {
+        tracing::warn!(
+            workspace = %workspace.display(),
+            workspace_kind = %kind,
+            "agent routing ambiguity: {message}"
+        );
+        *warning = Some(message.clone());
+    }
+    decision.agent
+}
+
+/// Case-stable key for explicit workspace → agent pins.
+fn workspace_binding_key(path: &FsPath) -> String {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let mut key = path.to_string_lossy().replace('\\', "/");
+    while key.len() > 1 && key.ends_with('/') {
+        key.pop();
+    }
+    if cfg!(windows) {
+        key = key.to_ascii_lowercase();
+    }
+    key
+}
+
+fn effective_for(state: &ServerState, scope: &str, tier: &str) -> Arc<EffectiveAgent> {
+    let registry = agent_registry(state);
+    if let Some(agent) = registry.get(scope) {
+        return Arc::new(agent.clone());
+    }
+    tracing::warn!("agent '{scope}' is not in the registry; using built-in defaults");
+    Arc::new(
+        state
+            .config
+            .effective(scope, tier)
+            .or_else(|_| state.config.effective("__default__", tier))
+            .unwrap_or_else(|_| stark_config::builtin_effective(tier)),
+    )
 }
 
 fn legacy_env_names() -> Vec<&'static str> {
@@ -587,6 +645,10 @@ struct RunRequest {
     attachments: Vec<Value>,
     #[serde(default)]
     workspace_kind: String,
+    /// Explicit agent key (built-in or custom). When empty the registry routes
+    /// by workspace kind/path, preserving old clients.
+    #[serde(default, alias = "agent_key")]
+    agent: String,
 }
 
 fn default_temperature() -> f64 {
@@ -873,12 +935,24 @@ async fn main() -> anyhow::Result<()> {
         provider_health: provider_health.clone(),
         questions: Arc::new(QuestionBroker::new()),
         runs: Arc::new(RunManager::default()),
+        registry_cache: Arc::new(Mutex::new(None)),
         registry: WorkspaceRegistry::new(&harness_root),
+        groups: GroupStore::default_root(),
         pairing: Arc::new(PairingStore::new(&harness_root)),
         ui_state_path: harness_root.join(".deep_agents").join("ui_state.json"),
         harness_root,
         voice,
     };
+    let codemode_state = state.clone();
+    background.push(tokio::spawn(async move {
+        deliver_code_mode_restart_notices(codemode_state).await;
+    }));
+    background.push(tokio::spawn(async {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            stark_tools::WorkerManager::sweep_idle();
+        }
+    }));
     let scheduler_state = state.clone();
     let group_runner_state = state.clone();
     let canvas_state = state.clone();
@@ -935,6 +1009,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/chats/{chat_id}/log", get(chat_log_handler))
         .route("/api/abort", post(abort_handler))
         .route("/api/health", get(health_handler))
+        .route("/api/audit", get(audit_handler))
         .route("/api/state", get(state_handler))
         .route("/api/history", get(history_handler))
         .route("/api/runs/active", get(active_handler))
@@ -958,12 +1033,21 @@ async fn main() -> anyhow::Result<()> {
             delete(remove_provider_key_handler),
         )
         .route("/api/provider/usage", get(provider_usage_handler))
+        .route("/api/agent-catalog", get(agent_catalog_handler))
         .route("/api/config/agents", get(agents_config_handler))
         .route(
             "/api/config/agents/{key}",
             get(agent_config_handler)
                 .put(save_agent_handler)
                 .delete(delete_agent_handler),
+        )
+        .route(
+            "/api/config/agents/{key}/preview",
+            post(preview_agent_handler),
+        )
+        .route(
+            "/api/config/agents/{key}/duplicate",
+            post(duplicate_agent_handler),
         )
         .route(
             "/api/workspaces",
@@ -976,6 +1060,12 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/workspaces/{workspace_id}",
             get(workspace_handler).delete(remove_workspace_handler),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/agent-binding",
+            get(workspace_agent_binding_handler)
+                .put(set_workspace_agent_binding_handler)
+                .delete(clear_workspace_agent_binding_handler),
         )
         .route(
             "/api/workspaces/{workspace_id}/files",
@@ -1067,7 +1157,39 @@ async fn main() -> anyhow::Result<()> {
             "/api/groups",
             get(groups_handler).post(create_group_handler),
         )
-        .route("/api/groups/{project_id}", get(group_handler))
+        .route("/api/groups/trash", get(group_trash_handler))
+        .route(
+            "/api/groups/trash/{folder}/restore",
+            post(group_restore_handler),
+        )
+        .route(
+            "/api/groups/trash/{folder}",
+            delete(group_permanent_delete_handler),
+        )
+        .route(
+            "/api/groups/{project_id}",
+            get(group_handler)
+                .patch(group_patch_handler)
+                .delete(group_delete_handler),
+        )
+        .route("/api/groups/{project_id}/start", post(group_start_handler))
+        .route("/api/groups/{project_id}/pause", post(group_pause_handler))
+        .route("/api/groups/{project_id}/stop", post(group_stop_handler))
+        .route("/api/groups/{project_id}/close", post(group_close_handler))
+        .route(
+            "/api/groups/{project_id}/restart",
+            post(group_restart_handler),
+        )
+        .route("/api/groups/{project_id}/plan", post(group_plan_handler))
+        .route(
+            "/api/groups/{project_id}/approve-plan",
+            post(group_approve_plan_handler),
+        )
+        .route(
+            "/api/groups/{project_id}/messages",
+            post(group_message_handler),
+        )
+        .route("/api/groups/{project_id}/runs", get(group_runs_handler))
         .route("/api/agents", get(agents_handler))
         .route("/api/agents/{agent_id}", get(agent_handler))
         .route("/api/agents/{agent_id}/cancel", post(agent_cancel_handler))
@@ -1428,14 +1550,21 @@ async fn canvas_loop(state: ServerState, shutdown: CancellationToken) {
                     .await;
                 continue;
             }
-            let target = canvas_target(&state, &chat);
+            let target = match canvas_target(&state, &chat) {
+                Ok(target) => target,
+                Err(error) => {
+                    tracing::warn!("canvas wake {id} target invalid: {error}");
+                    let _ = store.mark_wake(id, "failed").await;
+                    continue;
+                }
+            };
             spawn_follow_up_run(state.clone(), target, text);
             let _ = store.mark_wake(id, "done").await;
         }
     }
 }
 
-fn canvas_target(state: &ServerState, chat: &Value) -> RunTarget {
+fn canvas_target(state: &ServerState, chat: &Value) -> Result<RunTarget, String> {
     let workspace_path = chat["workspacePath"].as_str().unwrap_or("");
     let workspace = if workspace_path.trim().is_empty() {
         state.harness_root.clone()
@@ -1444,26 +1573,51 @@ fn canvas_target(state: &ServerState, chat: &Value) -> RunTarget {
     };
     let workspace_id = chat["workspaceId"].as_str().unwrap_or("_general");
     let parent = chat["parentChatId"].as_str().unwrap_or("");
-    let scope = if workspace_id == "_house" {
-        "house"
-    } else if workspace_id == "_dfd" {
-        "dfd"
-    } else if workspace_id == "_personal" {
-        "general"
-    } else if !parent.trim().is_empty() {
-        if workspace != state.harness_root {
+    let registry = agent_registry(state);
+    let persisted = chat
+        .get("agentKey")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|key| !key.is_empty());
+    let agent = if let Some(key) = persisted {
+        registry
+            .get(key)
+            .cloned()
+            .ok_or_else(|| format!("agent '{key}' no longer exists; choose another agent"))?
+    } else {
+        let scope = if workspace_id == "_house" {
+            "house"
+        } else if workspace_id == "_dfd" {
+            "dfd"
+        } else if workspace_id == "_personal" {
+            "general"
+        } else if !parent.trim().is_empty() {
+            if workspace != state.harness_root {
+                "developer"
+            } else {
+                "general"
+            }
+        } else if workspace != state.harness_root {
             "developer"
         } else {
-            "general"
+            "orchestrator"
+        };
+        match registry.get(scope).cloned() {
+            Some(agent) => agent,
+            None => {
+                let decision = registry.route_decision(scope, &workspace, &state.harness_root);
+                if let Some(warning) = &decision.warning {
+                    tracing::warn!(
+                        workspace = %workspace.display(),
+                        workspace_kind = %scope,
+                        "agent routing ambiguity: {warning}"
+                    );
+                }
+                decision.agent
+            }
         }
-    } else if workspace != state.harness_root {
-        "developer"
-    } else {
-        "orchestrator"
     };
-    let agent = stark_core::agent_for_scope(scope)
-        .unwrap_or_else(|| stark_core::agent_for_scope("general").expect("general agent"));
-    let mut effective = (*effective_for(state, agent.key, agent.tier)).clone();
+    let mut effective = agent.clone();
     let model = chat["model"]
         .as_str()
         .filter(|model| !model.trim().is_empty())
@@ -1477,7 +1631,7 @@ fn canvas_target(state: &ServerState, chat: &Value) -> RunTarget {
         .unwrap_or_else(|| effective.model.clone());
     effective.model = model.clone();
     let effective = Arc::new(effective);
-    RunTarget {
+    Ok(RunTarget {
         chat_id: chat["id"].as_str().unwrap_or("").to_string(),
         workspace_id: workspace_id.to_string(),
         workspace,
@@ -1488,7 +1642,7 @@ fn canvas_target(state: &ServerState, chat: &Value) -> RunTarget {
         depth: 0,
         agent_id: None,
         effective,
-    }
+    })
 }
 
 async fn schedule_loop(state: ServerState, shutdown: CancellationToken) {
@@ -1520,16 +1674,44 @@ async fn schedule_loop(state: ServerState, shutdown: CancellationToken) {
             } else {
                 PathBuf::from(&record.workspace_path)
             };
-            let tier = stark_core::agent_for_scope(&record.scope)
-                .map(|agent| agent.tier)
-                .unwrap_or("workspace");
-            let mut effective = (*effective_for(&state, &record.scope, tier)).clone();
+            let registry = agent_registry(&state);
+            let mut effective = match registry.get(&record.scope).cloned() {
+                Some(agent) => agent,
+                None => {
+                    tracing::warn!(
+                        "schedule {} references missing agent '{}'; skipped",
+                        record.id,
+                        record.scope
+                    );
+                    let _ = state
+                        .store
+                        .append_message(
+                            &record.chat_id,
+                            "error",
+                            &format!(
+                                "Scheduled run skipped: agent '{}' no longer exists.",
+                                record.scope
+                            ),
+                            false,
+                        )
+                        .await;
+                    if let Err(error) = store.mark_after_run(&record).await {
+                        tracing::warn!("scheduler mark after run failed: {error}");
+                    }
+                    continue;
+                }
+            };
+            let scope = effective.key.clone();
             let model = state
                 .config
                 .resolve_model(&effective.provider, &record.model)
                 .map(|(_, model)| model)
                 .unwrap_or_else(|_| effective.model.clone());
             effective.model = model.clone();
+            let role = record
+                .role
+                .clone()
+                .or_else(|| Some(effective.display.clone()));
             let effective = Arc::new(effective);
             spawn_follow_up_run(
                 state.clone(),
@@ -1537,8 +1719,8 @@ async fn schedule_loop(state: ServerState, shutdown: CancellationToken) {
                     chat_id: record.chat_id.clone(),
                     workspace_id: record.workspace_id.clone(),
                     workspace,
-                    scope: record.scope.clone(),
-                    role: record.role.clone(),
+                    scope,
+                    role,
                     model,
                     temperature: record.temperature,
                     depth: 0,
@@ -1555,7 +1737,7 @@ async fn schedule_loop(state: ServerState, shutdown: CancellationToken) {
 }
 
 async fn group_loop(state: ServerState, shutdown: CancellationToken) {
-    let groups = GroupStore::default_root();
+    let groups = state.groups.clone();
     match groups.recover_doing_items().await {
         Ok(count) if count > 0 => tracing::info!("recovered {count} interrupted group item(s)"),
         Ok(_) => {}
@@ -1565,51 +1747,346 @@ async fn group_loop(state: ServerState, shutdown: CancellationToken) {
         if !sleep_or_shutdown(std::time::Duration::from_secs(2), &shutdown).await {
             break;
         }
+        for project in groups.due_projects().await {
+            let Some(project_id) = project["id"].as_str() else {
+                continue;
+            };
+            if let Err(error) = groups.start_due(project_id).await {
+                tracing::warn!("group {project_id} scheduled start failed: {error}");
+            }
+        }
         for project in groups
             .list()
             .await
             .into_iter()
-            .filter(|project| project["status"] == "running")
+            .filter(|project| project["status"] == "running" || project["status"] == "planning")
         {
-            let Some(project_id) = project["id"].as_str() else {
+            let Some(project_id) = project["id"].as_str().map(str::to_string) else {
                 continue;
             };
-            match groups.claim_next_ready(project_id).await {
-                Ok(Some(item)) => {
-                    let state = state.clone();
-                    let groups = groups.clone();
-                    let project_id = project_id.to_string();
-                    tokio::spawn(async move {
-                        run_group_item(state, groups, project_id, item).await;
-                    });
+            if (project["status"] == "planning" || project["plan_status"] == "queued")
+                && groups.claim_planning(&project_id).await.unwrap_or(false)
+            {
+                let state = state.clone();
+                let groups = groups.clone();
+                tokio::spawn(async move {
+                    run_group_planner(state, groups, project_id).await;
+                });
+                continue;
+            }
+            if project["status"] != "running" {
+                continue;
+            }
+            // Fill the project's available worker slots. claim_next_ready is
+            // atomic and capacity-aware, so an over-claim is impossible.
+            for _ in 0..8 {
+                match groups.claim_next_ready(&project_id).await {
+                    Ok(Some(item)) => {
+                        let state = state.clone();
+                        let groups = groups.clone();
+                        let project_id = project_id.clone();
+                        tokio::spawn(async move {
+                            run_group_item(state, groups, project_id, item).await;
+                        });
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        tracing::warn!("group runner could not claim an item: {error}");
+                        break;
+                    }
                 }
-                Ok(None) => {}
-                Err(error) => tracing::warn!("group runner could not claim an item: {error}"),
             }
         }
     }
 }
 
-fn group_member_agent(owner: &str, detail: &Value) -> Option<stark_core::AgentSpec> {
+fn extract_json_object(text: &str) -> Option<Value> {
+    let trimmed = text.trim();
+    let candidate = if let Some(start) = trimmed.find("```json") {
+        let rest = &trimmed[start + 7..];
+        rest.split("```").next().unwrap_or(rest).trim()
+    } else if let Some(start) = trimmed.find("```") {
+        let rest = &trimmed[start + 3..];
+        rest.split("```").next().unwrap_or(rest).trim()
+    } else {
+        trimmed
+    };
+    if let Ok(value) = serde_json::from_str::<Value>(candidate) {
+        return Some(value);
+    }
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    serde_json::from_str::<Value>(trimmed.get(start..=end)?).ok()
+}
+
+fn group_plan_prompt(detail: &Value) -> String {
+    let members = detail["members"]
+        .as_array()
+        .map(|members| {
+            members
+                .iter()
+                .map(|member| {
+                    format!(
+                        "- {} (agent {}, {} items assigned)",
+                        member["display"].as_str().unwrap_or("Agent"),
+                        member["agent_key"].as_str().unwrap_or("developer"),
+                        member["assigned"].as_i64().unwrap_or(0)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    let workspace = detail["workspace_path"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .or_else(|| detail["project"]["workspace_path"].as_str())
+        .unwrap_or("");
+    format!(
+        r#"You are the planning lead for a group project. You do not do the work; you produce a precise, executable plan.
+
+Project title: {title}
+Goal:
+{goal}
+
+Work folder: {workspace}
+
+Team:
+{members}
+
+Return ONE JSON object only, with no prose outside the code fence:
+```json
+{{
+  "summary": "one short sentence",
+  "milestones": [
+    {{
+      "title": "phase title",
+      "detail": "what this phase delivers",
+      "depends_on": ["id of an earlier milestone"],
+      "items": [
+        {{
+          "title": "one concrete deliverable",
+          "detail": "exactly what to do and where",
+          "acceptance": ["a machine-checkable condition or a clearly manual check"],
+          "owner": "exact team member display name or null",
+          "priority": 0,
+          "requires_approval": false
+        }}
+      ]
+    }}
+  ]
+}}
+```
+
+Rules:
+- 2-8 milestones, 1-8 items per milestone, ordered by dependency.
+- Every item needs at least one acceptance criterion. Prefer concrete, verifiable checks.
+- Assign each item to one member display name from the team. Balance the work.
+- Coding items should name the files or directories they touch. If two items would edit the same files, put them in different milestones or sequence them with depends_on.
+- Do not create a separate "make a plan" item. The plan is the output.
+- Do not invent credentials, external access, or files that are not in the work folder.
+- Mark `requires_approval: true` for anything destructive, external, paid, or publish/send-related.
+- If the goal is ambiguous, make the smallest safe plan that produces a reviewable result."#,
+        title = detail["project"]["title"].as_str().unwrap_or("Project"),
+        goal = detail["project"]["goal"].as_str().unwrap_or(""),
+        members = members,
+        workspace = workspace,
+    )
+}
+
+async fn run_group_planner(state: ServerState, groups: GroupStore, project_id: String) {
+    let detail = match groups.detail(&project_id, 0).await {
+        Ok(detail) => detail,
+        Err(error) => {
+            tracing::warn!("group {project_id} planner detail failed: {error}");
+            let _ = groups.plan_failed(&project_id, &error).await;
+            return;
+        }
+    };
+    let cycle = detail["current_cycle"].as_i64().unwrap_or(1);
+    let planner_key = detail["project"]["planner_agent"]
+        .as_str()
+        .unwrap_or("orchestrator");
+    let registry = agent_registry(&state);
+    let agent = registry
+        .get(planner_key)
+        .cloned()
+        .or_else(|| registry.get("orchestrator").cloned());
+    let Some(agent) = agent else {
+        let _ = groups
+            .plan_failed(&project_id, "no planner agent is configured")
+            .await;
+        return;
+    };
+    let provider = state.provider_for(&agent);
+    let run_id = match groups
+        .start_run(
+            &project_id,
+            cycle,
+            None,
+            None,
+            &agent.key,
+            None,
+            None,
+            "planning",
+        )
+        .await
+    {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::warn!("group {project_id} planner run row failed: {error}");
+            let _ = groups.plan_failed(&project_id, &error).await;
+            return;
+        }
+    };
+    let prompt = group_plan_prompt(&detail);
+    let session_key = format!("group-plan-{}", project_id.replace([':', '/', '\\'], "-"));
+    let session = ProviderSession {
+        session_id: &session_key,
+        affinity: &session_key,
+        reasoning_effort: agent.thinking.as_deref(),
+    };
+    let messages = vec![
+        ChatMessage::system(
+            "You are a meticulous project planner. Return only the requested JSON. Never claim work was performed.",
+        ),
+        ChatMessage::user(prompt),
+    ];
+    let result = tokio::time::timeout(
+        Duration::from_secs(180),
+        provider.complete_text_for_session(&messages, 0.2, session),
+    )
+    .await;
+    match result {
+        Ok(Ok(completion)) => {
+            let usage = completion.usage;
+            let parsed = extract_json_object(&completion.text);
+            let applied = match parsed {
+                Some(plan) => groups.apply_plan(&project_id, &plan).await,
+                None => Err("planner did not return valid JSON".to_string()),
+            };
+            match applied {
+                Ok(()) => {
+                    let _ = groups
+                        .finish_run(
+                            &project_id,
+                            &run_id,
+                            "complete",
+                            usage.input_tokens as i64,
+                            usage.output_tokens as i64,
+                            usage.cost,
+                            Some(&completion.text),
+                            None,
+                        )
+                        .await;
+                }
+                Err(error) => {
+                    let _ = groups
+                        .finish_run(
+                            &project_id,
+                            &run_id,
+                            "failed",
+                            usage.input_tokens as i64,
+                            usage.output_tokens as i64,
+                            usage.cost,
+                            Some(&completion.text),
+                            Some(&error),
+                        )
+                        .await;
+                    let _ = groups.plan_failed(&project_id, &error).await;
+                }
+            }
+        }
+        Ok(Err(error)) => {
+            let message = format!("planner provider failed: {error}");
+            let _ = groups
+                .finish_run(
+                    &project_id,
+                    &run_id,
+                    "failed",
+                    0,
+                    0,
+                    0.0,
+                    None,
+                    Some(&message),
+                )
+                .await;
+            let _ = groups.plan_failed(&project_id, &message).await;
+        }
+        Err(_) => {
+            let message = "planner timed out after 180 seconds".to_string();
+            let _ = groups
+                .finish_run(
+                    &project_id,
+                    &run_id,
+                    "failed",
+                    0,
+                    0,
+                    0.0,
+                    None,
+                    Some(&message),
+                )
+                .await;
+            let _ = groups.plan_failed(&project_id, &message).await;
+        }
+    }
+}
+
+async fn group_workspace(
+    state: &ServerState,
+    groups: &GroupStore,
+    detail: &Value,
+) -> Result<PathBuf, String> {
+    let stored = detail["workspace_path"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            detail["project"]["workspace_path"]
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .map(PathBuf::from)
+        });
+    if let Some(path) = stored.filter(|path| path.is_dir()) {
+        return Ok(path);
+    }
+    let origin = detail["project"]["origin_workspace_id"]
+        .as_str()
+        .filter(|value| !value.is_empty());
+    if let Some(origin) = origin
+        && let Some(record) = state.registry.get(origin)
+        && FsPath::new(&record.path).is_dir()
+    {
+        let _ = groups
+            .set_workspace_path(detail["id"].as_str().unwrap_or(""), &record.path)
+            .await;
+        return Ok(PathBuf::from(record.path));
+    }
+    // Legacy projects created before workspace_path existed have no origin
+    // folder to resolve. They may run in their state folder until the owner
+    // relinks them; new projects always need a real workspace.
+    if let Some(path) = detail["path"]
+        .as_str()
+        .filter(|path| FsPath::new(path).is_dir())
+    {
+        return Ok(PathBuf::from(path));
+    }
+    Err("project workspace is missing; relink the work folder in settings".to_string())
+}
+
+fn group_member_runtime(
+    registry: &AgentRegistry,
+    owner: &str,
+    detail: &Value,
+) -> Option<EffectiveAgent> {
     let owner = owner.trim();
     if owner.is_empty() {
         return None;
     }
-    if let Some(agent) = agent_for_scope(owner) {
-        return Some(agent);
-    }
-    let alias = match owner.to_ascii_lowercase().as_str() {
-        "dev" | "coding" | "coder" | "engineer" => "developer",
-        "research" | "researcher" | "writer" | "analyst" => "general",
-        "design" | "designer" | "frontend" | "front-end" => "ui",
-        "ops" | "operations" | "sre" | "infra" => "devops",
-        "scout" | "explorer" => "explore",
-        _ => "",
-    };
-    if !alias.is_empty()
-        && let Some(agent) = agent_for_scope(alias)
-    {
-        return Some(agent);
+    // Agent names and aliases live in one registry, so custom agents resolve
+    // here exactly like built-ins.
+    if let Some(agent) = registry.get(owner) {
+        return Some(agent.clone());
     }
     let members = detail.get("members").and_then(Value::as_array)?;
     for member in members {
@@ -1622,30 +2099,70 @@ fn group_member_agent(owner: &str, detail: &Value) -> Option<stark_core::AgentSp
         }
         for key in ["kind", "derived_from", "name", "display"] {
             if let Some(candidate) = member.get(key).and_then(Value::as_str)
-                && let Some(agent) = agent_for_scope(candidate)
+                && let Some(agent) = registry.get(candidate)
             {
-                return Some(agent);
+                return Some(agent.clone());
             }
         }
     }
     None
 }
 
-fn group_item_agent(item: &Value, detail: &Value) -> stark_core::AgentSpec {
-    item.get("owner_member")
+fn group_item_runtime(
+    registry: &AgentRegistry,
+    item: &Value,
+    detail: &Value,
+) -> Result<EffectiveAgent, String> {
+    if let Some(member) = item.get("member") {
+        for key in ["agent_key", "id", "display", "name"] {
+            if let Some(candidate) = member.get(key).and_then(Value::as_str)
+                && let Some(agent) = registry.get(candidate)
+            {
+                return Ok(agent.clone());
+            }
+        }
+    }
+    let owner_member_id = item
+        .get("owner_member_id")
         .and_then(Value::as_str)
-        .and_then(|owner| group_member_agent(owner, detail))
-        .or_else(|| agent_for_scope("developer"))
-        .expect("the developer agent is registered")
+        .map(str::trim)
+        .unwrap_or("");
+    if !owner_member_id.is_empty()
+        && let Some(members) = detail.get("members").and_then(Value::as_array)
+    {
+        for member in members {
+            if member.get("id").and_then(Value::as_str) == Some(owner_member_id) {
+                for key in ["agent_key", "display", "id"] {
+                    if let Some(candidate) = member.get(key).and_then(Value::as_str)
+                        && let Some(agent) = registry.get(candidate)
+                    {
+                        return Ok(agent.clone());
+                    }
+                }
+            }
+        }
+    }
+    let owner = item
+        .get("owner_member")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if owner.is_empty() {
+        return registry
+            .get("developer")
+            .cloned()
+            .ok_or_else(|| "the developer agent is unavailable".to_string());
+    }
+    group_member_runtime(registry, owner, detail)
+        .ok_or_else(|| format!("owner_member '{owner}' does not match an agent"))
 }
 
 const GROUP_RUNTIME_NOTICE: &str = "Group projects run in their project folder. owner_member selects the agent; items tagged needs-approval (or flagged requires_approval) park for approval.";
 
 async fn run_group_item(state: ServerState, groups: GroupStore, project_id: String, item: Value) {
     let item_id = item["id"].as_str().unwrap_or("").to_string();
-    // Pre-run approval gate: a tagged (or flagged) item parks for the owner
-    // instead of executing. The existing approval route returns it to `todo`
-    // on grant, so the claim loop picks it up again — nothing is lost.
+    // Pre-run approval gate: a flagged item parks for the owner instead of
+    // executing. Approval returns it to todo, so the loop picks it up again.
     let wants_approval = item
         .get("requires_approval")
         .and_then(Value::as_bool)
@@ -1689,22 +2206,60 @@ async fn run_group_item(state: ServerState, groups: GroupStore, project_id: Stri
     } else {
         origin_workspace_id.to_string()
     };
-    // Group work belongs to the project folder, not the workspace that asked
-    // for the project. Running in the origin workspace (often the harness
-    // root for General) would let an item write outside its project.
-    let workspace = detail["path"]
-        .as_str()
-        .filter(|path| !path.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| state.harness_root.clone());
-    let agent = group_item_agent(&item, &detail);
-    let effective = effective_for(&state, agent.key, agent.tier);
+    let workspace = match group_workspace(&state, &groups, &detail).await {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            let _ = groups
+                .finish_item_with_usage(&project_id, &item_id, false, &error, 0, 0, 0.0, None)
+                .await;
+            notify_group_origin(
+                &state,
+                &groups,
+                &project_id,
+                &item_id,
+                item["title"].as_str().unwrap_or("item"),
+                false,
+                &error,
+            )
+            .await;
+            return;
+        }
+    };
+    let registry = agent_registry(&state);
+    let agent = match group_item_runtime(&registry, &item, &detail) {
+        Ok(agent) => agent,
+        Err(error) => {
+            let _ = groups
+                .finish_item_with_usage(&project_id, &item_id, false, &error, 0, 0, 0.0, None)
+                .await;
+            return;
+        }
+    };
+    let member = item.get("member").cloned().unwrap_or_else(|| json!({}));
+    let member_id = member
+        .get("id")
+        .and_then(Value::as_str)
+        .or_else(|| item.get("owner_member_id").and_then(Value::as_str))
+        .unwrap_or("")
+        .to_string();
+    let member_display = member
+        .get("display")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&agent.display)
+        .to_string();
+    let cycle = item["cycle"].as_i64().unwrap_or(1);
+    let effective = Arc::new(agent.clone());
     let model = effective.model.clone();
     let provider = state.provider_for(&effective);
     let title = format!(
-        "Group: {} ({})",
+        "Group: {} · {} ({})",
         item["title"].as_str().unwrap_or("Task"),
-        agent.display
+        item["title_project"]
+            .as_str()
+            .or_else(|| detail["project"]["title"].as_str())
+            .unwrap_or("Project"),
+        member_display
     );
     let chat = match state
         .store
@@ -1720,27 +2275,26 @@ async fn run_group_item(state: ServerState, groups: GroupStore, project_id: Stri
         Err(error) => {
             let message = format!("Could not create the worker chat: {error}");
             let _ = groups
-                .finish_item(
-                    &project_id,
-                    item["id"].as_str().unwrap_or(""),
-                    false,
-                    &message,
-                )
+                .finish_item_with_usage(&project_id, &item_id, false, &message, 0, 0, 0.0, None)
                 .await;
             return;
         }
     };
     let chat_id = chat["id"].as_str().unwrap_or_default().to_string();
+    let _ = state
+        .store
+        .set_chat_agent_with_hash(&chat_id, &agent.key, Some(&agent.definition_hash))
+        .await;
     let (tx, _) = broadcast::channel(RUN_EVENT_CAPACITY);
     let cancel = CancellationToken::new();
     let steering = Arc::new(Mutex::new(VecDeque::new()));
     let follow_up = Arc::new(Mutex::new(VecDeque::new()));
-    let run_id = Checkpoint::next_run_id();
+    let agent_run_id = Checkpoint::next_run_id();
     let latest = Arc::new(Mutex::new(None));
     if let Err(error) = state.runs.claim(
         &chat_id,
         RunClaim {
-            run_id: run_id.clone(),
+            run_id: agent_run_id.clone(),
             latest: latest.clone(),
             cancel: cancel.clone(),
             tx: tx.clone(),
@@ -1750,21 +2304,39 @@ async fn run_group_item(state: ServerState, groups: GroupStore, project_id: Stri
         },
     ) {
         if error == ClaimError::ShuttingDown {
+            let _ = groups
+                .release_item(&project_id, &item_id, "server shutting down")
+                .await;
             return;
         }
         let message = error.message();
-        let _ = groups
-            .finish_item(
-                &project_id,
-                item["id"].as_str().unwrap_or(""),
-                false,
-                &message,
-            )
-            .await;
+        let _ = groups.release_item(&project_id, &item_id, &message).await;
         return;
     }
 
-    let checkpoint = Checkpoint::begin_with_run_id(&chat_id, &workspace, run_id);
+    let group_run_id = match groups
+        .start_run(
+            &project_id,
+            cycle,
+            Some(&item_id),
+            Some(&member_id),
+            &agent.key,
+            Some(&chat_id),
+            Some(&agent_run_id),
+            "item",
+        )
+        .await
+    {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::warn!("group {project_id} run row failed: {error}");
+            state.runs.finish(&chat_id, None);
+            let _ = groups.release_item(&project_id, &item_id, &error).await;
+            return;
+        }
+    };
+
+    let checkpoint = Checkpoint::begin_with_run_id(&chat_id, &workspace, agent_run_id.clone());
     if workspace != state.harness_root {
         let snapshot = checkpoint.clone();
         let _ = tokio::task::spawn_blocking(move || snapshot.snapshot_all()).await;
@@ -1773,10 +2345,10 @@ async fn run_group_item(state: ServerState, groups: GroupStore, project_id: Stri
         chat_id: chat_id.clone(),
         workspace_id,
         workspace: workspace.clone(),
-        role: Some(agent.display.to_string()),
+        role: Some(member_display.clone()),
         scope: agent.key.to_string(),
         depth: 0,
-        file_access: stark_core::FileAccess::Write,
+        file_access: agent_access_for(&agent, 0, false),
         model,
         temperature: 0.2,
         images: Vec::new(),
@@ -1792,16 +2364,91 @@ async fn run_group_item(state: ServerState, groups: GroupStore, project_id: Stri
         config: Some(effective.clone()),
         on_job_done: None,
     };
+    let pending = groups
+        .pending_messages(&project_id, &member_id)
+        .await
+        .unwrap_or_default();
+    let message_block = if pending.is_empty() {
+        "No new messages.".to_string()
+    } else {
+        pending
+            .iter()
+            .map(|message| {
+                format!(
+                    "- {} ({}): {}",
+                    message["from"].as_str().unwrap_or("owner"),
+                    message["kind"].as_str().unwrap_or("note"),
+                    message["body"].as_str().unwrap_or("")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let delivered = pending
+        .iter()
+        .filter_map(|message| message["seq"].as_i64())
+        .collect::<Vec<_>>();
+    let _ = groups.mark_delivered(&project_id, &delivered).await;
     let acceptance =
         serde_json::to_string_pretty(&item["acceptance"]).unwrap_or_else(|_| "[]".to_string());
+    let team = detail["members"]
+        .as_array()
+        .map(|members| {
+            members
+                .iter()
+                .map(|member| {
+                    format!(
+                        "- {} ({})",
+                        member["display"].as_str().unwrap_or("Agent"),
+                        member["agent_key"].as_str().unwrap_or("developer")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
     let prompt = format!(
-        "You are acting as the {display} member for one group-project item.\n\nProject goal:\n{}\n\nMilestone:\n{}\n\nItem:\n{}\n\nDetails:\n{}\n\nAcceptance criteria (all must be met):\n{}\n\nWork only on this item. Report what changed and how each criterion was met.",
-        detail["project"]["goal"].as_str().unwrap_or(""),
-        item["milestone_title"].as_str().unwrap_or(""),
-        item["title"].as_str().unwrap_or(""),
-        item["detail"].as_str().unwrap_or(""),
-        acceptance,
-        display = agent.display,
+        r#"You are {display}, one member of a group project. Work only on this item.
+
+Project: {project}
+Goal:
+{goal}
+
+Cycle: {cycle}
+Milestone: {milestone}
+Item: {item}
+Details:
+{detail}
+
+Acceptance criteria (all must be met):
+{acceptance}
+
+Team:
+{team}
+
+Messages from the owner/team since your last turn:
+{messages}
+
+Rules:
+- Work inside the project workspace: {workspace}
+- Do not edit or read the project's metadata folder (.deep_agents/groups).
+- Inspect before editing. Report the exact files changed and evidence for each acceptance criterion.
+- If you cannot complete the item, say exactly what blocked you; do not claim success.
+- Work only on this item. Do not start other team members' items."#,
+        display = member_display,
+        project = item["title_project"]
+            .as_str()
+            .or_else(|| detail["project"]["title"].as_str())
+            .unwrap_or("Project"),
+        goal = detail["project"]["goal"].as_str().unwrap_or(""),
+        cycle = cycle,
+        milestone = item["milestone_title"].as_str().unwrap_or(""),
+        item = item["title"].as_str().unwrap_or(""),
+        detail = item["detail"].as_str().unwrap_or(""),
+        acceptance = acceptance,
+        team = team,
+        messages = message_block,
+        workspace = workspace.display(),
     );
     let result = run_agent(ctx, prompt).await;
     checkpoint.finalize();
@@ -1809,6 +2456,13 @@ async fn run_group_item(state: ServerState, groups: GroupStore, project_id: Stri
     let aborted = state_snapshot
         .as_ref()
         .is_some_and(|snapshot| snapshot.active_node == "aborted");
+    let usage = state_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.token_usage.clone())
+        .unwrap_or_default();
+    let input_tokens = usage.total_input_tokens as i64;
+    let output_tokens = usage.total_output_tokens as i64;
+    let cost_usd = usage.total_cost;
     let transcript_report = state
         .store
         .history(&chat_id, 12)
@@ -1848,10 +2502,27 @@ async fn run_group_item(state: ServerState, groups: GroupStore, project_id: Stri
         Ok(()) => "Agent run was aborted.".to_string(),
         Err(error) => error.to_string(),
     };
+    if aborted {
+        state.runs.finish(&chat_id, state_snapshot);
+        let _ = groups
+            .finish_run(
+                &project_id,
+                &group_run_id,
+                "cancelled",
+                input_tokens,
+                output_tokens,
+                cost_usd,
+                Some(&report),
+                Some("cancelled by owner"),
+            )
+            .await;
+        let _ = groups
+            .release_item(&project_id, &item_id, "agent run cancelled")
+            .await;
+        return;
+    }
     // Post-run acceptance verification: machine-checkable criteria must hold
-    // before the item counts as done; `manual` criteria park the item for the
-    // owner instead of failing it. Unsupported/free-form criteria are noted
-    // in the report, never invented as failures.
+    // before the item counts as done; `manual` criteria park it for the owner.
     let (success, output) = if success {
         let verdict = evaluate_acceptance(&workspace, &item["acceptance"]);
         if !verdict.failed.is_empty() {
@@ -1865,6 +2536,18 @@ async fn run_group_item(state: ServerState, groups: GroupStore, project_id: Stri
         } else if !verdict.needs_human.is_empty() {
             let reason = format!("manual acceptance check needed: {}", verdict.summary());
             state.runs.finish(&chat_id, state_snapshot);
+            let _ = groups
+                .finish_run(
+                    &project_id,
+                    &group_run_id,
+                    "complete",
+                    input_tokens,
+                    output_tokens,
+                    cost_usd,
+                    Some(&report),
+                    None,
+                )
+                .await;
             if let Err(error) = groups
                 .park_for_approval(&project_id, &item_id, &reason)
                 .await
@@ -1882,6 +2565,18 @@ async fn run_group_item(state: ServerState, groups: GroupStore, project_id: Stri
         (success, output)
     };
     state.runs.finish(&chat_id, state_snapshot);
+    let _ = groups
+        .finish_run(
+            &project_id,
+            &group_run_id,
+            if success { "complete" } else { "failed" },
+            input_tokens,
+            output_tokens,
+            cost_usd,
+            Some(&report),
+            if success { None } else { Some(&output) },
+        )
+        .await;
     let canvas_report = output.clone();
     let canvas_status = if success { "complete" } else { "failed" };
     spawn_canvas_notification(
@@ -1891,11 +2586,15 @@ async fn run_group_item(state: ServerState, groups: GroupStore, project_id: Stri
         canvas_status,
     );
     if let Err(error) = groups
-        .finish_item(
+        .finish_item_with_usage(
             &project_id,
-            item["id"].as_str().unwrap_or(""),
+            &item_id,
             success,
             &output,
+            input_tokens,
+            output_tokens,
+            cost_usd,
+            Some(&agent_run_id),
         )
         .await
     {
@@ -1936,7 +2635,13 @@ async fn notify_group_origin(
     let Ok(Some(chat)) = state.store.get_chat(&chat_id).await else {
         return;
     };
-    let target = canvas_target(state, &chat);
+    let target = match canvas_target(state, &chat) {
+        Ok(target) => target,
+        Err(error) => {
+            tracing::warn!("group result target invalid: {error}");
+            return;
+        }
+    };
     spawn_follow_up_run(state.clone(), target, message);
 }
 
@@ -1944,6 +2649,9 @@ struct StartedRun {
     chat_id: String,
     run_id: String,
     after_seq: u64,
+    route_warning: Option<String>,
+    agent_hash: String,
+    agent_changed: bool,
 }
 
 enum StartRunError {
@@ -2051,9 +2759,98 @@ Attached files:
     } else {
         state.harness_root.clone()
     };
-    let agent = resolve_agent(&request.workspace_kind, &workspace, &state.harness_root);
-
-    let mut effective = (*effective_for(state, agent.key, agent.tier)).clone();
+    let registry = agent_registry(state);
+    let prior_chat = state.store.get_chat(&chat_id).await.ok().flatten();
+    let mut route_warning = None;
+    let requested_agent = request.agent.trim();
+    let agent = if !requested_agent.is_empty() {
+        registry.get(requested_agent).cloned().ok_or_else(|| {
+            StartRunError::Http(
+                StatusCode::BAD_REQUEST,
+                json!({"error": format!("unknown agent '{requested_agent}'")}),
+            )
+        })?
+    } else {
+        // Persisted chat agent wins over workspace routing, so a custom agent
+        // keeps its identity on every follow-up turn.
+        let persisted = prior_chat
+            .as_ref()
+            .and_then(|chat| chat.get("agentKey"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|key| !key.trim().is_empty());
+        match persisted {
+            Some(key) => registry.get(&key).cloned().ok_or_else(|| {
+                StartRunError::Http(
+                    StatusCode::BAD_REQUEST,
+                    json!({
+                        "error": format!(
+                            "agent '{key}' no longer exists; choose another agent"
+                        )
+                    }),
+                )
+            })?,
+            None => {
+                let binding_key = workspace_binding_key(&workspace);
+                let bound = state
+                    .store
+                    .workspace_agent_binding(&binding_key)
+                    .await
+                    .ok()
+                    .flatten();
+                match bound.as_deref().and_then(|key| registry.get(key).cloned()) {
+                    Some(agent) => agent,
+                    None => {
+                        if let Some(key) = bound {
+                            let warning = format!(
+                                "workspace is pinned to agent '{key}', which no longer exists; using routing"
+                            );
+                            tracing::warn!(
+                                workspace = %workspace.display(),
+                                "agent binding is stale: {warning}"
+                            );
+                            route_warning = Some(warning);
+                        }
+                        route_agent(
+                            &registry,
+                            &request.workspace_kind,
+                            &workspace,
+                            &state.harness_root,
+                            &mut route_warning,
+                        )
+                    }
+                }
+            }
+        }
+    };
+    let _ = state
+        .store
+        .record_audit(
+            Some(&chat_id),
+            None,
+            "route_decision",
+            Some(&agent.key),
+            Some(&workspace.to_string_lossy()),
+            &json!({
+                "workspace_kind": request.workspace_kind,
+                "explicit": !requested_agent.is_empty(),
+                "builtin": agent.builtin,
+                "route_warning": route_warning,
+            }),
+        )
+        .await;
+    let previous_key = prior_chat
+        .as_ref()
+        .and_then(|chat| chat.get("agentKey"))
+        .and_then(Value::as_str);
+    let previous_hash = prior_chat
+        .as_ref()
+        .and_then(|chat| chat.get("agentHash"))
+        .and_then(Value::as_str)
+        .filter(|hash| !hash.is_empty());
+    let agent_changed = previous_key.is_some_and(|key| key.eq_ignore_ascii_case(&agent.key))
+        && previous_hash.is_some_and(|hash| hash != agent.definition_hash);
+    let mut effective = agent.clone();
     let model = if request.model.trim().is_empty() {
         effective.model.clone()
     } else {
@@ -2165,7 +2962,7 @@ Attached files:
                 note: image.name,
             })
             .collect();
-    let root_access = stark_core::default_access(&target.scope, 0, false);
+    let root_access = agent_access_for(&agent, 0, false);
     // Ensure the root agent exists before the run so status transitions are
     // visible in the tree for the whole run.
     let target = ensure_root_agent(state, target, root_access.as_str()).await;
@@ -2241,6 +3038,9 @@ Attached files:
         chat_id: started_chat_id,
         run_id,
         after_seq,
+        route_warning,
+        agent_hash: agent.definition_hash.clone(),
+        agent_changed,
     })
 }
 
@@ -2266,6 +3066,9 @@ async fn run_command_handler(
             "chat_id": started.chat_id,
             "run_id": started.run_id,
             "after_seq": started.after_seq,
+            "route_warning": started.route_warning,
+            "agent_hash": started.agent_hash,
+            "agent_changed": started.agent_changed,
         })),
     ))
 }
@@ -2277,6 +3080,37 @@ fn job_hook(state: ServerState, target: RunTarget) -> stark_core::JobDoneHook {
         }
         spawn_follow_up_run(state.clone(), target.clone(), message);
     })
+}
+
+/// OpenCode's `SessionRestart` Code Mode branch: every script still running
+/// when the server stopped becomes `Interrupted by server restart.`, and a
+/// finished script whose notice never reached the session is delivered once.
+async fn deliver_code_mode_restart_notices(state: ServerState) {
+    let notices = stark_tools::recover_code_mode_notices(&state.harness_root);
+    for notice in notices {
+        let chat = match state.store.get_chat(&notice.chat_id).await {
+            Ok(Some(chat)) => chat,
+            _ => continue,
+        };
+        let target = match canvas_target(&state, &chat) {
+            Ok(target) => target,
+            Err(error) => {
+                tracing::warn!(
+                    "Code Mode restart notice for {} dropped: {error}",
+                    notice.job_id
+                );
+                stark_tools::acknowledge_code_mode_notice(&state.harness_root, &notice.job_id);
+                continue;
+            }
+        };
+        if state.runs.follow_up(&target.chat_id, &notice.message) {
+            stark_tools::acknowledge_code_mode_notice(&state.harness_root, &notice.job_id);
+            continue;
+        }
+        spawn_follow_up_run(state.clone(), target, notice.message);
+        stark_tools::acknowledge_code_mode_notice(&state.harness_root, &notice.job_id);
+        tracing::info!("delivered Code Mode restart notice for {}", notice.job_id);
+    }
 }
 
 fn spawn_follow_up_run(state: ServerState, target: RunTarget, message: String) {
@@ -2294,13 +3128,31 @@ fn spawn_follow_up_run_attempt(
     attempt: u32,
 ) {
     // Re-resolve on every follow-up so config edits apply without waiting for
-    // a new chat.
-    let tier = agent_for_scope(&target.scope)
-        .map(|agent| agent.tier)
-        .unwrap_or("workspace");
-    let effective = effective_for(&state, &target.scope, tier);
-    target.model = effective.model.clone();
-    target.effective = effective;
+    // a new chat. A deleted custom agent is an explicit error, never a silent
+    // fallback to a more privileged built-in.
+    let runtime = match agent_registry(&state).get(&target.scope).cloned() {
+        Some(agent) => agent,
+        None => {
+            let store = state.store.clone();
+            let chat_id = target.chat_id.clone();
+            let scope = target.scope.clone();
+            tokio::spawn(async move {
+                let _ = store
+                    .append_message(
+                        &chat_id,
+                        "error",
+                        &format!(
+                            "Agent '{scope}' no longer exists. Pick another agent to continue."
+                        ),
+                        false,
+                    )
+                    .await;
+            });
+            return;
+        }
+    };
+    target.model = runtime.model.clone();
+    target.effective = Arc::new(runtime);
     let (tx, _) = broadcast::channel(RUN_EVENT_CAPACITY);
     let cancel = CancellationToken::new();
     let steering = Arc::new(Mutex::new(VecDeque::new()));
@@ -2364,7 +3216,7 @@ fn spawn_follow_up_run_attempt(
 
     let checkpoint = Checkpoint::begin_with_run_id(&target.chat_id, &target.workspace, run_id);
     let follow_access =
-        stark_core::default_access(&target.scope, target.depth, target.agent_id.is_some());
+        agent_access_for(&target.effective, target.depth, target.agent_id.is_some());
     let ctx = RunContext {
         chat_id: target.chat_id.clone(),
         workspace_id: target.workspace_id.clone(),
@@ -2555,7 +3407,7 @@ async fn agent_loop(state: ServerState, shutdown: CancellationToken) {
     }
 }
 
-async fn agent_target(state: &ServerState, agent: &AgentRecord) -> RunTarget {
+async fn agent_target(state: &ServerState, agent: &AgentRecord) -> Result<RunTarget, String> {
     let mut workspace_path = state
         .store
         .chat_workspace_path(&agent.chat_id)
@@ -2577,28 +3429,41 @@ async fn agent_target(state: &ServerState, agent: &AgentRecord) -> RunTarget {
     } else {
         PathBuf::from(workspace_path)
     };
-    let tier = stark_core::agent_for_scope(&agent.scope)
-        .map(|spec| spec.tier)
-        .unwrap_or("workspace");
+    // Stored agents may carry a legacy alias ("coder", "dev", "frontend"), or
+    // a custom key. Resolve through the one registry.
+    let registry = agent_registry(state);
+    let effective = registry
+        .get(&agent.scope)
+        .cloned()
+        .ok_or_else(|| format!("agent '{}' no longer exists", agent.scope))?;
+    let scope = effective.key.clone();
     // Config is authoritative. The stored `agent.model` is a snapshot from
     // creation time and may reference a provider the app no longer uses.
-    let effective = effective_for(state, &agent.scope, tier);
-    RunTarget {
+    Ok(RunTarget {
         chat_id: agent.chat_id.clone(),
         workspace_id: agent.workspace_id.clone(),
         workspace,
-        scope: agent.scope.clone(),
-        role: (!agent.role.is_empty()).then(|| agent.role.clone()),
+        scope,
+        role: (!agent.role.is_empty())
+            .then(|| agent.role.clone())
+            .or_else(|| Some(effective.display.clone())),
         model: effective.model.clone(),
         temperature: 0.2,
         depth: agent.depth.max(0) as u32,
         agent_id: Some(agent.id.clone()),
-        effective,
-    }
+        effective: Arc::new(effective),
+    })
 }
 
 async fn spawn_agent_run(state: ServerState, store: AgentStore, agent: AgentRecord) -> bool {
-    let target = agent_target(&state, &agent).await;
+    let target = match agent_target(&state, &agent).await {
+        Ok(target) => target,
+        Err(error) => {
+            tracing::warn!("agent {} target invalid: {error}", agent.id);
+            let _ = store.set_status(&agent.id, "failed", false).await;
+            return false;
+        }
+    };
     let pending = match store.messages(&agent.id).await {
         Ok(messages) => messages,
         Err(error) => {
@@ -2794,7 +3659,13 @@ async fn wake_parent_agent(
     let Ok(Some(parent)) = store.get(parent_id).await else {
         return;
     };
-    let target = agent_target(state, &parent).await;
+    let target = match agent_target(state, &parent).await {
+        Ok(target) => target,
+        Err(error) => {
+            tracing::warn!("parent agent target invalid: {error}");
+            return;
+        }
+    };
     let text = format!(
         "[AGENT RESULT] {} · {} · {}\nchat: {}\n{}\nReview the child result and continue.",
         child.path,
@@ -2847,6 +3718,10 @@ fn rollout_event(line: &stark_store::rollout::RolloutLine) -> (&'static str, Str
         RolloutItem::EventMsg { payload } => match payload {
             EventMsgPayload::Error { message, .. } => ("error", json!({"message": message}).to_string()),
             EventMsgPayload::Warning { message } => ("warning", json!({"message": message}).to_string()),
+            EventMsgPayload::AgentContext { agent_key, agent_hash } => (
+                "agent_context",
+                json!({"agent_key": agent_key, "agent_hash": agent_hash}).to_string(),
+            ),
             EventMsgPayload::TurnStarted { turn_id, .. } => ("turn_started", json!({"turn_id": turn_id}).to_string()),
             EventMsgPayload::TurnComplete { turn_id, error, last_agent_message, .. } => (
                 "turn_complete",
@@ -3222,7 +4097,12 @@ async fn abort_handler(
     Json(json!({"ok": top || child}))
 }
 
-async fn health_handler() -> Json<Value> {
+async fn health_handler(State(state): State<ServerState>) -> Json<Value> {
+    let audit = state
+        .store
+        .audit_counts()
+        .await
+        .unwrap_or_else(|_| json!({}));
     Json(json!({
         "ok": true,
         "code_version": "stark-rs-0.1",
@@ -3232,7 +4112,55 @@ async fn health_handler() -> Json<Value> {
         "build": std::env::var("STARK_BUILD_SHA").unwrap_or_default(),
         "origin": server_origin(),
         "cap": concurrent_cap(),
+        "code_mode": stark_tools::code_mode_runtime_status(&state.harness_root),
+        "audit": audit,
     }))
+}
+
+#[derive(Debug, Deserialize)]
+struct AuditQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    chat_id: Option<String>,
+    #[serde(default)]
+    since: Option<String>,
+}
+
+async fn audit_handler(
+    State(state): State<ServerState>,
+    Query(query): Query<AuditQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let events = state
+        .store
+        .list_audit(
+            query.limit.unwrap_or(200),
+            query
+                .kind
+                .as_deref()
+                .map(str::trim)
+                .filter(|kind| !kind.is_empty()),
+            query
+                .chat_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|chat| !chat.is_empty()),
+            query
+                .since
+                .as_deref()
+                .map(str::trim)
+                .filter(|since| !since.is_empty()),
+        )
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error.to_string()})),
+            )
+        })?;
+    Ok(Json(json!({"events": events})))
 }
 
 /// Which machine this server is: "local" by default, "vps" when
@@ -4031,6 +4959,9 @@ struct ProviderRequest {
 struct AgentQuery {
     #[serde(default)]
     tier: Option<String>,
+    /// Optional project workspace used to validate workspace-local skills.
+    #[serde(default)]
+    workspace_path: Option<String>,
 }
 
 async fn models_handler(State(state): State<ServerState>) -> Json<Value> {
@@ -4066,12 +4997,10 @@ async fn provider_handler(
     let active = state.config.active_provider();
     let summaries = state.config.provider_summaries();
     let active_provider = summaries.iter().find(|provider| provider.id == active);
-    let effective = query.agent.as_deref().map(|agent| {
-        let tier = agent_for_scope(agent)
-            .map(|spec| spec.tier)
-            .unwrap_or("workspace");
-        effective_for(&state, agent, tier)
-    });
+    let effective = query
+        .agent
+        .as_deref()
+        .map(|agent| effective_for(&state, agent, "workspace"));
     let legacy_env: Vec<&str> = legacy_env_names();
     Json(json!({
         "provider": active,
@@ -4297,9 +5226,9 @@ fn parse_opencode_usage(value: &Value) -> Value {
         "weekly": weekly,
         "monthly": monthly,
     });
-    // The documented `/usage` endpoint only returns the three meters, but
-    // pass through any dashboard-style fields if the gateway ever returns
-    // them so the desktop can render totals without a backend change.
+    // The documented endpoint returns the three meters. Pass through any
+    // dashboard-style fields if the gateway returns them so the desktop can
+    // render totals without a backend change.
     if let Some(object) = out.as_object_mut() {
         for key in [
             "cost",
@@ -4554,40 +5483,129 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
+fn agent_issues(registry: &AgentRegistry, key: &str) -> Vec<String> {
+    let prefix = format!("{key}:");
+    registry
+        .issues()
+        .iter()
+        .filter(|issue| issue.starts_with(&prefix))
+        .cloned()
+        .collect()
+}
+
+fn agent_warnings(registry: &AgentRegistry, key: &str) -> Vec<String> {
+    let prefix = format!("{key}:");
+    registry
+        .warnings()
+        .iter()
+        .filter(|warning| warning.starts_with(&prefix))
+        .cloned()
+        .collect()
+}
+
+fn builtin_spec(key: &str) -> Option<stark_core::AgentSpec> {
+    stark_core::workspace_agents()
+        .iter()
+        .find(|spec| spec.key == key)
+        .copied()
+}
+
+fn builtin_override(state: &ServerState, spec: stark_core::AgentSpec) -> Option<AgentFile> {
+    state.config.agent(spec.key).or_else(|| {
+        spec.aliases
+            .iter()
+            .find_map(|alias| state.config.agent(alias))
+    })
+}
+
 async fn agents_config_handler(State(state): State<ServerState>) -> Json<Value> {
-    let mut agents = Vec::new();
-    for key in [
-        "orchestrator",
-        "developer",
-        "coder",
-        "general",
-        "house",
-        "dfd",
-        "ui",
-        "devops",
-        "explore",
-    ] {
-        let Some(spec) = agent_for_scope(key) else {
-            continue;
-        };
-        let effective = effective_for(&state, key, spec.tier);
-        agents.push(json!({
-            "key": spec.key,
-            "display": spec.display,
-            "tier": spec.tier,
-            "configured": state.config.agent(key).is_some(),
-            "override": state.config.agent(key),
-            "effective": effective,
-        }));
+    let registry = agent_registry(&state);
+    let mut agents: Vec<(i32, String, Value)> = Vec::new();
+    for spec in stark_core::workspace_agents() {
+        let effective = registry
+            .get(spec.key)
+            .cloned()
+            .unwrap_or_else(|| (*effective_for(&state, spec.key, spec.tier)).clone());
+        let issues = agent_issues(&registry, spec.key);
+        let configured = builtin_override(&state, *spec);
+        agents.push((
+            effective.ui_order,
+            spec.key.to_string(),
+            json!({
+                "key": spec.key,
+                "display": effective.display,
+                "description": effective.description,
+                "tier": effective.tier,
+                "builtin": true,
+                "editable": true,
+                "deletable": false,
+                "resettable": configured.is_some(),
+                "configured": configured.is_some(),
+                "valid": issues.is_empty(),
+                "errors": issues,
+                "warnings": agent_warnings(&registry, spec.key),
+                "override": configured,
+                "effective": effective,
+            }),
+        ));
     }
+    for (key, file) in state.config.agent_files() {
+        // Built-in keys are listed above. Legacy alias files (coder.json) are
+        // migrated into their canonical built-in, so they must not appear as
+        // a second agent here.
+        if stark_core::agent_for_scope(&key).is_some() {
+            continue;
+        }
+        let effective = registry.get(&key).cloned();
+        let issues = agent_issues(&registry, &key);
+        let order = effective
+            .as_ref()
+            .map(|agent| agent.ui_order)
+            .or(file.ui.as_ref().and_then(|ui| ui.order))
+            .unwrap_or(1000);
+        agents.push((
+            order,
+            key.clone(),
+            json!({
+                "key": key,
+                "display": effective.as_ref().map(|agent| agent.display.clone()).unwrap_or_else(|| file.display.clone()),
+                "description": effective.as_ref().map(|agent| agent.description.clone()).unwrap_or_else(|| file.description.clone()),
+                "tier": effective.as_ref().map(|agent| agent.tier.clone()).unwrap_or_else(|| file.tier.clone()),
+                "builtin": false,
+                "editable": true,
+                "deletable": true,
+                "resettable": false,
+                "configured": true,
+                "valid": effective.is_some() && issues.is_empty(),
+                "errors": issues,
+                "warnings": agent_warnings(&registry, &key),
+                "override": file,
+                "effective": effective,
+            }),
+        ));
+    }
+    agents.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
     Json(json!({
-        "agents": agents,
-        "issues": state.config.issues(),
+        "agents": agents.into_iter().map(|(_, _, value)| value).collect::<Vec<_>>(),
+        "issues": registry.issues(),
+        "warnings": registry.warnings(),
+        "config_issues": state.config.issues(),
         "active_provider": state.config.active_provider(),
         "providers": state.config.provider_summaries(),
         "config_file": state.config.has_file(),
         "legacy_env": legacy_env_names(),
         "health": state.provider_health.lock().map(|health| health.clone()).unwrap_or_default(),
+        "capabilities": {
+            "agent_builder": true,
+            "custom_agents": true,
+            "custom_code_mode": true,
+            "custom_routing": true,
+            "routing_repos": true,
+            "skill_pins": true,
+            "agent_binding": true,
+            "audit": true,
+            "schema_version": 2,
+        },
     }))
 }
 
@@ -4596,22 +5614,42 @@ async fn agent_config_handler(
     Path(key): Path<String>,
     Query(query): Query<AgentQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let spec = agent_for_scope(&key).ok_or_else(|| {
-        (
+    let registry = agent_registry(&state);
+    let requested = key.trim().to_ascii_lowercase();
+    let canonical = registry
+        .canonical_key(&requested)
+        .unwrap_or_else(|| requested.clone());
+    if registry.get(&canonical).is_none() && state.config.agent(&canonical).is_none() {
+        return Err((
             StatusCode::NOT_FOUND,
             Json(json!({"error": format!("unknown agent '{key}'")})),
-        )
-    })?;
-    let tier = query
-        .tier
-        .filter(|tier| !tier.trim().is_empty())
-        .unwrap_or_else(|| spec.tier.to_string());
-    let effective = effective_for(&state, spec.key, &tier);
+        ));
+    }
+    let builtin = builtin_spec(&canonical);
+    let effective = registry.get(&canonical).cloned().or_else(|| {
+        builtin.map(|spec| {
+            (*effective_for(&state, spec.key, query.tier.as_deref().unwrap_or(spec.tier))).clone()
+        })
+    });
+    let issues = agent_issues(&registry, &canonical);
+    let override_file = builtin
+        .and_then(|spec| builtin_override(&state, spec))
+        .or_else(|| state.config.agent(&canonical));
     Ok(Json(json!({
-        "key": spec.key,
-        "display": spec.display,
-        "tier": spec.tier,
-        "override": state.config.agent(spec.key),
+        "key": canonical,
+        "display": effective.as_ref().map(|agent| agent.display.clone())
+            .or_else(|| override_file.as_ref().map(|file| file.display.clone()))
+            .unwrap_or_else(|| key.clone()),
+        "tier": effective.as_ref().map(|agent| agent.tier.clone())
+            .or_else(|| builtin.map(|spec| spec.tier.to_string()))
+            .unwrap_or_else(|| "workspace".to_string()),
+        "builtin": builtin.is_some(),
+        "editable": true,
+        "deletable": builtin.is_none(),
+        "valid": effective.is_some() && issues.is_empty(),
+        "errors": issues,
+        "warnings": agent_warnings(&registry, &canonical),
+        "override": override_file,
         "effective": effective,
     })))
 }
@@ -4619,26 +5657,75 @@ async fn agent_config_handler(
 async fn save_agent_handler(
     State(state): State<ServerState>,
     Path(key): Path<String>,
+    Query(query): Query<AgentQuery>,
     Json(agent): Json<AgentFile>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let spec = agent_for_scope(&key).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": format!("unknown agent '{key}'")})),
-        )
-    })?;
-    state.config.save_agent(spec.key, agent).map_err(|error| {
-        (
+    let registry = agent_registry(&state);
+    let requested = key.trim().to_ascii_lowercase();
+    let canonical = registry
+        .canonical_key(&requested)
+        .unwrap_or_else(|| requested.clone());
+    let workspace = query
+        .workspace_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
+    let check = stark_core::validate_definition_in(
+        &state.config,
+        &state.harness_root,
+        &canonical,
+        &agent,
+        &registry,
+        workspace.as_deref(),
+    );
+    if !check.errors.is_empty() {
+        return Err((
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": error.to_string()})),
+            Json(json!({
+                "error": "invalid agent definition",
+                "errors": check.errors,
+                "warnings": check.warnings,
+            })),
+        ));
+    }
+    state
+        .config
+        .save_agent(&canonical, agent)
+        .map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": error.to_string()})),
+            )
+        })?;
+    let registry = agent_registry(&state);
+    let effective = registry.get(&canonical).cloned();
+    let mut warnings = check.warnings;
+    warnings.extend(agent_warnings(&registry, &canonical));
+    warnings.sort();
+    warnings.dedup();
+    let _ = state
+        .store
+        .record_audit(
+            None,
+            None,
+            "agent_saved",
+            Some(&canonical),
+            None,
+            &json!({
+                "builtin": builtin_spec(&canonical).is_some(),
+                "definition_hash": effective.as_ref().map(|agent| agent.definition_hash.as_str()),
+            }),
         )
-    })?;
-    let effective = effective_for(&state, spec.key, spec.tier);
+        .await;
     Ok(Json(json!({
         "ok": true,
-        "key": spec.key,
-        "override": state.config.agent(spec.key),
+        "key": canonical,
+        "builtin": builtin_spec(&canonical).is_some(),
+        "warnings": warnings,
+        "override": state.config.agent(&canonical),
         "effective": effective,
+        "errors": effective.is_none().then(|| agent_issues(&registry, &canonical)),
     })))
 }
 
@@ -4646,24 +5733,412 @@ async fn delete_agent_handler(
     State(state): State<ServerState>,
     Path(key): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let spec = agent_for_scope(&key).ok_or_else(|| {
-        (
+    let registry = agent_registry(&state);
+    let requested = key.trim().to_ascii_lowercase();
+    let canonical = registry
+        .canonical_key(&requested)
+        .unwrap_or_else(|| requested.clone());
+    let builtin = builtin_spec(&canonical).is_some();
+    if !builtin && state.config.agent(&canonical).is_none() {
+        return Err((
             StatusCode::NOT_FOUND,
             Json(json!({"error": format!("unknown agent '{key}'")})),
-        )
-    })?;
-    state.config.delete_agent(spec.key).map_err(|error| {
+        ));
+    }
+    state.config.delete_agent(&canonical).map_err(|error| {
         (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": error.to_string()})),
         )
     })?;
-    let effective = effective_for(&state, spec.key, spec.tier);
+    // A reset must also remove legacy alias files; otherwise coder.json would
+    // immediately re-apply as a developer override.
+    if let Some(spec) = builtin_spec(&canonical) {
+        for alias in spec.aliases {
+            let _ = state.config.delete_agent(alias);
+        }
+    }
+    let registry = agent_registry(&state);
+    let effective = registry.get(&canonical).cloned();
+    let _ = state
+        .store
+        .record_audit(
+            None,
+            None,
+            if builtin {
+                "agent_reset"
+            } else {
+                "agent_deleted"
+            },
+            Some(&canonical),
+            None,
+            &json!({
+                "builtin": builtin,
+                "definition_hash": effective.as_ref().map(|agent| agent.definition_hash.as_str()),
+            }),
+        )
+        .await;
     Ok(Json(json!({
         "ok": true,
-        "key": spec.key,
+        "key": canonical,
+        "builtin": builtin,
+        "reset": builtin,
+        "deleted": !builtin,
         "effective": effective,
     })))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PreviewRequest {
+    #[serde(default)]
+    draft: Option<AgentFile>,
+    #[serde(default)]
+    workspace_path: String,
+    #[serde(default)]
+    mode: String,
+}
+
+fn tool_names(specs: &[Value]) -> Vec<String> {
+    specs
+        .iter()
+        .filter_map(|spec| {
+            spec.get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+async fn preview_agent_handler(
+    State(state): State<ServerState>,
+    Path(key): Path<String>,
+    Json(request): Json<PreviewRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let registry = agent_registry(&state);
+    let requested = key.trim().to_ascii_lowercase();
+    let canonical = registry
+        .canonical_key(&requested)
+        .unwrap_or_else(|| requested.clone());
+    let builtin = builtin_spec(&canonical);
+    let file = request
+        .draft
+        .or_else(|| state.config.agent(&canonical))
+        .or_else(|| builtin.map(|_| AgentFile::default()));
+    let Some(file) = file else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("unknown agent '{key}'")})),
+        ));
+    };
+    let workspace = if request.workspace_path.trim().is_empty() {
+        state.harness_root.clone()
+    } else {
+        PathBuf::from(request.workspace_path.trim())
+    };
+    let workspace_hint = (!request.workspace_path.trim().is_empty()).then_some(workspace.as_path());
+    let check = stark_core::validate_definition_in(
+        &state.config,
+        &state.harness_root,
+        &canonical,
+        &file,
+        &registry,
+        workspace_hint,
+    );
+    if !check.errors.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "invalid agent definition",
+                "errors": check.errors,
+                "warnings": check.warnings,
+            })),
+        ));
+    }
+    let effective = resolve_definition(&state.config, &state.harness_root, &canonical, &file)
+        .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({"error": error}))))?;
+    let workspace_id = state
+        .store
+        .workspace_id_for_path(workspace.to_string_lossy().as_ref());
+    let mode = if request.mode.trim().is_empty() {
+        "build"
+    } else {
+        request.mode.trim()
+    };
+    let system_prompt = preview_system_prompt(
+        &effective,
+        &workspace,
+        &workspace_id,
+        &state.harness_root,
+        mode,
+    )
+    .await;
+    let skills =
+        stark_tools::catalog_entries(&workspace, &state.harness_root, effective.skills.as_deref())
+            .await;
+    let code_mode = effective
+        .code_mode
+        .as_deref()
+        .and_then(stark_tools::CodeMode::parse)
+        .unwrap_or_default();
+    let full = code_mode.enabled()
+        && (matches!(code_mode, stark_tools::CodeMode::Only)
+            || effective.full_codemode.unwrap_or(false));
+    let direct = stark_tools::tool_specs_for_run_with_code_mode_full(
+        mode,
+        &canonical,
+        &effective.access,
+        &HashSet::new(),
+        effective.tools.as_deref(),
+        effective.mcp.as_deref(),
+        code_mode,
+        full,
+    );
+    let program = if code_mode.enabled() {
+        stark_tools::program_specs_for_run_full(
+            mode,
+            &canonical,
+            &effective.access,
+            effective.tools.as_deref(),
+            effective.mcp.as_deref(),
+            full,
+        )
+    } else {
+        Vec::new()
+    };
+    let mut warnings = check.warnings;
+    warnings.extend(agent_warnings(&registry, &canonical));
+    Ok(Json(json!({
+        "ok": true,
+        "key": canonical,
+        "builtin": builtin.is_some(),
+        "effective": effective,
+        "system_prompt": system_prompt,
+        "prompt_tokens": stark_core::estimate_prompt_tokens(&system_prompt),
+        "skills": skills,
+        "tools": {
+            "direct": tool_names(&direct),
+            "program": tool_names(&program),
+            "direct_specs": direct,
+            "program_specs": program,
+        },
+        "warnings": warnings,
+    })))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DuplicateRequest {
+    #[serde(default)]
+    key: String,
+    #[serde(default)]
+    display: Option<String>,
+}
+
+async fn duplicate_agent_handler(
+    State(state): State<ServerState>,
+    Path(key): Path<String>,
+    Json(request): Json<DuplicateRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let registry = agent_registry(&state);
+    let requested = key.trim().to_ascii_lowercase();
+    let canonical = registry
+        .canonical_key(&requested)
+        .unwrap_or_else(|| requested.clone());
+    let Some(source) = registry.get(&canonical).cloned() else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("unknown agent '{key}'")})),
+        ));
+    };
+    let new_key = request.key.trim().to_ascii_lowercase();
+    if new_key.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "duplicate requires a new key"})),
+        ));
+    }
+    let display = request
+        .display
+        .filter(|display| !display.trim().is_empty())
+        .unwrap_or_else(|| format!("{} Copy", source.display));
+    let mut file = state.config.agent(&canonical).unwrap_or_default();
+    file.key = new_key.clone();
+    file.display = display;
+    file.description = source.description.clone();
+    file.tier = source.tier.clone();
+    file.access = Some(source.access.clone());
+    // A custom agent has no compiled base instructions, so a duplicate of a
+    // general-profile built-in must carry those instructions in its persona.
+    let base_instructions = if source.prompt_profile == "general" {
+        stark_core::agent_for_scope(&canonical).map(|spec| spec.instructions)
+    } else {
+        None
+    };
+    let persona = [
+        source.persona.clone(),
+        base_instructions.map(str::to_string),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|value| !value.trim().is_empty())
+    .collect::<Vec<_>>()
+    .join("\n\n");
+    file.prompt = Some(stark_config::AgentPromptFile {
+        profile: Some(source.prompt_profile.clone()),
+        persona: (!persona.is_empty()).then_some(persona),
+    });
+    file.system_prompt = None;
+    let read_only = source.access == "read";
+    let source_mode = source
+        .code_mode
+        .as_deref()
+        .and_then(stark_tools::CodeMode::parse)
+        .unwrap_or_default();
+    let copy_code_mode = source_mode.enabled()
+        && source
+            .tools
+            .as_deref()
+            .is_some_and(stark_tools::has_execute_tool);
+    file.tools = source.tools.as_ref().map(|tools| {
+        tools
+            .iter()
+            // A read-only custom agent cannot carry mutating tools. Built-in
+            // read-only agents enforce the same rule at the surface layer.
+            .filter(|tool| !read_only || !stark_tools::is_read_blocked(tool))
+            .filter(|tool| copy_code_mode || tool.as_str() != "execute")
+            .cloned()
+            .collect()
+    });
+    file.skills = Some(
+        source
+            .skills
+            .clone()
+            .unwrap_or_else(|| stark_tools::skill_names(&state.harness_root, &state.harness_root)),
+    );
+    file.mcp = Some(
+        source
+            .mcp
+            .clone()
+            .unwrap_or_else(|| stark_tools::configured_servers(&state.harness_root)),
+    );
+    file.aliases = None;
+    file.delegation = Some(stark_config::AgentDelegationFile {
+        delegatable: Some(source.delegatable),
+        can_delegate: Some(source.can_delegate),
+        can_spawn: Some(source.can_spawn),
+    });
+    file.ui = Some(stark_config::AgentUiFile {
+        visible: Some(source.ui_visible),
+        order: Some(source.ui_order),
+    });
+    file.routing = (!source.routing_workspace_kinds.is_empty()
+        || !source.routing_paths.is_empty()
+        || !source.routing_repos.is_empty())
+    .then(|| stark_config::AgentRoutingFile {
+        workspace_kinds: source.routing_workspace_kinds.clone(),
+        paths: source.routing_paths.clone(),
+        repos: source.routing_repos.clone(),
+    });
+    file.code_mode = Some(if copy_code_mode { "hybrid" } else { "off" }.to_string());
+    file.full_codemode = None;
+    let check = validate_definition(
+        &state.config,
+        &state.harness_root,
+        &new_key,
+        &file,
+        &registry,
+    );
+    if !check.errors.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "invalid duplicate",
+                "errors": check.errors,
+                "warnings": check.warnings,
+            })),
+        ));
+    }
+    state.config.save_agent(&new_key, file).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": error.to_string()})),
+        )
+    })?;
+    let registry = agent_registry(&state);
+    Ok(Json(json!({
+        "ok": true,
+        "key": new_key,
+        "source": canonical,
+        "effective": registry.get(&new_key),
+    })))
+}
+
+async fn agent_catalog_handler(State(state): State<ServerState>) -> Json<Value> {
+    let registry = agent_registry(&state);
+    let tools: Vec<Value> = stark_tools::contract()
+        .exposed_tools()
+        .filter(|tool| stark_tools::is_implemented(&tool.name))
+        .map(|tool| {
+            json!({
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.parameters,
+                "program": stark_tools::is_program(&tool.name),
+                "codemode": stark_tools::is_codemode(&tool.name),
+                "read_blocked": stark_tools::is_read_blocked(&tool.name),
+                "plan_write": stark_tools::is_plan_write(&tool.name),
+            })
+        })
+        .collect();
+    let agents: Vec<Value> = registry
+        .visible()
+        .into_iter()
+        .map(|agent| {
+            json!({
+                "key": agent.key,
+                "display": agent.display,
+                "description": agent.description,
+                "tier": agent.tier,
+                "builtin": agent.builtin,
+                "access": agent.access,
+                "prompt_profile": agent.prompt_profile,
+                "tools": agent.tools,
+                "code_mode": agent.code_mode,
+                "ui_order": agent.ui_order,
+                "routing": {
+                    "workspace_kinds": agent.routing_workspace_kinds,
+                    "paths": agent.routing_paths,
+                },
+            })
+        })
+        .collect();
+    let mcp = stark_tools::McpManager::global()
+        .map(|manager| manager.status_snapshot())
+        .unwrap_or_default();
+    Json(json!({
+        "schema_version": 2,
+        "capabilities": {
+            "agent_builder": true,
+            "custom_agents": true,
+            "custom_code_mode": true,
+            "custom_routing": true,
+            "routing_repos": true,
+            "skill_pins": true,
+            "agent_binding": true,
+            "audit": true,
+            "duplicate": true,
+            "preview": true,
+        },
+        "agents": agents,
+        "tools": tools,
+        "skills": stark_tools::skill_names(&state.harness_root, &state.harness_root),
+        "mcp": mcp,
+        "mcp_configured": stark_tools::configured_servers(&state.harness_root),
+        "providers": state.config.provider_summaries(),
+        "active_provider": state.config.active_provider(),
+        "issues": registry.issues(),
+        "warnings": registry.warnings(),
+    }))
 }
 
 /// Build one portable backup zip. Excludes `.env`, models, logs and WAL.
@@ -5355,15 +6830,169 @@ async fn session_reset_handler() -> Json<Value> {
 #[derive(Debug, Deserialize)]
 struct CreateGroupRequest {
     #[serde(default)]
+    title: String,
+    #[serde(default)]
     goal: String,
     #[serde(default)]
     workspace_id: String,
+    #[serde(default)]
+    workspace_path: String,
+    #[serde(default)]
+    members: Value,
+    #[serde(default)]
+    milestones: Value,
+    #[serde(default)]
+    schedule: Value,
+    #[serde(default)]
+    start_mode: String,
+    #[serde(default)]
+    start_at: Value,
+    #[serde(default)]
+    recurrence: String,
+    #[serde(default)]
+    repeat_active: Option<bool>,
+    #[serde(default)]
+    plan_review: Option<bool>,
+    #[serde(default)]
+    auto_plan: Option<bool>,
+    #[serde(default)]
+    planner_agent: String,
+    #[serde(default)]
+    max_parallel: Option<i64>,
 }
 
-fn starter_group_manifest(goal: &str) -> Value {
+async fn create_group_handler(
+    State(state): State<ServerState>,
+    Json(request): Json<CreateGroupRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let goal = request.goal.trim();
+    let title = if request.title.trim().is_empty() {
+        goal
+    } else {
+        request.title.trim()
+    };
+    if goal.is_empty() && title.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "goal is required"})),
+        ));
+    }
+    let goal = if goal.is_empty() { title } else { goal };
+    let requested_path = request.workspace_path.trim();
+    let workspace = if !requested_path.is_empty() {
+        let path = FsPath::new(requested_path);
+        if !path.is_dir() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("workspace folder not found: {requested_path}")})),
+            ));
+        }
+        let found = state.registry.find_by_path(requested_path);
+        match found {
+            Some(record) => record,
+            None => state
+                .registry
+                .add(
+                    requested_path,
+                    if title.is_empty() { "Project" } else { title },
+                )
+                .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({"error": error}))))?,
+        }
+    } else if !request.workspace_id.trim().is_empty() {
+        state
+            .registry
+            .get(request.workspace_id.trim())
+            .ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "workspace not found"})),
+                )
+            })?
+    } else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "workspace_id or workspace_path is required"})),
+        ));
+    };
+    let schedule = request.schedule;
+    let milestones = if request.milestones.is_null() {
+        json!([])
+    } else {
+        request.milestones
+    };
+    let members = if request.members.is_null() {
+        json!([])
+    } else {
+        request.members
+    };
+    let start_mode = if request.start_mode.trim().is_empty() {
+        schedule
+            .get("start_mode")
+            .and_then(Value::as_str)
+            .unwrap_or("now")
+            .to_string()
+    } else {
+        request.start_mode.trim().to_string()
+    };
+    let start_at = if request.start_at.is_null() {
+        schedule.get("start_at").cloned().unwrap_or(Value::Null)
+    } else {
+        request.start_at
+    };
+    let recurrence = if request.recurrence.trim().is_empty() {
+        schedule
+            .get("recurrence")
+            .and_then(Value::as_str)
+            .unwrap_or("none")
+            .to_string()
+    } else {
+        request.recurrence.trim().to_string()
+    };
+    let manifest = json!({
+        "id": format!("{}-{}", slug_for_group(title), &Uuid::new_v4().simple().to_string()[..6]),
+        "title": title,
+        "goal": goal,
+        "workspace_path": workspace.path,
+        "owner": "localhost",
+        "members": members,
+        "milestones": milestones,
+        "schedule": {
+            "start_mode": start_mode,
+            "start_at": start_at,
+            "recurrence": recurrence,
+        },
+        "start_mode": start_mode,
+        "start_at": start_at,
+        "recurrence": recurrence,
+        "repeat_active": request.repeat_active.unwrap_or(recurrence != "none"),
+        "plan_review": request.plan_review.unwrap_or(true),
+        "auto_plan": request.auto_plan.unwrap_or(true),
+        "planner_agent": if request.planner_agent.trim().is_empty() { "orchestrator" } else { request.planner_agent.trim() },
+        "max_parallel": request.max_parallel.unwrap_or(1).clamp(1, 8),
+    });
+    let detail = state
+        .groups
+        .create(&manifest, &workspace.id)
+        .await
+        .map_err(group_error)?;
+    let id = detail["id"].as_str().unwrap_or_default();
+    Ok(Json(json!({
+        "id": id,
+        "path": detail["path"],
+        "workspace_path": detail["workspace_path"],
+        "title": title,
+        "runtime_notice": GROUP_RUNTIME_NOTICE,
+        "project": detail["project"],
+        "members": detail["members"],
+        "milestones": detail["milestones"],
+        "items": detail["items"],
+    })))
+}
+
+fn slug_for_group(value: &str) -> String {
     let mut slug = String::new();
     let mut dash = false;
-    for character in goal.chars().flat_map(char::to_lowercase) {
+    for character in value.chars().flat_map(char::to_lowercase) {
         if character.is_ascii_alphanumeric() {
             if dash && !slug.is_empty() {
                 slug.push('-');
@@ -5377,62 +7006,12 @@ fn starter_group_manifest(goal: &str) -> Value {
             break;
         }
     }
-    let id = slug.trim_matches('-');
-    let id = if id.is_empty() { "group-project" } else { id };
-    let id = format!("{}-{}", id, &Uuid::new_v4().simple().to_string()[..6]);
-    json!({
-        "id": id,
-        "goal": goal,
-        "status": "active",
-        "milestones": [
-            {
-                "id": "m1",
-                "title": "Plan",
-                "items": [{
-                    "id": "m1-i1",
-                    "title": "Break the goal into a clear deliverable",
-                    "detail": format!("Review the goal and prepare a concrete plan: {goal}"),
-                    "acceptance": ["The deliverable and its completion checks are recorded"]
-                }]
-            },
-            {
-                "id": "m2",
-                "title": "Deliver",
-                "depends_on": ["m1"],
-                "items": [{
-                    "id": "m2-i1",
-                    "title": "Complete the requested work",
-                    "detail": goal,
-                    "acceptance": ["The requested deliverable is complete and summarized"]
-                }]
-            }
-        ]
-    })
-}
-
-async fn create_group_handler(
-    State(_state): State<ServerState>,
-    Json(request): Json<CreateGroupRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let goal = request.goal.trim();
-    if goal.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "goal is required"})),
-        ));
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "group-project".to_string()
+    } else {
+        slug.to_string()
     }
-    let detail = GroupStore::default_root()
-        .create(&starter_group_manifest(goal), request.workspace_id.trim())
-        .await
-        .map_err(group_error)?;
-    let id = detail["id"].as_str().unwrap_or_default();
-    Ok(Json(json!({
-        "id": id,
-        "path": detail["path"],
-        "title": goal,
-        "runtime_notice": GROUP_RUNTIME_NOTICE,
-        "project": detail["project"],
-    })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -5641,8 +7220,8 @@ async fn groups_handler(
 ) -> Json<Value> {
     let scoped =
         !query.workspace_id.is_empty() && state.registry.get(&query.workspace_id).is_some();
-    let projects = GroupStore::default_root().list().await;
-    let mut projects = if scoped {
+    let projects = state.groups.list().await;
+    let projects = if scoped {
         projects
             .into_iter()
             .filter(|project| {
@@ -5652,26 +7231,36 @@ async fn groups_handler(
     } else {
         projects
     };
-    for project in &mut projects {
-        if project["status"] == "active" {
-            project["status"] = json!("running");
-        }
-    }
     Json(json!({"projects": projects, "scoped": scoped}))
 }
 
 async fn group_handler(
-    State(_state): State<ServerState>,
+    State(state): State<ServerState>,
     Path(project_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let mut detail = GroupStore::default_root()
+    let mut detail = state
+        .groups
         .detail(&project_id, 200)
         .await
         .map_err(group_error)?;
-    if detail["project"]["status"] == "active" {
-        detail["project"]["status"] = json!("running");
+    if detail["workspace_path"]
+        .as_str()
+        .is_none_or(|value| value.trim().is_empty())
+        && let Some(origin) = detail["project"]["origin_workspace_id"].as_str()
+        && let Some(workspace) = state.registry.get(origin)
+        && FsPath::new(&workspace.path).is_dir()
+    {
+        let _ = state
+            .groups
+            .set_workspace_path(&project_id, &workspace.path)
+            .await;
+        detail["workspace_path"] = json!(workspace.path);
+        detail["project"]["workspace_path"] = json!(workspace.path);
     }
     detail["runtime_notice"] = json!(GROUP_RUNTIME_NOTICE);
+    let workspace = detail["workspace_path"].as_str().unwrap_or("");
+    detail["workspace_missing"] =
+        json!(workspace.trim().is_empty() || !FsPath::new(workspace).is_dir());
     Ok(Json(detail))
 }
 
@@ -5684,14 +7273,278 @@ struct GroupUpdateRequest {
 }
 
 async fn group_update_handler(
+    State(state): State<ServerState>,
     Path(project_id): Path<String>,
     Json(request): Json<GroupUpdateRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    GroupStore::default_root()
+    if matches!(request.op.as_str(), "stop" | "close") {
+        for chat_id in state
+            .groups
+            .active_chats(&project_id)
+            .await
+            .unwrap_or_default()
+        {
+            state.runs.cancel(&chat_id);
+        }
+    }
+    state
+        .groups
         .update(&project_id, &request.op, &request.params)
         .await
         .map(Json)
         .map_err(group_error)
+}
+
+async fn group_patch_handler(
+    State(state): State<ServerState>,
+    Path(project_id): Path<String>,
+    Json(params): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    state
+        .groups
+        .update(&project_id, "set_settings", &params)
+        .await
+        .map(Json)
+        .map_err(group_error)
+}
+
+async fn group_delete_handler(
+    State(state): State<ServerState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    for chat_id in state
+        .groups
+        .active_chats(&project_id)
+        .await
+        .unwrap_or_default()
+    {
+        state.runs.cancel(&chat_id);
+    }
+    let _ = state.groups.update(&project_id, "stop", &json!({})).await;
+    state
+        .groups
+        .trash(&project_id)
+        .await
+        .map(Json)
+        .map_err(group_error)
+}
+
+async fn group_start_handler(
+    State(state): State<ServerState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    state
+        .groups
+        .update(&project_id, "start", &json!({}))
+        .await
+        .map(Json)
+        .map_err(group_error)
+}
+
+async fn group_pause_handler(
+    State(state): State<ServerState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    state
+        .groups
+        .update(&project_id, "pause", &json!({}))
+        .await
+        .map(Json)
+        .map_err(group_error)
+}
+
+async fn group_stop_handler(
+    State(state): State<ServerState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    for chat_id in state
+        .groups
+        .active_chats(&project_id)
+        .await
+        .unwrap_or_default()
+    {
+        state.runs.cancel(&chat_id);
+    }
+    state
+        .groups
+        .update(&project_id, "stop", &json!({}))
+        .await
+        .map(Json)
+        .map_err(group_error)
+}
+
+async fn group_close_handler(
+    State(state): State<ServerState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    for chat_id in state
+        .groups
+        .active_chats(&project_id)
+        .await
+        .unwrap_or_default()
+    {
+        state.runs.cancel(&chat_id);
+    }
+    state
+        .groups
+        .update(&project_id, "close", &json!({}))
+        .await
+        .map(Json)
+        .map_err(group_error)
+}
+
+async fn group_restart_handler(
+    State(state): State<ServerState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let detail = state
+        .groups
+        .start_next_cycle(&project_id)
+        .await
+        .map_err(group_error)?;
+    Ok(Json(json!({"ok": true, "project": detail})))
+}
+
+async fn group_plan_handler(
+    State(state): State<ServerState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    state
+        .groups
+        .set_planning(&project_id)
+        .await
+        .map_err(group_error)?;
+    Ok(Json(json!({"ok": true, "status": "planning"})))
+}
+
+async fn group_approve_plan_handler(
+    State(state): State<ServerState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    state
+        .groups
+        .approve_plan(&project_id)
+        .await
+        .map_err(group_error)?;
+    Ok(Json(json!({"ok": true, "status": "running"})))
+}
+
+#[derive(Debug, Deserialize)]
+struct GroupMessageRequest {
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    to: String,
+    #[serde(default)]
+    target: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    item_id: Option<String>,
+    #[serde(default)]
+    reply_to: Option<i64>,
+}
+
+async fn group_message_handler(
+    State(state): State<ServerState>,
+    Path(project_id): Path<String>,
+    Json(request): Json<GroupMessageRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let body = [request.body, request.content, request.message]
+        .into_iter()
+        .find(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "message needs a non-empty body"})),
+            )
+        })?;
+    let to = if !request.to.trim().is_empty() {
+        request.to.trim()
+    } else if !request.target.trim().is_empty() {
+        request.target.trim()
+    } else {
+        "all"
+    };
+    let kind = if request.kind.trim().is_empty() {
+        "note"
+    } else {
+        request.kind.trim()
+    };
+    let seq = state
+        .groups
+        .send_message(
+            &project_id,
+            &body,
+            to,
+            kind,
+            "owner",
+            None,
+            "owner",
+            request.item_id.as_deref(),
+            None,
+            true,
+        )
+        .await
+        .map_err(group_error)?;
+    // Steer active workers immediately; queued messages are delivered on the
+    // next claimed item by the runner.
+    let active = state
+        .groups
+        .active_chats(&project_id)
+        .await
+        .unwrap_or_default();
+    for chat_id in active {
+        state.runs.steer(&chat_id, &body);
+    }
+    let _ = request.reply_to;
+    Ok(Json(json!({"ok": true, "seq": seq})))
+}
+
+async fn group_runs_handler(
+    State(state): State<ServerState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let detail = state
+        .groups
+        .detail(&project_id, 0)
+        .await
+        .map_err(group_error)?;
+    Ok(Json(
+        json!({"runs": detail["runs"], "usage": detail["usage"]}),
+    ))
+}
+
+async fn group_trash_handler(State(state): State<ServerState>) -> Json<Value> {
+    Json(json!({"projects": state.groups.trash_list().await}))
+}
+
+async fn group_restore_handler(
+    State(state): State<ServerState>,
+    Path(folder): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    state
+        .groups
+        .restore(&folder)
+        .await
+        .map(Json)
+        .map_err(group_error)
+}
+
+async fn group_permanent_delete_handler(
+    State(state): State<ServerState>,
+    Path(folder): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    state
+        .groups
+        .permanent_delete(&folder)
+        .await
+        .map_err(group_error)?;
+    Ok(Json(json!({"ok": true, "deleted": folder})))
 }
 
 #[derive(Debug, Deserialize)]
@@ -5703,10 +7556,12 @@ struct GroupApprovalRequest {
 }
 
 async fn group_approval_handler(
+    State(state): State<ServerState>,
     Path((project_id, item_id)): Path<(String, String)>,
     Json(request): Json<GroupApprovalRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    GroupStore::default_root()
+    state
+        .groups
         .approval(&project_id, &item_id, request.grant, &request.note)
         .await
         .map(Json)
@@ -5959,6 +7814,126 @@ async fn delete_note_handler(
     } else {
         Err(not_found("note not found"))
     }
+}
+
+fn workspace_record_or_404(
+    state: &ServerState,
+    workspace_id: &str,
+) -> Result<stark_store::WorkspaceRecord, (StatusCode, Json<Value>)> {
+    state.registry.get(workspace_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("unknown workspace '{workspace_id}'")})),
+        )
+    })
+}
+
+async fn workspace_agent_binding_handler(
+    State(state): State<ServerState>,
+    Path(workspace_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let workspace = workspace_record_or_404(&state, &workspace_id)?;
+    let key = workspace_binding_key(FsPath::new(&workspace.path));
+    let agent_key = state
+        .store
+        .workspace_agent_binding(&key)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error.to_string()})),
+            )
+        })?;
+    Ok(Json(json!({
+        "workspace_id": workspace.id,
+        "workspace_path": workspace.path,
+        "agent_key": agent_key,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentBindingRequest {
+    #[serde(default, alias = "agent")]
+    agent_key: String,
+}
+
+async fn set_workspace_agent_binding_handler(
+    State(state): State<ServerState>,
+    Path(workspace_id): Path<String>,
+    Json(request): Json<AgentBindingRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let workspace = workspace_record_or_404(&state, &workspace_id)?;
+    let registry = agent_registry(&state);
+    let requested = request.agent_key.trim();
+    let Some(canonical) = registry.canonical_key(requested) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("unknown agent '{requested}'")})),
+        ));
+    };
+    let key = workspace_binding_key(FsPath::new(&workspace.path));
+    state
+        .store
+        .set_workspace_agent_binding(&key, &canonical)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error.to_string()})),
+            )
+        })?;
+    let _ = state
+        .store
+        .record_audit(
+            None,
+            None,
+            "agent_binding_set",
+            Some(&canonical),
+            Some(&workspace.path),
+            &json!({"workspace_id": workspace.id}),
+        )
+        .await;
+    Ok(Json(json!({
+        "ok": true,
+        "workspace_id": workspace.id,
+        "workspace_path": workspace.path,
+        "agent_key": canonical,
+    })))
+}
+
+async fn clear_workspace_agent_binding_handler(
+    State(state): State<ServerState>,
+    Path(workspace_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let workspace = workspace_record_or_404(&state, &workspace_id)?;
+    let key = workspace_binding_key(FsPath::new(&workspace.path));
+    state
+        .store
+        .clear_workspace_agent_binding(&key)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error.to_string()})),
+            )
+        })?;
+    let _ = state
+        .store
+        .record_audit(
+            None,
+            None,
+            "agent_binding_cleared",
+            None,
+            Some(&workspace.path),
+            &json!({"workspace_id": workspace.id}),
+        )
+        .await;
+    Ok(Json(json!({
+        "ok": true,
+        "workspace_id": workspace.id,
+        "workspace_path": workspace.path,
+        "agent_key": null,
+    })))
 }
 
 async fn workspace_handler(
@@ -7154,11 +9129,17 @@ mod tests {
                 .body(Body::from("mock provider failure"))
                 .unwrap();
         }
-        let body = concat!(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"Group item complete\"}}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
-            "data: [DONE]\n\n"
-        );
+        let request = _body.to_string();
+        let content = if request.contains("planning lead") {
+            r#"```json
+{"summary":"Mock plan","milestones":[{"title":"Build","detail":"Deliver the result","items":[{"title":"Write it","detail":"Create the deliverable","acceptance":[],"owner":null,"requires_approval":false}]}]}
+```"#
+        } else {
+            "Group item complete"
+        };
+        let frame = json!({"choices":[{"delta":{"content":content}}]}).to_string();
+        let stop = json!({"choices":[{"delta":{},"finish_reason":"stop"}]}).to_string();
+        let body = format!("data: {frame}\n\ndata: {stop}\n\ndata: [DONE]\n\n");
         Response::builder()
             .header(header::CONTENT_TYPE, "text/event-stream")
             .body(Body::from(body))
@@ -7233,7 +9214,9 @@ mod tests {
             provider_health: Arc::new(Mutex::new(HashMap::new())),
             questions: Arc::new(QuestionBroker::new()),
             runs: Arc::new(RunManager::default()),
+            registry_cache: Arc::new(Mutex::new(None)),
             registry: WorkspaceRegistry::new(root),
+            groups: GroupStore::new(root.join("projects")),
             pairing: Arc::new(PairingStore::new(root)),
             ui_state_path: root.join(".deep_agents").join("ui_state.json"),
             harness_root: root.to_path_buf(),
@@ -7263,13 +9246,17 @@ mod tests {
 
     async fn group_with_one_ready_item(root: &std::path::Path) -> GroupStore {
         let groups = GroupStore::new(root.join("projects"));
+        let work = root.join("real-work");
+        std::fs::create_dir_all(&work).unwrap();
         groups.create(&json!({
             "id": "mock-run",
             "goal": "Create a small deliverable",
+            "workspace_path": work.to_string_lossy(),
+            "members": [{"agent_key": "developer", "amount": 1}],
             "milestones": [{
                 "id": "m1",
                 "title": "Build",
-                "items": [{"id": "i1", "title": "Write it", "detail": "Create the deliverable", "acceptance": ["It exists"]}]
+                "items": [{"id": "i1", "title": "Write it", "detail": "Create the deliverable", "max_attempts": 1, "acceptance": ["It exists"]}]
             }]
         }), "_general").await.unwrap();
         groups
@@ -7323,7 +9310,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let groups = group_with_items(
             dir.path(),
-            json!([{"id": "i1", "title": "Write it", "detail": "Create the deliverable", "acceptance": [{"kind": "file_exists", "path": "proof.txt"}]}]),
+            json!([{"id": "i1", "title": "Write it", "detail": "Create the deliverable", "max_attempts": 1, "acceptance": [{"kind": "file_exists", "path": "proof.txt"}]}]),
         )
         .await;
         let item = groups.claim_next_ready("mock-run").await.unwrap().unwrap();
@@ -7344,7 +9331,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let groups = group_with_items(
             dir.path(),
-            json!([{"id": "i1", "title": "Write it", "detail": "Create the deliverable", "acceptance": [{"kind": "file_exists", "path": "proof.txt"}]}]),
+            json!([{"id": "i1", "title": "Write it", "detail": "Create the deliverable", "max_attempts": 1, "acceptance": [{"kind": "file_exists", "path": "proof.txt"}]}]),
         )
         .await;
         // The runner evaluates acceptance against the project folder.
@@ -7416,12 +9403,7 @@ mod tests {
                 .starts_with("Group: Write it")
         );
         let chat_id = chats[0]["id"].as_str().unwrap();
-        let expected = dir
-            .path()
-            .join("projects")
-            .join("mock-run")
-            .to_string_lossy()
-            .to_string();
+        let expected = dir.path().join("real-work").to_string_lossy().to_string();
         let actual = state.store.chat_workspace_path(chat_id).await.unwrap();
         assert_eq!(actual.as_deref(), Some(expected.as_str()));
     }
@@ -7667,7 +9649,9 @@ mod tests {
             provider_health: Arc::new(Mutex::new(HashMap::new())),
             questions: Arc::new(QuestionBroker::new()),
             runs: Arc::new(RunManager::default()),
+            registry_cache: Arc::new(Mutex::new(None)),
             registry: WorkspaceRegistry::new(dir.path()),
+            groups: GroupStore::new(dir.path().join("projects")),
             pairing: Arc::new(PairingStore::new(dir.path())),
             ui_state_path: dir.path().join("ui_state.json"),
             harness_root: dir.path().to_path_buf(),
@@ -7732,8 +9716,111 @@ mod tests {
         assert_eq!(value["plan"]["agent"][0]["step"], "inspect");
     }
 
+    #[tokio::test]
+    async fn planner_creates_a_reviewable_plan_and_approval_executes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("plan-work");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join("proof.txt"), "proof").unwrap();
+        let state = group_test_state(dir.path(), group_provider(false).await).await;
+        let detail = state
+            .groups
+            .create(
+                &json!({
+                    "id": "planner-proof",
+                    "title": "Planner proof",
+                    "goal": "Prove planning",
+                    "workspace_path": work.to_string_lossy(),
+                    "members": [{"agent_key": "developer", "amount": 1}],
+                    "auto_plan": true,
+                    "plan_review": true,
+                    "milestones": []
+                }),
+                "_general",
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail["project"]["status"], "planning");
+        assert!(state.groups.claim_planning("planner-proof").await.unwrap());
+        run_group_planner(
+            state.clone(),
+            state.groups.clone(),
+            "planner-proof".to_string(),
+        )
+        .await;
+        let detail = state.groups.detail("planner-proof", 40).await.unwrap();
+        assert_eq!(detail["project"]["status"], "plan_ready");
+        assert_eq!(detail["milestones"].as_array().unwrap().len(), 1);
+        assert_eq!(detail["runs"][0]["kind"], "planning");
+        assert_eq!(detail["runs"][0]["status"], "complete");
+        assert!(
+            state
+                .groups
+                .claim_next_ready("planner-proof")
+                .await
+                .unwrap()
+                .is_none(),
+            "plan review gates execution"
+        );
+        state.groups.approve_plan("planner-proof").await.unwrap();
+        let item = state
+            .groups
+            .claim_next_ready("planner-proof")
+            .await
+            .unwrap()
+            .expect("approved plan dispatches");
+        run_group_item(
+            state.clone(),
+            state.groups.clone(),
+            "planner-proof".to_string(),
+            item,
+        )
+        .await;
+        let detail = state.groups.detail("planner-proof", 60).await.unwrap();
+        assert_eq!(detail["items"][0]["status"], "done");
+        assert!(detail["runs"].as_array().unwrap().len() >= 2);
+    }
+
+    #[tokio::test]
+    async fn create_group_handler_persists_workspace_members_and_schedule() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("endpoint-work");
+        std::fs::create_dir_all(&work).unwrap();
+        let state = group_test_state(dir.path(), "http://127.0.0.1:9".to_string()).await;
+        let request: CreateGroupRequest = serde_json::from_value(json!({
+            "title": "Endpoint project",
+            "goal": "Prove the endpoint",
+            "workspace_path": work.to_string_lossy(),
+            "members": [
+                {"agent_key": "developer", "amount": 2},
+                {"agent_key": "ui", "amount": 1}
+            ],
+            "auto_plan": false,
+            "milestones": [],
+            "start_mode": "manual",
+            "max_parallel": 2
+        }))
+        .unwrap();
+        let Json(created) = create_group_handler(State(state.clone()), Json(request))
+            .await
+            .expect("create group");
+        let id = created["id"].as_str().unwrap().to_string();
+        let detail = state.groups.detail(&id, 20).await.unwrap();
+        assert_eq!(detail["workspace_path"], work.to_string_lossy().to_string());
+        assert_eq!(detail["members"].as_array().unwrap().len(), 3);
+        assert_eq!(detail["project"]["status"], "draft");
+        assert_eq!(detail["project"]["max_parallel"], 2);
+        let pending: Vec<Value> = state.groups.trash_list().await;
+        assert!(pending.is_empty());
+        let trashed = state.groups.trash(&id).await.unwrap();
+        assert!(trashed["folder"].as_str().is_some());
+        assert!(work.join("endpoint-work").exists() || work.exists());
+    }
+
     #[test]
     fn group_owner_member_selects_the_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = AgentRegistry::open(dir.path());
         let detail = json!({
             "members": [
                 {"name": "Nova", "display": "Nova", "kind": "ui"},
@@ -7741,26 +9828,462 @@ mod tests {
             ]
         });
         assert_eq!(
-            group_item_agent(&json!({"owner_member": "UI"}), &detail).key,
+            group_item_runtime(&registry, &json!({"owner_member": "UI"}), &detail)
+                .unwrap()
+                .key,
             "ui"
         );
         assert_eq!(
-            group_item_agent(&json!({"owner_member": "research"}), &detail).key,
+            group_item_runtime(&registry, &json!({"owner_member": "research"}), &detail)
+                .unwrap()
+                .key,
             "general"
         );
         assert_eq!(
-            group_item_agent(&json!({"owner_member": "Nova"}), &detail).key,
+            group_item_runtime(&registry, &json!({"owner_member": "Nova"}), &detail)
+                .unwrap()
+                .key,
             "ui"
         );
         assert_eq!(
-            group_item_agent(&json!({"owner_member": "ops"}), &detail).key,
+            group_item_runtime(&registry, &json!({"owner_member": "ops"}), &detail)
+                .unwrap()
+                .key,
             "devops"
         );
+        assert!(
+            group_item_runtime(&registry, &json!({"owner_member": "unknown"}), &detail).is_err()
+        );
         assert_eq!(
-            group_item_agent(&json!({"owner_member": "unknown"}), &detail).key,
+            group_item_runtime(&registry, &json!({}), &detail)
+                .unwrap()
+                .key,
             "developer"
         );
-        assert_eq!(group_item_agent(&json!({}), &detail).key, "developer");
+    }
+
+    #[tokio::test]
+    async fn custom_agent_crud_preview_and_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = group_test_state(dir.path(), "http://127.0.0.1:9".to_string()).await;
+        let file: AgentFile = serde_json::from_value(json!({
+            "version": 2,
+            "display": "Backend",
+            "description": "Rust backend work",
+            "access": "write",
+            "prompt": {"profile": "coding", "persona": "You own backend-rs."},
+            "tools": ["read", "edit", "glob", "grep"],
+            "skills": [],
+            "mcp": [],
+            "delegation": {"delegatable": true, "can_delegate": false, "can_spawn": false},
+            "ui": {"visible": true, "order": 25}
+        }))
+        .unwrap();
+        let saved = save_agent_handler(
+            State(state.clone()),
+            Path("backend".to_string()),
+            Query(AgentQuery {
+                tier: None,
+                workspace_path: None,
+            }),
+            Json(file),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.0["key"], "backend");
+        assert_eq!(saved.0["effective"]["access"], "write");
+        assert_eq!(saved.0["effective"]["prompt_profile"], "coding");
+
+        let listed = agents_config_handler(State(state.clone())).await;
+        let entry = listed.0["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["key"] == "backend")
+            .expect("custom agent in list");
+        assert_eq!(entry["builtin"], false);
+        assert_eq!(entry["deletable"], true);
+        assert_eq!(entry["valid"], true);
+
+        let preview = preview_agent_handler(
+            State(state.clone()),
+            Path("backend".to_string()),
+            Json(PreviewRequest {
+                draft: None,
+                workspace_path: dir.path().to_string_lossy().to_string(),
+                mode: "build".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        let prompt = preview.0["system_prompt"].as_str().unwrap();
+        assert!(prompt.contains("You own backend-rs."));
+        assert!(preview.0["tools"]["direct"].as_array().is_some());
+        assert!(preview.0["prompt_tokens"].as_u64().unwrap() > 0);
+
+        let deleted = delete_agent_handler(State(state.clone()), Path("backend".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(deleted.0["deleted"], true);
+        let after = agent_config_handler(
+            State(state.clone()),
+            Path("backend".to_string()),
+            Query(AgentQuery {
+                tier: None,
+                workspace_path: None,
+            }),
+        )
+        .await;
+        assert!(after.is_err());
+    }
+
+    #[tokio::test]
+    async fn legacy_alias_file_is_listed_as_its_builtin_and_reset_removes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = group_test_state(dir.path(), "http://127.0.0.1:9".to_string()).await;
+        let agents_dir = dir.path().join(".deep_agents/config/agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("coder.json"),
+            r#"{"display":"Legacy Coder"}"#,
+        )
+        .unwrap();
+        let listed = agents_config_handler(State(state.clone())).await;
+        let keys: Vec<String> = listed.0["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["key"].as_str().map(str::to_string))
+            .collect();
+        assert!(!keys.contains(&"coder".to_string()), "{keys:?}");
+        let developer = listed.0["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["key"] == "developer")
+            .unwrap();
+        assert_eq!(developer["display"], "Legacy Coder");
+        let _ = delete_agent_handler(State(state.clone()), Path("developer".to_string()))
+            .await
+            .unwrap();
+        assert!(!agents_dir.join("coder.json").exists());
+        let listed = agents_config_handler(State(state)).await;
+        let developer = listed.0["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["key"] == "developer")
+            .unwrap();
+        assert_eq!(developer["display"], "Developer");
+    }
+
+    #[tokio::test]
+    async fn duplicating_builtins_produces_safe_custom_agents() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = group_test_state(dir.path(), "http://127.0.0.1:9".to_string()).await;
+        let developer = duplicate_agent_handler(
+            State(state.clone()),
+            Path("developer".to_string()),
+            Json(DuplicateRequest {
+                key: "backend2".to_string(),
+                display: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let tools = developer.0["effective"]["tools"].as_array().unwrap();
+        assert!(tools.iter().any(|tool| tool == "execute"));
+        assert_eq!(developer.0["effective"]["code_mode"], "hybrid");
+        assert_eq!(developer.0["effective"]["prompt_profile"], "coding");
+
+        let house = duplicate_agent_handler(
+            State(state.clone()),
+            Path("house".to_string()),
+            Json(DuplicateRequest {
+                key: "house2".to_string(),
+                display: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(house.0["effective"]["access"], "read");
+        let persona = house.0["effective"]["persona"].as_str().unwrap_or("");
+        assert!(persona.contains("You are the House agent"), "{persona}");
+    }
+
+    #[tokio::test]
+    async fn custom_hybrid_code_mode_previews_direct_and_program_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = group_test_state(dir.path(), "http://127.0.0.1:9".to_string()).await;
+        let file: AgentFile = serde_json::from_value(json!({
+            "version": 2,
+            "display": "Hybrid",
+            "access": "read",
+            "tools": ["read", "files_changed", "execute"],
+            "skills": [],
+            "mcp": [],
+            "code_mode": "hybrid"
+        }))
+        .unwrap();
+        let saved = save_agent_handler(
+            State(state.clone()),
+            Path("hybrid".to_string()),
+            Query(AgentQuery {
+                tier: None,
+                workspace_path: None,
+            }),
+            Json(file),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.0["effective"]["code_mode"], "hybrid");
+        let preview = preview_agent_handler(
+            State(state),
+            Path("hybrid".to_string()),
+            Json(PreviewRequest {
+                draft: None,
+                workspace_path: dir.path().to_string_lossy().to_string(),
+                mode: "build".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        let direct: Vec<&str> = preview.0["tools"]["direct"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(direct.contains(&"read"), "{direct:?}");
+        assert!(direct.contains(&"execute"), "{direct:?}");
+        assert!(!direct.contains(&"files_changed"), "{direct:?}");
+        let program: Vec<&str> = preview.0["tools"]["program"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(program, vec!["files_changed"]);
+        let prompt = preview.0["system_prompt"].as_str().unwrap();
+        assert!(prompt.contains("# Code Mode"), "{prompt}");
+        assert!(prompt.contains("tools.files_changed"), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn custom_hybrid_code_mode_advertises_execute_and_catalog() {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::http::header;
+        use axum::routing::post;
+
+        async fn capture_provider(
+            State(seen): State<Arc<Mutex<Vec<Value>>>>,
+            Json(body): Json<Value>,
+        ) -> Response {
+            seen.lock().unwrap().push(body);
+            let body = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            );
+            Response::builder()
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(body))
+                .unwrap()
+        }
+
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let captured = seen.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/chat/completions", post(capture_provider))
+                    .with_state(captured),
+            )
+            .await
+            .unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let state = group_test_state(dir.path(), format!("http://{address}")).await;
+        let file: AgentFile = serde_json::from_value(json!({
+            "version": 2,
+            "display": "Hybrid Live",
+            "access": "read",
+            "tools": ["read", "files_changed", "execute"],
+            "skills": [],
+            "mcp": [],
+            "code_mode": "hybrid"
+        }))
+        .unwrap();
+        let _ = save_agent_handler(
+            State(state.clone()),
+            Path("hybrid-live".to_string()),
+            Query(AgentQuery {
+                tier: None,
+                workspace_path: None,
+            }),
+            Json(file),
+        )
+        .await
+        .unwrap();
+        let _ = run_command_handler(
+            State(state.clone()),
+            Path("chat-hybrid".to_string()),
+            Json(RunRequest {
+                prompt: "inspect".to_string(),
+                model: "mock".to_string(),
+                temperature: 0.0,
+                workspace_path: dir.path().to_string_lossy().to_string(),
+                workspace_id: "_general".to_string(),
+                chat_id: "chat-hybrid".to_string(),
+                attachments: Vec::new(),
+                workspace_kind: "general".to_string(),
+                agent: "hybrid-live".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        for _ in 0..400 {
+            if !state.runs.is_running("chat-hybrid") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let requests = seen.lock().unwrap();
+        let body = &requests[0];
+        let tools: Vec<String> = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| {
+                tool.pointer("/function/name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
+        assert!(tools.contains(&"read".to_string()), "{tools:?}");
+        assert!(tools.contains(&"execute".to_string()), "{tools:?}");
+        assert!(!tools.contains(&"files_changed".to_string()), "{tools:?}");
+        let system = body["messages"][0]["content"].as_str().unwrap_or("");
+        assert!(system.contains("# Code Mode"), "{system}");
+        assert!(system.contains("tools.files_changed"), "{system}");
+    }
+
+    #[tokio::test]
+    async fn workspace_local_skill_validates_saves_and_previews() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("project");
+        let skill_dir = workspace.join(".agents/skills/review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: review\ndescription: Review code.\n---\n# Review\n",
+        )
+        .unwrap();
+        let state = group_test_state(dir.path(), "http://127.0.0.1:9".to_string()).await;
+        let file: AgentFile = serde_json::from_value(json!({
+            "version": 2,
+            "display": "Reviewer",
+            "access": "read",
+            "tools": ["read", "skill"],
+            "skills": ["review"],
+            "mcp": []
+        }))
+        .unwrap();
+        let saved = save_agent_handler(
+            State(state.clone()),
+            Path("reviewer".to_string()),
+            Query(AgentQuery {
+                tier: None,
+                workspace_path: Some(workspace.to_string_lossy().to_string()),
+            }),
+            Json(file.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.0["effective"]["skills"], json!(["review"]));
+        let preview = preview_agent_handler(
+            State(state.clone()),
+            Path("reviewer".to_string()),
+            Json(PreviewRequest {
+                draft: None,
+                workspace_path: workspace.to_string_lossy().to_string(),
+                mode: "build".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            preview.0["system_prompt"]
+                .as_str()
+                .unwrap()
+                .contains("review: Review code.")
+        );
+        // Without a workspace the same skill is a warning, not a hard error,
+        // because it may be project-local.
+        let saved = save_agent_handler(
+            State(state),
+            Path("reviewer".to_string()),
+            Query(AgentQuery {
+                tier: None,
+                workspace_path: None,
+            }),
+            Json(file),
+        )
+        .await
+        .unwrap();
+        assert!(
+            saved.0["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning.as_str().unwrap_or("").contains("workspace-local"))
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_agent_rejects_unsafe_definitions() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = group_test_state(dir.path(), "http://127.0.0.1:9".to_string()).await;
+        let unknown: AgentFile = serde_json::from_value(json!({
+            "version": 2,
+            "tools": ["read", "not_a_tool"]
+        }))
+        .unwrap();
+        let result = save_agent_handler(
+            State(state.clone()),
+            Path("bad".to_string()),
+            Query(AgentQuery {
+                tier: None,
+                workspace_path: None,
+            }),
+            Json(unknown),
+        )
+        .await;
+        assert!(result.is_err());
+
+        let read_only_edit: AgentFile = serde_json::from_value(json!({
+            "version": 2,
+            "access": "read",
+            "tools": ["read", "edit"]
+        }))
+        .unwrap();
+        let result = save_agent_handler(
+            State(state.clone()),
+            Path("readonly".to_string()),
+            Query(AgentQuery {
+                tier: None,
+                workspace_path: None,
+            }),
+            Json(read_only_edit),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(state.config.agent("bad").is_none());
+        assert!(state.config.agent("readonly").is_none());
     }
 
     #[test]
@@ -8137,6 +10660,191 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn custom_agent_runs_with_a_closed_tool_surface_and_persists_on_follow_up() {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::http::header;
+        use axum::routing::post;
+
+        async fn capture_provider(
+            State(seen): State<Arc<Mutex<Vec<Value>>>>,
+            Json(body): Json<Value>,
+        ) -> Response {
+            seen.lock().unwrap().push(body);
+            let body = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Custom reply\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            );
+            Response::builder()
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(body))
+                .unwrap()
+        }
+
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let captured = seen.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/chat/completions", post(capture_provider))
+                    .with_state(captured),
+            )
+            .await
+            .unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = group_test_state(dir.path(), format!("http://{address}")).await;
+        let file: AgentFile = serde_json::from_value(json!({
+            "version": 2,
+            "display": "Backend",
+            "description": "Rust backend work",
+            "access": "read",
+            "prompt": {"profile": "general", "persona": "CUSTOM PERSONA: own backend-rs."},
+            "tools": ["read", "grep"],
+            "skills": [],
+            "mcp": []
+        }))
+        .unwrap();
+        let _ = save_agent_handler(
+            State(state.clone()),
+            Path("backend".to_string()),
+            Query(AgentQuery {
+                tier: None,
+                workspace_path: None,
+            }),
+            Json(file),
+        )
+        .await
+        .unwrap();
+
+        let request = RunRequest {
+            prompt: "inspect".to_string(),
+            model: "mock".to_string(),
+            temperature: 0.0,
+            workspace_path: dir.path().to_string_lossy().to_string(),
+            workspace_id: "_general".to_string(),
+            chat_id: "chat-custom".to_string(),
+            attachments: Vec::new(),
+            workspace_kind: "general".to_string(),
+            agent: "backend".to_string(),
+        };
+        let _ = run_command_handler(
+            State(state.clone()),
+            Path("chat-custom".to_string()),
+            Json(request),
+        )
+        .await
+        .unwrap();
+        for _ in 0..400 {
+            if !state.runs.is_running("chat-custom") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(!state.runs.is_running("chat-custom"));
+        let chat = state.store.get_chat("chat-custom").await.unwrap().unwrap();
+        assert_eq!(chat["agentKey"], "backend");
+        {
+            let requests = seen.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            let body = &requests[0];
+            let system = body["messages"][0]["content"].as_str().unwrap_or("");
+            assert!(system.contains("CUSTOM PERSONA"), "{system}");
+            let tools: Vec<String> = body["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|tool| {
+                    tool.pointer("/function/name")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .collect();
+            assert_eq!(tools, vec!["read", "grep"]);
+        }
+
+        // Follow-up with no explicit agent must keep the persisted custom
+        // agent instead of re-routing to General.
+        let follow_up = RunRequest {
+            prompt: "continue".to_string(),
+            model: "mock".to_string(),
+            temperature: 0.0,
+            workspace_path: dir.path().to_string_lossy().to_string(),
+            workspace_id: "_general".to_string(),
+            chat_id: "chat-custom".to_string(),
+            attachments: Vec::new(),
+            workspace_kind: "general".to_string(),
+            agent: String::new(),
+        };
+        let _ = run_command_handler(
+            State(state.clone()),
+            Path("chat-custom".to_string()),
+            Json(follow_up),
+        )
+        .await
+        .unwrap();
+        for _ in 0..400 {
+            if !state.runs.is_running("chat-custom") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        {
+            let requests = seen.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            let system = requests[1]["messages"][0]["content"].as_str().unwrap_or("");
+            assert!(system.contains("CUSTOM PERSONA"), "{system}");
+            let tools: Vec<String> = requests[1]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|tool| {
+                    tool.pointer("/function/name")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .collect();
+            assert_eq!(tools, vec!["read", "grep"]);
+        }
+
+        // Deleting the agent makes the persisted chat fail explicitly instead
+        // of silently routing to a more privileged built-in.
+        let _ = delete_agent_handler(State(state.clone()), Path("backend".to_string()))
+            .await
+            .unwrap();
+        let missing = run_command_handler(
+            State(state.clone()),
+            Path("chat-custom".to_string()),
+            Json(RunRequest {
+                prompt: "after delete".to_string(),
+                model: "mock".to_string(),
+                temperature: 0.0,
+                workspace_path: dir.path().to_string_lossy().to_string(),
+                workspace_id: "_general".to_string(),
+                chat_id: "chat-custom".to_string(),
+                attachments: Vec::new(),
+                workspace_kind: "general".to_string(),
+                agent: String::new(),
+            }),
+        )
+        .await;
+        assert!(missing.is_err());
+        let (_, Json(error)) = missing.unwrap_err();
+        assert!(
+            error["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("no longer exists"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
     async fn command_endpoint_starts_a_run_and_after_seq_predates_the_log() {
         async fn command_mock_provider(Json(_body): Json<Value>) -> Response {
             let body = concat!(
@@ -8172,6 +10880,7 @@ mod tests {
             chat_id: String::new(),
             attachments: Vec::new(),
             workspace_kind: "general".to_string(),
+            agent: String::new(),
         };
         let started = run_command_handler(
             State(state.clone()),

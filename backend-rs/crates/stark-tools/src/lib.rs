@@ -30,8 +30,7 @@ mod skills;
 mod truncate;
 mod verify;
 
-use std::collections::BTreeMap;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -41,9 +40,20 @@ use tokio_util::sync::CancellationToken;
 
 pub use approvals::ApprovalCache;
 pub use checkpoint::{Checkpoint, RestoreReport, SnapshotGroup};
+pub use codemode::worker::{WorkerManager, runtime_status as code_mode_runtime_status};
+pub use codemode::{
+    execute_description as code_mode_execute_description,
+    instructions::Rendered as CodeModeInstructions,
+    jobs::{
+        JobNotice, acknowledge_notice as acknowledge_code_mode_notice,
+        recover_notices as recover_code_mode_notices,
+    },
+};
 pub use house::{HouseStore, public_device, public_state};
 pub use images::{InlineImage, collect_inline_images, is_image_mime, mime_for_ext};
-pub use inventory::{INVENTORY, is_implemented, is_plan_write, is_program, is_read_blocked};
+pub use inventory::{
+    INVENTORY, is_codemode, is_implemented, is_plan_write, is_program, is_read_blocked,
+};
 pub use permissions::doom_loop_gate;
 pub use stark_sandbox::{ApprovalPolicy, SandboxMode, SandboxProfile};
 
@@ -67,6 +77,7 @@ pub fn sandbox_prompt_line_for(workspace: &Path, access: &str) -> String {
 pub fn sandbox_status(workspace: &Path) -> String {
     SandboxProfile::from_env(workspace).prompt_line()
 }
+pub use mcp::configured_servers;
 pub use mcp::{McpManager, ServerConfig as McpServerConfig, init as init_mcp, search_tools};
 pub use plan::{PlanError, PlanStore, update_plan};
 pub use processes::{ProcessManager, ProcessStatus};
@@ -75,7 +86,9 @@ pub use retention::{RetentionPolicy, RetentionReport, free_bytes, sweep_harness}
 pub use screen::{
     PendingImage, ScreenBridge, drain_images, latest_continuous_image, queue_image, screen_bridge,
 };
-pub use skills::{catalog_block_for, catalog_block_for_agent};
+pub use skills::{
+    SkillEntry, catalog_block_for, catalog_block_for_agent, catalog_entries, skill_names,
+};
 pub use verify::{AcceptanceVerdict, CriterionStatus, CriterionVerdict, evaluate_acceptance};
 
 /// Tool membership and guard flags live in [`inventory`]: one `ToolMeta`
@@ -85,6 +98,99 @@ pub use verify::{AcceptanceVerdict, CriterionStatus, CriterionVerdict, evaluate_
 pub const MCP_EAGER_LIMIT: usize = 8;
 
 static CONTRACT: OnceLock<ToolSpecFile> = OnceLock::new();
+
+/// How an agent surfaces tools to the model.
+///
+/// Mirrors OpenCode v2's Code Mode partition at the agent level:
+/// - `Off`: every tool is a direct call and `execute` is not exposed.
+/// - `Hybrid`: OpenCode base Code Mode. Core tools stay direct; the long-tail
+///   catalog is callable only from inside `execute`.
+/// - `Only`: OpenCode's execute-only full surface. Core tools move into the
+///   catalog and `glob`/`grep` are hidden; direct calls are repaired into a
+///   one-call program.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CodeMode {
+    #[default]
+    Off,
+    Hybrid,
+    Only,
+}
+
+impl CodeMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "disabled" => Some(Self::Off),
+            "hybrid" | "both" | "preferred" => Some(Self::Hybrid),
+            "only" | "strict" => Some(Self::Only),
+            _ => None,
+        }
+    }
+
+    pub fn enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Hybrid => "hybrid",
+            Self::Only => "only",
+        }
+    }
+}
+
+/// Canonical scope for Code Mode policy. Mirrors the compatibility aliases in
+/// `stark_core::agents` (`stark-tools` cannot depend on `stark-core`), so old
+/// sessions and configs carrying a removed scope keep that scope's behavior
+/// instead of silently falling back to `Off`.
+pub fn canonical_code_mode_scope(scope: &str) -> &str {
+    match scope.trim().to_ascii_lowercase().as_str() {
+        "coder" | "dev" | "coding" | "engineer" => "developer",
+        _ => scope.trim(),
+    }
+}
+
+/// Coding workspace agents use OpenCode's base Code Mode: core tools stay
+/// direct and the long-tail catalog runs through `execute`. Every other scope
+/// keeps direct tool calls until its contract opts in.
+pub fn default_code_mode(scope: &str) -> CodeMode {
+    match canonical_code_mode_scope(scope)
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "developer" => CodeMode::Hybrid,
+        _ => CodeMode::Off,
+    }
+}
+
+/// Delivers a finished background Code Mode script as a follow-up message
+/// (`<background-result kind="codemode" ...>`). Stark-core wires the run's
+/// `on_job_done` hook here; the worker never blocks on it.
+pub type BackgroundHook = Arc<dyn Fn(String) + Send + Sync>;
+pub type AuditHook = Arc<dyn Fn(&str, &str, serde_json::Value) + Send + Sync>;
+
+/// Whether the frozen contract for this scope exposes `execute`. Guards
+/// against an agent config enabling Code Mode on a scope that has no program
+/// tool to call.
+pub fn scope_supports_code_mode(scope: &str) -> bool {
+    contract()
+        .scope_map
+        .get(&canonical_code_mode_scope(scope).to_ascii_lowercase())
+        .is_some_and(|tools| tools.iter().any(|tool| tool == "execute"))
+}
+
+/// Custom agents have no frozen contract scope. Their explicit `execute` tool
+/// is the capability marker; built-ins keep the contract-based check.
+pub fn supports_execute(scope: &str, has_execute: bool) -> bool {
+    scope_supports_code_mode(scope) || has_execute
+}
+
+/// Whether an explicit tool-name list contains the Code Mode capability.
+pub fn has_execute_tool(tools: &[String]) -> bool {
+    tools
+        .iter()
+        .any(|tool| tool.trim().eq_ignore_ascii_case("execute"))
+}
 
 #[derive(Clone)]
 pub struct ToolContext {
@@ -110,16 +216,40 @@ pub struct ToolContext {
     pub depth: u32,
     /// "read" blocks writes at dispatch; "write"/"worktree" allow them.
     pub access: String,
+    /// Agent-level Code Mode partition. `Only` hides program-capable tools
+    /// from the provider and repairs direct calls into `execute`.
+    pub code_mode: CodeMode,
+    /// OpenCode `full_codemode`: `fetch` plus `path`/`Bun` globals, script
+    /// `timeout`/`background`, and the pinned file/shell catalog.
+    pub full_codemode: bool,
+    /// True while dispatching a tool call made from inside a `execute`
+    /// program. The direct-call gate ignores program tools in this mode.
+    pub in_program: bool,
     /// MCP tools activated by `tool_search` for this run. Large MCP catalogs
     /// are deferred: only these names are sent to the provider.
     pub active_mcp: Arc<Mutex<HashSet<String>>>,
     /// Optional per-agent allowlist. `None` keeps the scope contract; `Some`
     /// is enforced both when advertising tools and at dispatch time.
     pub allowed_tools: Option<Arc<HashSet<String>>>,
+    /// Optional per-agent skill allowlist. `None` means every discovered
+    /// skill; `Some(empty)` disables skill loading even if the tool is listed.
+    pub allowed_skills: Option<Arc<HashSet<String>>>,
+    /// Optional pinned SHA-256 per skill name.
+    pub allowed_skill_hashes: Option<Arc<HashMap<String, String>>>,
     /// Optional per-agent MCP server allowlist (`["github"]`). Tool names are
     /// shaped `mcp__<server>__<tool>`.
     pub mcp_servers: Option<Arc<HashSet<String>>>,
     pub code_delta: Option<Arc<dyn Fn(stark_contract::Delta) + Send + Sync>>,
+    /// Durable, model-invisible security audit sink. Best-effort: a sink
+    /// failure must never block a tool.
+    pub audit_hook: Option<AuditHook>,
+    /// Shared Code Mode worker manager for this harness. Production runs set
+    /// this in `stark-core`; tests and one-shot contexts leave it `None` and
+    /// get a disposable worker (killed on drop).
+    pub worker_manager: Option<Arc<crate::WorkerManager>>,
+    /// Receives a finished background `execute` script as a follow-up message.
+    /// Set from the run's `on_job_done` hook; `None` in tests drops it.
+    pub background_hook: Option<BackgroundHook>,
     /// Cancels cancel-safe tools when the user stops the run. Tools that
     /// mutate files are deliberately not wrapped: Stop must never leave a
     /// half-written file. Codex kills the process group of a cancelled exec
@@ -150,10 +280,18 @@ impl ToolContext {
             mode: "build".to_string(),
             depth: 0,
             access: "write".to_string(),
+            code_mode: CodeMode::Off,
+            full_codemode: false,
+            in_program: false,
             active_mcp: Arc::new(Mutex::new(HashSet::new())),
             allowed_tools: None,
+            allowed_skills: None,
+            allowed_skill_hashes: None,
             mcp_servers: None,
             code_delta: None,
+            audit_hook: None,
+            worker_manager: None,
+            background_hook: None,
             cancel: CancellationToken::new(),
         }
     }
@@ -198,6 +336,27 @@ impl ToolContext {
         self
     }
 
+    pub fn with_code_mode(mut self, code_mode: CodeMode) -> Self {
+        self.code_mode = code_mode;
+        self
+    }
+
+    pub fn with_full_codemode(mut self, full: bool) -> Self {
+        self.full_codemode = full;
+        self
+    }
+
+    /// `Only` is OpenCode's execute-only full surface, so it implies full
+    /// even when the flag was not repeated on the context.
+    fn codemode_full(&self) -> bool {
+        self.full_codemode || matches!(self.code_mode, CodeMode::Only)
+    }
+
+    pub fn with_in_program(mut self, in_program: bool) -> Self {
+        self.in_program = in_program;
+        self
+    }
+
     pub fn with_allowed_tools(mut self, allowed: Option<Vec<String>>) -> Self {
         self.allowed_tools = allowed.map(|names| {
             Arc::new(
@@ -208,6 +367,49 @@ impl ToolContext {
             )
         });
         self
+    }
+
+    pub fn with_allowed_skills(mut self, allowed: Option<Vec<String>>) -> Self {
+        self.allowed_skills = allowed.map(|names| {
+            Arc::new(
+                names
+                    .into_iter()
+                    .map(|name| name.to_ascii_lowercase())
+                    .collect(),
+            )
+        });
+        self
+    }
+
+    pub fn with_allowed_skill_hashes(mut self, hashes: Option<BTreeMap<String, String>>) -> Self {
+        self.allowed_skill_hashes = hashes.map(|hashes| {
+            Arc::new(
+                hashes
+                    .into_iter()
+                    .map(|(name, hash)| {
+                        (
+                            name.trim().to_ascii_lowercase(),
+                            hash.trim()
+                                .trim_start_matches("sha256:")
+                                .to_ascii_lowercase(),
+                        )
+                    })
+                    .filter(|(name, hash)| !name.is_empty() && !hash.is_empty())
+                    .collect(),
+            )
+        });
+        self
+    }
+
+    pub fn with_audit_hook(mut self, hook: Option<AuditHook>) -> Self {
+        self.audit_hook = hook;
+        self
+    }
+
+    pub fn audit_event(&self, kind: &str, subject: &str, detail: serde_json::Value) {
+        if let Some(hook) = &self.audit_hook {
+            hook(kind, subject, detail);
+        }
     }
 
     pub fn with_mcp_servers(mut self, servers: Option<Vec<String>>) -> Self {
@@ -230,6 +432,20 @@ impl ToolContext {
     }
 
     fn tool_allowed(&self, name: &str) -> bool {
+        // The dispatcher is infrastructure, not an optional tool: when Code
+        // Mode is on, `tools: ["read"]` must not silently hide the only way
+        // to call `read`. Turn Code Mode off instead.
+        if name == "execute"
+            && self.code_mode.enabled()
+            && supports_execute(
+                &self.scope,
+                self.allowed_tools
+                    .as_ref()
+                    .is_some_and(|tools| tools.iter().any(|tool| tool == "execute")),
+            )
+        {
+            return true;
+        }
         // MCP tools are governed by the server allowlist, not the tool list:
         // `tools: ["read"]` + `mcp: ["github"]` must still expose GitHub tools.
         if name.starts_with("mcp__") {
@@ -257,6 +473,23 @@ impl ToolContext {
         delta: Arc<dyn Fn(stark_contract::Delta) + Send + Sync>,
     ) -> Self {
         self.code_delta = Some(delta);
+        self
+    }
+
+    /// Drop the inner-call timeline callback. Used by the implicit repair
+    /// path so an auto-wrapped direct call shows one timeline row, not two.
+    pub fn without_code_delta(mut self) -> Self {
+        self.code_delta = None;
+        self
+    }
+
+    pub fn with_background_hook(mut self, hook: Option<BackgroundHook>) -> Self {
+        self.background_hook = hook;
+        self
+    }
+
+    pub fn with_worker_manager(mut self, manager: Arc<crate::WorkerManager>) -> Self {
+        self.worker_manager = Some(manager);
         self
     }
 
@@ -350,6 +583,9 @@ pub struct ToolOutcome {
     pub exit_code: Option<i32>,
     pub plan: Option<BTreeMap<String, Vec<PlanItem>>>,
     pub children: Vec<Value>,
+    /// Structured result data for clients (file diffs, tool-call rows, …).
+    /// Never sent to the model; it rides the tool-finished delta.
+    pub metadata: Option<Value>,
     /// Failure class for harness-side repair guidance (`None` on success).
     pub class: Option<ToolErrorClass>,
 }
@@ -362,6 +598,7 @@ impl ToolOutcome {
             exit_code: None,
             plan: None,
             children: Vec::new(),
+            metadata: None,
             class: None,
         }
     }
@@ -373,6 +610,7 @@ impl ToolOutcome {
             exit_code: None,
             plan: None,
             children: Vec::new(),
+            metadata: None,
             class: None,
         }
     }
@@ -385,6 +623,7 @@ impl ToolOutcome {
             exit_code: None,
             plan: None,
             children: Vec::new(),
+            metadata: None,
             class: Some(class),
         }
     }
@@ -396,6 +635,7 @@ impl ToolOutcome {
             exit_code,
             plan: None,
             children: Vec::new(),
+            metadata: None,
             class: None,
         }
     }
@@ -412,6 +652,11 @@ impl ToolOutcome {
 
     pub fn with_children(mut self, children: Vec<Value>) -> Self {
         self.children = children;
+        self
+    }
+
+    pub fn with_metadata(mut self, metadata: Value) -> Self {
+        self.metadata = Some(metadata);
         self
     }
 }
@@ -466,13 +711,22 @@ pub fn tool_specs_for_scope(mode: &str, scope: &str) -> Vec<Value> {
 }
 
 pub fn tool_specs_for_scope_with_access(mode: &str, scope: &str, access: &str) -> Vec<Value> {
-    tool_specs_for_run(mode, scope, access, &HashSet::new(), None, None)
+    tool_specs_for_run_with_code_mode(
+        mode,
+        scope,
+        access,
+        &HashSet::new(),
+        None,
+        None,
+        CodeMode::Hybrid,
+    )
 }
 
 /// Like [`tool_specs_for_scope_with_access`] but honors MCP deferral: when a
 /// scope has more than [`MCP_EAGER_LIMIT`] MCP tools, only the ones activated
 /// by `tool_search` are sent.
-pub fn tool_specs_for_run(
+/// The unfiltered surface for a scope, before Code Mode hiding.
+fn visible_specs_for_run(
     mode: &str,
     scope: &str,
     access: &str,
@@ -480,7 +734,9 @@ pub fn tool_specs_for_run(
     allowed_tools: Option<&[String]>,
     mcp_servers: Option<&[String]>,
 ) -> Vec<Value> {
-    let scope = scope.trim().to_lowercase();
+    // Compatibility aliases ("coder", "dev", ...) resolve to the canonical
+    // built-in before the contract lookup.
+    let scope = canonical_code_mode_scope(scope.trim()).to_ascii_lowercase();
     let allowed = contract().scope_map.get(&scope);
     let agent_allowed: Option<HashSet<String>> = allowed_tools.map(|names| {
         names
@@ -497,15 +753,18 @@ pub fn tool_specs_for_run(
             .collect()
     });
     let read_only = access == "read";
-    // New v2 surfaces (developer, coder) keep the tool catalog stable across
+    // The v2 developer surface keeps the tool catalog stable across
     // plan/build for prefix-cache reuse; writes are blocked at dispatch.
     // Older scopes keep the legacy filter.
-    let plan_filter = mode == "plan" && !matches!(scope.as_str(), "developer" | "coder");
+    let plan_filter = mode == "plan" && scope.as_str() != "developer";
     let mut specs: Vec<Value> = contract()
         .tools
         .iter()
         .filter(|tool| {
-            tool.exposed
+            // A custom scope only has tools through its explicit ACL. Never
+            // fall through to the whole inventory when that ACL is missing.
+            (allowed.is_some() || agent_allowed.is_some() || scope == "agent")
+                && tool.exposed
                 && is_implemented(tool.name.as_str())
                 && allowed.is_none_or(|names| names.contains(&tool.name))
                 && agent_allowed
@@ -532,7 +791,7 @@ pub fn tool_specs_for_run(
                         && matches!(
                             tool.name.as_str(),
                             "edit_file"
-                                | "run_code"
+                                | "apply_patch"
                                 | "call_subagent"
                                 | "edit"
                                 | "spawn_agent"
@@ -645,6 +904,333 @@ pub fn tool_specs_for_run(
     }
     specs.extend(mcp_specs);
     specs
+}
+
+/// Program eligibility for built-ins and MCP tools. MCP servers opt out with
+/// `"codemode": false`.
+pub(crate) fn is_program_tool(name: &str) -> bool {
+    if name.starts_with("mcp__") {
+        mcp::is_codemode_tool(name)
+    } else {
+        is_program(name)
+    }
+}
+
+/// OpenCode tools that keep `codemode: false` in the base surface: core
+/// shell/file/search work stays direct until `full_codemode` pins it.
+fn is_codemode_catalog_tool(name: &str) -> bool {
+    is_program_tool(name) && inventory::is_codemode(name)
+}
+
+/// Whether a tool is reachable only through `execute` for the active surface.
+fn codemode_tool_is_catalog(name: &str, full: bool) -> bool {
+    if full {
+        is_program_tool(name)
+    } else {
+        is_codemode_catalog_tool(name)
+    }
+}
+
+fn mcp_server_allowed(name: &str, mcp_servers: Option<&[String]>) -> bool {
+    let Some(servers) = mcp_servers else {
+        return true;
+    };
+    let server = name
+        .trim_start_matches("mcp__")
+        .split("__")
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    servers
+        .iter()
+        .any(|allowed| allowed.trim().eq_ignore_ascii_case(&server))
+}
+
+fn spec_name(spec: &Value) -> &str {
+    spec.get("function")
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+}
+
+/// Direct provider surface. `Off` removes `execute`; `Only` hides every
+/// program-capable tool so the model must use a program; `Hybrid` keeps core
+/// tools direct and catalogs only the long tail.
+pub fn tool_specs_for_run(
+    mode: &str,
+    scope: &str,
+    access: &str,
+    active_mcp: &HashSet<String>,
+    allowed_tools: Option<&[String]>,
+    mcp_servers: Option<&[String]>,
+) -> Vec<Value> {
+    // Compatibility surface: the contract's scope map without applying an
+    // agent-level Code Mode policy. Production callers use
+    // `tool_specs_for_run_with_code_mode`.
+    tool_specs_for_run_with_code_mode(
+        mode,
+        scope,
+        access,
+        active_mcp,
+        allowed_tools,
+        mcp_servers,
+        CodeMode::Hybrid,
+    )
+}
+
+pub fn tool_specs_for_run_with_code_mode(
+    mode: &str,
+    scope: &str,
+    access: &str,
+    active_mcp: &HashSet<String>,
+    allowed_tools: Option<&[String]>,
+    mcp_servers: Option<&[String]>,
+    code_mode: CodeMode,
+) -> Vec<Value> {
+    tool_specs_for_run_with_code_mode_full(
+        mode,
+        scope,
+        access,
+        active_mcp,
+        allowed_tools,
+        mcp_servers,
+        code_mode,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn tool_specs_for_run_with_code_mode_full(
+    mode: &str,
+    scope: &str,
+    access: &str,
+    active_mcp: &HashSet<String>,
+    allowed_tools: Option<&[String]>,
+    mcp_servers: Option<&[String]>,
+    code_mode: CodeMode,
+    full: bool,
+) -> Vec<Value> {
+    // OpenCode enables Code Mode only where `execute` is reachable. Without
+    // it, every tool (including catalog tools) stays direct.
+    let code_mode_enabled = code_mode.enabled();
+    let explicit_execute = allowed_tools.is_some_and(has_execute_tool);
+    let partition = code_mode_enabled && supports_execute(scope, explicit_execute);
+    // `Only` is the execute-only full surface; `Hybrid` is the base surface
+    // unless `full_codemode` promotes it.
+    let full = partition && (full || matches!(code_mode, CodeMode::Only));
+    let mut specs =
+        visible_specs_for_run(mode, scope, access, active_mcp, allowed_tools, mcp_servers);
+    if full {
+        // OpenCode `fullCodeModeHidden`: programs search and fetch through
+        // shell and the `fetch` global, so these only add noise.
+        specs.retain(|spec| !matches!(spec_name(spec), "glob" | "grep" | "webfetch"));
+    }
+    if partition {
+        match code_mode {
+            CodeMode::Off => {}
+            CodeMode::Only => specs.retain(|spec| !is_program_tool(spec_name(spec))),
+            CodeMode::Hybrid => {
+                if full {
+                    specs.retain(|spec| !is_program_tool(spec_name(spec)));
+                } else {
+                    // Base Code Mode: core tools stay direct; only the
+                    // long-tail catalog moves behind `execute`.
+                    specs.retain(|spec| !is_codemode_catalog_tool(spec_name(spec)));
+                }
+            }
+        }
+        specs.retain(|spec| spec_name(spec) != "execute");
+        specs.push(codemode::execute_spec(full));
+    } else {
+        // No `execute` contract for this scope: every tool stays direct.
+        specs.retain(|spec| spec_name(spec) != "execute");
+    }
+    // OpenCode appends the Code Mode tool last so the direct tool prefix stays
+    // stable and the dispatcher is visually separate.
+    if let Some(index) = specs.iter().position(|spec| spec_name(spec) == "execute") {
+        let execute = specs.remove(index);
+        specs.push(execute);
+    }
+    specs
+}
+
+/// Tools callable from inside a `execute` program. Uses the same scope,
+/// access, plan, and agent-allowlist filters as the direct surface so the
+/// advertised catalog and the dispatch gate can never disagree.
+pub fn program_specs_for_run(
+    mode: &str,
+    scope: &str,
+    access: &str,
+    allowed_tools: Option<&[String]>,
+    mcp_servers: Option<&[String]>,
+) -> Vec<Value> {
+    program_specs_for_run_full(mode, scope, access, allowed_tools, mcp_servers, false)
+}
+
+pub fn program_specs_for_run_full(
+    mode: &str,
+    scope: &str,
+    access: &str,
+    allowed_tools: Option<&[String]>,
+    mcp_servers: Option<&[String]>,
+    full: bool,
+) -> Vec<Value> {
+    let mut specs: Vec<Value> = visible_specs_for_run(
+        mode,
+        scope,
+        access,
+        &HashSet::new(),
+        allowed_tools,
+        mcp_servers,
+    )
+    .into_iter()
+    // OpenCode base Code Mode catalogs only the tools that opt in; core
+    // tools stay direct unless `full_codemode` pins them.
+    .filter(|spec| codemode_tool_is_catalog(spec_name(spec), full))
+    .filter(|spec| !full || !matches!(spec_name(spec), "glob" | "grep" | "webfetch"))
+    .map(|spec| if full { code_mode_spec(spec) } else { spec })
+    .collect();
+    // Deferred MCP tools are hidden from the direct provider list, but Code
+    // Mode keeps the whole Code Mode server catalog searchable. Read-only
+    // agents cannot call MCP at all, so the catalog avoids advertising it.
+    let mut mcp_specs = if access == "read" {
+        Vec::new()
+    } else {
+        mcp::codemode_tool_specs_for_scope(scope)
+    };
+    mcp_specs.retain(|spec| mcp_server_allowed(spec_name(spec), mcp_servers));
+    for spec in mcp_specs {
+        if !specs
+            .iter()
+            .any(|existing| spec_name(existing) == spec_name(&spec))
+        {
+            specs.push(spec);
+        }
+    }
+    specs
+}
+
+/// OpenCode `full_codemode` Code Mode overrides. The shell loses its
+/// background parameter and gets the 10-minute Code Mode foreground default.
+fn code_mode_spec(mut spec: Value) -> Value {
+    if spec_name(&spec) == "bash"
+        && let Some(parameters) = spec
+            .get_mut("function")
+            .and_then(|function| function.get_mut("parameters"))
+        && let Some(properties) = parameters
+            .get_mut("properties")
+            .and_then(Value::as_object_mut)
+    {
+        properties.remove("run_in_background");
+        if let Some(timeout) = properties.get_mut("timeoutMs") {
+            timeout["description"] = json!(
+                "Optional timeout in milliseconds (default 600000). When it expires, a foreground command moves to the background and a background command is stopped."
+            );
+        }
+        if let Some(parameters) = parameters.as_object_mut()
+            && let Some(required) = parameters.get_mut("required").and_then(Value::as_array_mut)
+        {
+            required.retain(|value| value.as_str() != Some("run_in_background"));
+        }
+    }
+    spec
+}
+
+/// Program catalog for a live tool context, honoring the agent allowlist and
+/// MCP server allowlist.
+pub fn program_specs_for_context(ctx: &ToolContext) -> Vec<Value> {
+    let allowed: Option<Vec<String>> = ctx
+        .allowed_tools
+        .as_ref()
+        .map(|names| names.iter().cloned().collect());
+    let servers: Option<Vec<String>> = ctx
+        .mcp_servers
+        .as_ref()
+        .map(|names| names.iter().cloned().collect());
+    program_specs_for_run_full(
+        &ctx.mode,
+        &ctx.scope,
+        &ctx.access,
+        allowed.as_deref(),
+        servers.as_deref(),
+        ctx.codemode_full(),
+    )
+}
+
+/// Per-chat Code Mode instruction observation: the frozen epoch baseline for
+/// the system prompt plus, when the catalog changed, the chronological update
+/// OpenCode stores as a system message. Persisted under
+/// `.deep_agents/codemode/instructions`.
+#[allow(clippy::too_many_arguments)]
+pub fn render_code_mode_instructions_for_chat(
+    harness_root: &std::path::Path,
+    chat_id: &str,
+    mode: &str,
+    scope: &str,
+    access: &str,
+    allowed_tools: Option<&[String]>,
+    mcp_servers: Option<&[String]>,
+    full: bool,
+) -> CodeModeInstructions {
+    let specs = program_specs_for_run_full(mode, scope, access, allowed_tools, mcp_servers, full);
+    let inventory = codemode::catalog_for_specs(&specs, full);
+    codemode::instructions::render_for_chat(harness_root, chat_id, Some(&inventory))
+}
+
+/// The current Code Mode epoch baseline for rebuilding a system prompt.
+pub fn code_mode_instructions_baseline_for_chat(
+    harness_root: &std::path::Path,
+    chat_id: &str,
+) -> Option<String> {
+    codemode::instructions::baseline_for_chat(harness_root, chat_id)
+}
+
+/// OpenCode `InstructionState.advanceEpoch` after a completed compaction.
+pub fn rebase_code_mode_instructions_for_chat(harness_root: &std::path::Path, chat_id: &str) {
+    codemode::instructions::rebase_for_chat(harness_root, chat_id);
+}
+
+/// OpenCode's `removed` observation when Code Mode is unavailable for this
+/// chat's scope or agent.
+pub fn remove_code_mode_instructions_for_chat(
+    harness_root: &std::path::Path,
+    chat_id: &str,
+) -> CodeModeInstructions {
+    codemode::instructions::render_for_chat(harness_root, chat_id, None)
+}
+
+/// Catalog text injected into the system prompt. Mirrors OpenCode v2's
+/// `# Code Mode` section: direct tools are named only by exclusion, and the
+/// complete list carries exact signatures. Signatures are rendered by the
+/// OpenCode `tool-schema` port (`codemode::schema`), so prompt bytes match
+/// the worker runtime's catalog.
+pub fn render_code_mode_catalog(
+    mode: &str,
+    scope: &str,
+    access: &str,
+    allowed_tools: Option<&[String]>,
+    mcp_servers: Option<&[String]>,
+) -> String {
+    render_code_mode_catalog_full(mode, scope, access, allowed_tools, mcp_servers, false)
+}
+
+pub fn render_code_mode_catalog_full(
+    mode: &str,
+    scope: &str,
+    access: &str,
+    allowed_tools: Option<&[String]>,
+    mcp_servers: Option<&[String]>,
+    full: bool,
+) -> String {
+    let specs = program_specs_for_run_full(mode, scope, access, allowed_tools, mcp_servers, full);
+    codemode::render_catalog_for_specs(&specs, full)
+}
+
+/// `tools.name(...)` / `tools.ns.name(...)` / `tools["odd-name"](...)`.
+/// Dotted program paths render per OpenCode `toolExpression` (with the
+/// `tools` prefix included).
+pub fn code_mode_tool_expression(name: &str) -> String {
+    codemode::schema::tool_expression(&codemode::to_program_name(name))
 }
 
 pub fn plan_mode_denial(mode: &str, name: &str, args: &Value) -> Option<String> {
@@ -831,8 +1417,30 @@ fn argument_matches(value: &Value, kind: &str) -> bool {
     }
 }
 
+/// OpenCode v2 behavior: a direct call to a Code Mode tool still runs, but
+/// inside an implicit one-call program. The result carries a repair note so
+/// the next turn uses `execute`. Inner timeline deltas are suppressed so the
+/// transcript shows one tool row, not two.
+async fn repair_direct_program_call(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcome {
+    let args_json = serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string());
+    let expression = code_mode_tool_expression(name);
+    let code = format!("return await {expression}({args_json});");
+    let inner = ctx.clone().with_in_program(true).without_code_delta();
+    let outcome = codemode::handle(&inner, &json!({"code": code})).await;
+    let mut content = format!(
+        "<tool-repair>{name} is a Code Mode tool, so this ran inside execute as {expression}(input). Call it there next time.</tool-repair>\n\n"
+    );
+    content.push_str(&outcome.content);
+    ToolOutcome { content, ..outcome }
+}
+
 pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcome {
     if !ctx.tool_allowed(name) {
+        ctx.audit_event(
+            "acl_denied",
+            name,
+            json!({"reason": "agent_tool_list", "scope": ctx.scope}),
+        );
         return ToolOutcome::err_class(
             ToolErrorClass::Blocked,
             format!(
@@ -864,29 +1472,53 @@ pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcom
     // Enforce the frozen scope contract at dispatch, not only when
     // advertising. Without this a hallucinated legacy name (read_file,
     // run_command, ...) skipped the v2 permission gates.
-    if !name.starts_with("mcp__")
-        && let Some(allowed) = contract().scope_map.get(&ctx.scope)
-        && !allowed.iter().any(|tool| tool == name)
-    {
-        // A name that is not in the frozen contract at all is a hallucination,
-        // not a policy denial: say so, and list what exists.
-        if contract().tool(name).is_none() {
+    if !name.starts_with("mcp__") {
+        let contract_scope = canonical_code_mode_scope(&ctx.scope).to_ascii_lowercase();
+        if let Some(allowed) = contract().scope_map.get(&contract_scope) {
+            if !allowed.iter().any(|tool| tool == name) {
+                // A name that is not in the frozen contract at all is a
+                // hallucination, not a policy denial: say so, and list what
+                // exists.
+                if contract().tool(name).is_none() {
+                    ctx.audit_event(
+                        "acl_denied",
+                        name,
+                        json!({"reason": "unknown_tool", "scope": ctx.scope}),
+                    );
+                    return ToolOutcome::err_class(
+                        ToolErrorClass::Unknown,
+                        format!(
+                            "Error: tool '{name}' does not exist in this harness. Use tool_search to find MCP tools, or one of: {}",
+                            allowed.join(", ")
+                        ),
+                    );
+                }
+                ctx.audit_event(
+                    "acl_denied",
+                    name,
+                    json!({"reason": "scope_contract", "scope": ctx.scope}),
+                );
+                return ToolOutcome::err_class(
+                    ToolErrorClass::Blocked,
+                    format!(
+                        "[BLOCKED] Tool '{name}' is not in the '{}' scope contract. Use one of: {}",
+                        ctx.scope,
+                        allowed.join(", ")
+                    ),
+                );
+            }
+        } else if ctx.scope != "agent" && ctx.allowed_tools.is_none() {
+            // Custom agents have no frozen scope entry. Without an explicit
+            // closed ACL they must fail closed, not fall through to every
+            // built-in tool.
             return ToolOutcome::err_class(
-                ToolErrorClass::Unknown,
+                ToolErrorClass::Blocked,
                 format!(
-                    "Error: tool '{name}' does not exist in this harness. Use tool_search to find MCP tools, or one of: {}",
-                    allowed.join(", ")
+                    "[BLOCKED] Agent scope '{}' has no tool contract. Refusing to run '{name}'.",
+                    ctx.scope
                 ),
             );
         }
-        return ToolOutcome::err_class(
-            ToolErrorClass::Blocked,
-            format!(
-                "[BLOCKED] Tool '{name}' is not in the '{}' scope contract. Use one of: {}",
-                ctx.scope,
-                allowed.join(", ")
-            ),
-        );
     }
     if ctx.depth > 0 && matches!(name, "ask_user_question" | "ask_user") {
         return ToolOutcome::err_class(
@@ -944,24 +1576,73 @@ pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcom
         }
     }
     if let Some(reason) = plan_mode_denial(&ctx.mode, name, args) {
+        ctx.audit_event(
+            "acl_denied",
+            name,
+            json!({"reason": "plan_mode", "scope": ctx.scope}),
+        );
         return ToolOutcome::err_class(ToolErrorClass::Blocked, reason);
     }
     if ctx.access == "read"
         && let Some(reason) = read_only_denial(name, args, ctx)
     {
+        ctx.audit_event(
+            "acl_denied",
+            name,
+            json!({"reason": "read_only", "scope": ctx.scope}),
+        );
         return ToolOutcome::err_class(ToolErrorClass::Blocked, reason);
+    }
+    if name == "execute" {
+        if ctx.in_program {
+            return ToolOutcome::err_class(
+                ToolErrorClass::Blocked,
+                "execute cannot be called from inside execute. Return a value instead.",
+            );
+        }
+        if !ctx.code_mode.enabled() {
+            ctx.audit_event(
+                "acl_denied",
+                name,
+                json!({"reason": "code_mode_disabled", "scope": ctx.scope}),
+            );
+            return ToolOutcome::err_class(
+                ToolErrorClass::Blocked,
+                "[BLOCKED] Code Mode is disabled for this agent. Call tools directly.",
+            );
+        }
+        return codemode::handle(ctx, args).await;
+    }
+    // Code Mode partition. Nested calls may only reach program-capable
+    // built-ins; direct calls to those tools in `Only` mode are repaired into
+    // a one-call program so the model gets the result and a nudge instead of
+    // a dead end.
+    if ctx.in_program && !codemode_tool_is_catalog(name, ctx.codemode_full()) {
+        return ToolOutcome::err_class(
+            ToolErrorClass::Blocked,
+            format!("{name} cannot be called from inside execute. Call it directly instead."),
+        );
+    }
+    if !ctx.in_program
+        && ctx.code_mode.enabled()
+        && scope_supports_code_mode(&ctx.scope)
+        && codemode_tool_is_catalog(name, ctx.codemode_full())
+    {
+        return repair_direct_program_call(name, args, ctx).await;
     }
     if name.starts_with("mcp__") {
         if ctx.access == "read" {
+            ctx.audit_event(
+                "acl_denied",
+                name,
+                json!({"reason": "read_only_mcp", "scope": ctx.scope}),
+            );
             return ToolOutcome::err_class(
                 ToolErrorClass::Blocked,
                 "[BLOCKED] Read-only agent cannot call MCP tools. Report findings instead.",
             );
         }
         return cancelable(ctx, name, mcp::call(name, args, ctx)).await;
-    }
-    if name == "run_code" {
-        return codemode::handle(ctx, args).await;
     }
     match name {
         "bash" => ds_shell::bash(ctx, args).await,
@@ -1128,7 +1809,7 @@ mod tests {
             Some(&[]),
         );
         let names = tool_names(&specs);
-        assert_eq!(names, vec!["read"]);
+        assert_eq!(names, vec!["read", "execute"]);
     }
 
     #[test]
@@ -1148,16 +1829,23 @@ mod tests {
 
     #[test]
     fn plan_mode_hides_write_tools_and_guards_shell() {
-        let build = tool_specs_for("build");
-        let plan = tool_specs_for("plan");
+        let build = tool_specs_for_scope("build", "developer");
+        let plan = tool_specs_for_scope("plan", "developer");
         assert!(tool_names(&build).contains(&"edit"));
         assert!(tool_names(&build).contains(&"spawn_agent"));
-        assert!(!tool_names(&plan).contains(&"edit"));
-        assert!(!tool_names(&plan).contains(&"spawn_agent"));
-        assert!(!tool_names(&plan).contains(&"run_code"));
+        // V2 coding catalogs stay stable across plan/build; dispatch carries
+        // the plan guard instead of hiding the tools.
+        assert!(tool_names(&plan).contains(&"edit"));
+        assert!(tool_names(&plan).contains(&"spawn_agent"));
+        assert!(tool_names(&plan).contains(&"execute"));
         assert!(!tool_names(&plan).contains(&"agent"));
         assert!(tool_names(&plan).contains(&"update_plan"));
         assert!(tool_names(&plan).contains(&"bash"));
+
+        // Legacy scopes keep the old plan filter.
+        let legacy_plan = tool_specs_for_scope("plan", "agent");
+        assert!(!tool_names(&legacy_plan).contains(&"edit"));
+        assert!(!tool_names(&legacy_plan).contains(&"spawn_agent"));
 
         assert!(
             plan_mode_denial(
@@ -1172,7 +1860,8 @@ mod tests {
             plan_mode_denial("plan", "bash", &json!({"command": "echo x > out.txt"})).is_some()
         );
         assert!(plan_mode_denial("build", "edit", &json!({})).is_none());
-        assert!(plan_mode_denial("plan", "run_code", &json!({"code": "return 1"})).is_some());
+        // `execute` is a dispatcher; its inner calls carry the plan guard.
+        assert!(plan_mode_denial("plan", "execute", &json!({"code": "return 1"})).is_none());
         assert!(plan_mode_denial("plan", "agent", &json!({"action": "spawn"})).is_some());
     }
 
@@ -1250,28 +1939,21 @@ mod tests {
         assert!(!names.contains(&"agent"));
         assert_eq!(
             tool_names(&tool_specs_for_scope("build", "agent")).len(),
-            47
+            46
         );
     }
 
     #[test]
-    fn coder_scope_is_developer_plus_run_code() {
+    fn developer_scope_keeps_code_mode_in_plan_mode() {
         let developer_specs = tool_specs_for_scope("build", "developer");
         let developer: std::collections::BTreeSet<&str> =
             tool_names(&developer_specs).into_iter().collect();
-        let coder_specs = tool_specs_for_scope("build", "coder");
-        let coder: std::collections::BTreeSet<&str> =
-            tool_names(&coder_specs).into_iter().collect();
-        assert_eq!(developer.len(), 15);
-        assert_eq!(coder.len(), 16);
-        assert!(coder.contains("run_code"));
-        assert!(!developer.contains("run_code"));
-        let extra: Vec<&&str> = coder.difference(&developer).collect();
-        assert_eq!(extra, vec![&"run_code"]);
-        // Plan mode keeps the catalog stable for the coder surface.
-        let plan_specs = tool_specs_for_scope("plan", "coder");
+        assert_eq!(developer.len(), 16);
+        assert!(developer.contains("execute"));
+        // Plan mode keeps the catalog stable for the coding surface.
+        let plan_specs = tool_specs_for_scope("plan", "developer");
         let plan = tool_names(&plan_specs);
-        assert!(plan.contains(&"run_code"));
+        assert!(plan.contains(&"execute"));
     }
 
     #[tokio::test]
@@ -1344,10 +2026,19 @@ mod tests {
         let read = tool_specs_for_scope_with_access("build", "explore", "read");
         let names = tool_names(&read);
         assert!(!names.contains(&"edit"));
-        assert!(!names.contains(&"run_code"));
+        assert!(!names.contains(&"execute"));
         assert!(names.contains(&"read"));
         assert!(names.contains(&"grep"));
         assert!(names.contains(&"bash"));
+
+        // A read-only coding agent keeps the dispatcher: inner reads work,
+        // inner writes hit the read-only guard.
+        let read_dev = tool_specs_for_scope_with_access("build", "developer", "read");
+        let dev_names = tool_names(&read_dev);
+        assert!(!dev_names.contains(&"edit"));
+        assert!(!dev_names.contains(&"apply_patch"));
+        assert!(dev_names.contains(&"execute"));
+        assert!(dev_names.contains(&"read"));
 
         // Orchestrator keeps its orchestration tools with read-only file
         // access: they act through server-owned state, not direct writes.
@@ -1793,7 +2484,9 @@ mod v2_surface_tests {
             "interrupt_agent",
             "close_agent",
             "update_plan",
+            "execute",
         ];
+        // execute is appended last by the surface builder.
         assert_eq!(
             names,
             expected
@@ -1809,7 +2502,6 @@ mod v2_surface_tests {
             "ask_user",
             "todo_write",
             "call_subagent",
-            "run_code",
             "agent",
             "memory",
             "working_directory",
@@ -1841,7 +2533,6 @@ mod v2_surface_tests {
         ];
         for scope in [
             "developer",
-            "coder",
             "general",
             "house",
             "dfd",
@@ -1872,5 +2563,842 @@ mod v2_surface_tests {
             .filter_map(|spec| spec["function"]["name"].as_str().map(str::to_string))
             .collect();
         assert_eq!(build, plan);
+    }
+}
+
+#[cfg(test)]
+mod code_mode_policy_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn names(specs: &[Value]) -> Vec<&str> {
+        specs
+            .iter()
+            .filter_map(|spec| spec["function"]["name"].as_str())
+            .collect()
+    }
+
+    fn coding(workspace: &std::path::Path) -> ToolContext {
+        ToolContext::new(workspace, "policy-test", Arc::new(QuestionBroker::new()))
+            .with_scope("developer")
+            .with_mode("build")
+            .with_code_mode(CodeMode::Only)
+            .with_full_codemode(true)
+    }
+
+    #[test]
+    fn only_mode_hides_program_tools_and_keeps_direct_tools() {
+        let specs = tool_specs_for_run_with_code_mode(
+            "build",
+            "developer",
+            "write",
+            &HashSet::new(),
+            None,
+            None,
+            CodeMode::Only,
+        );
+        let names = names(&specs);
+        for direct in [
+            "execute",
+            "job",
+            "update_plan",
+            "skill",
+            "ask_user_question",
+            "spawn_agent",
+        ] {
+            assert!(names.contains(&direct), "missing direct tool {direct}");
+        }
+        for nested in ["read", "edit", "apply_patch", "bash", "glob", "grep"] {
+            assert!(!names.contains(&nested), "leaked nested tool {nested}");
+        }
+    }
+
+    #[test]
+    fn hybrid_and_off_modes_keep_the_expected_surface() {
+        let hybrid = tool_specs_for_run_with_code_mode(
+            "build",
+            "developer",
+            "write",
+            &HashSet::new(),
+            None,
+            None,
+            CodeMode::Hybrid,
+        );
+        let hybrid = names(&hybrid);
+        assert!(hybrid.contains(&"read"));
+        assert!(hybrid.contains(&"execute"));
+
+        let off = tool_specs_for_run_with_code_mode(
+            "build",
+            "developer",
+            "write",
+            &HashSet::new(),
+            None,
+            None,
+            CodeMode::Off,
+        );
+        let off = names(&off);
+        assert!(off.contains(&"read"));
+        assert!(!off.contains(&"execute"));
+    }
+
+    #[test]
+    fn removed_coder_scope_keeps_developer_codemode() {
+        // Compatibility alias (mirrors `stark_core::agents`): old sessions
+        // and configs on `"coder"` must not silently fall back to `Off`.
+        assert_eq!(default_code_mode("coder"), CodeMode::Hybrid);
+        assert_eq!(default_code_mode("Coder"), CodeMode::Hybrid);
+        assert_eq!(default_code_mode("dev"), CodeMode::Hybrid);
+        assert!(scope_supports_code_mode("coder"));
+        let direct = tool_specs_for_run_with_code_mode(
+            "build",
+            "coder",
+            "write",
+            &HashSet::new(),
+            None,
+            None,
+            default_code_mode("coder"),
+        );
+        let direct_names = names(&direct);
+        assert!(direct_names.contains(&"execute"), "{direct_names:?}");
+        assert!(direct_names.contains(&"read"), "{direct_names:?}");
+    }
+
+    #[test]
+    fn per_tool_codemode_flag_matches_opencode_opt_outs() {
+        // OpenCode registers core tools with `codemode: false`; everything
+        // else program-capable opts in.
+        for core in ["bash", "read", "edit", "apply_patch", "glob", "grep"] {
+            assert!(is_program(core), "{core} must stay program-capable");
+            assert!(!is_codemode(core), "{core} must opt out of the catalog");
+        }
+        assert!(is_codemode("files_changed"));
+        assert!(!is_codemode("execute"));
+        assert!(!is_codemode("spawn_agent"));
+    }
+
+    #[test]
+    fn base_codemode_keeps_core_tools_direct_and_catalogs_only_long_tail() {
+        assert_eq!(default_code_mode("developer"), CodeMode::Hybrid);
+        let direct = tool_specs_for_run_with_code_mode(
+            "build",
+            "developer",
+            "write",
+            &HashSet::new(),
+            None,
+            None,
+            CodeMode::Hybrid,
+        );
+        let direct_names = names(&direct);
+        for core in ["bash", "read", "edit", "apply_patch", "glob", "grep"] {
+            assert!(direct_names.contains(&core), "base lost direct {core}");
+        }
+        assert!(direct_names.contains(&"execute"));
+        let execute = direct
+            .iter()
+            .find(|spec| spec["function"]["name"] == "execute")
+            .expect("execute");
+        let properties = execute
+            .pointer("/function/parameters/properties")
+            .expect("execute properties");
+        assert!(properties.get("timeout").is_none());
+        assert!(properties.get("background").is_none());
+
+        let catalog = program_specs_for_run("build", "developer", "write", None, None);
+        let catalog_names = names(&catalog);
+        for core in ["bash", "read", "edit", "apply_patch", "glob", "grep"] {
+            assert!(
+                !catalog_names.contains(&core),
+                "base catalog leaked core {core}"
+            );
+        }
+    }
+
+    #[test]
+    fn program_catalog_matches_the_dispatch_allowlist() {
+        let catalog = program_specs_for_run_full("build", "developer", "write", None, None, true);
+        let names = names(&catalog);
+        // Full mode hides glob/grep/webfetch entirely; the rest are pinned.
+        assert_eq!(names, vec!["bash", "read", "apply_patch", "edit"]);
+        for spec in &catalog {
+            assert!(spec["function"]["description"].is_string());
+        }
+        let text = render_code_mode_catalog_full("build", "developer", "write", None, None, true);
+        assert!(text.starts_with("# Code Mode"));
+        assert!(text.contains("The catalog is complete. Do not guess tool names."));
+        assert!(text.contains("tools.read({"));
+        assert!(text.contains("file_path: string,"));
+        assert!(text.contains(": Promise<string | null>"));
+        assert!(!text.contains("tools.spawn_agent"));
+    }
+
+    #[test]
+    fn program_catalog_honors_the_agent_allowlist() {
+        let allowed = vec!["read".to_string()];
+        let catalog =
+            program_specs_for_run_full("build", "developer", "write", Some(&allowed), None, true);
+        assert_eq!(names(&catalog), vec!["read"]);
+
+        // The dispatcher is implicit: an allowlist that names only nested
+        // tools still leaves `execute` as the direct entry point.
+        let direct = tool_specs_for_run_with_code_mode(
+            "build",
+            "developer",
+            "write",
+            &HashSet::new(),
+            Some(&allowed),
+            None,
+            CodeMode::Only,
+        );
+        assert_eq!(names(&direct), vec!["execute"]);
+    }
+
+    #[tokio::test]
+    async fn direct_program_calls_are_repaired_inside_execute() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "repair me").unwrap();
+        let ctx = coding(dir.path());
+        let outcome = dispatch("read", &json!({"file_path": "a.txt"}), &ctx).await;
+        assert!(!outcome.is_error, "{}", outcome.content);
+        assert!(
+            outcome
+                .content
+                .starts_with("<tool-repair>read is a Code Mode tool"),
+            "{}",
+            outcome.content
+        );
+        assert!(outcome.content.contains("repair me"), "{}", outcome.content);
+    }
+
+    #[tokio::test]
+    async fn nested_calls_reject_direct_only_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = coding(dir.path()).with_in_program(true);
+        let outcome = dispatch(
+            "spawn_agent",
+            &json!({"task_name": "nested", "message": "x"}),
+            &ctx,
+        )
+        .await;
+        assert!(outcome.is_error, "{}", outcome.content);
+        assert!(
+            outcome
+                .content
+                .contains("cannot be called from inside execute"),
+            "{}",
+            outcome.content
+        );
+
+        let ctx = coding(dir.path());
+        let off = ctx.with_code_mode(CodeMode::Off);
+        let outcome = dispatch("execute", &json!({"code": "return 1;"}), &off).await;
+        assert!(outcome.is_error, "{}", outcome.content);
+        assert!(
+            outcome.content.contains("Code Mode is disabled"),
+            "{}",
+            outcome.content
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_mode_programs_run_reads_but_block_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "plan read").unwrap();
+        let ctx = coding(dir.path()).with_mode("plan");
+        let read = dispatch(
+            "execute",
+            &json!({"code": "return tools.read({ file_path: 'a.txt' });"}),
+            &ctx,
+        )
+        .await;
+        assert!(!read.is_error, "{}", read.content);
+        assert!(read.content.contains("plan read"), "{}", read.content);
+
+        let write = dispatch(
+            "execute",
+            &json!({"code": "return tools.edit({ file_path: 'a.txt', old_string: 'plan', new_string: 'build' });"}),
+            &ctx,
+        )
+        .await;
+        assert_eq!(
+            write.metadata.as_ref().and_then(|m| m["error"].as_bool()),
+            Some(true)
+        );
+        assert!(write.content.contains("[BLOCKED]"), "{}", write.content);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "plan read"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_programs_read_but_cannot_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "read only").unwrap();
+        let ctx = coding(dir.path()).with_access("read");
+        let read = dispatch(
+            "execute",
+            &json!({"code": "return tools.read({ file_path: 'a.txt' });"}),
+            &ctx,
+        )
+        .await;
+        assert!(!read.is_error, "{}", read.content);
+        assert!(read.content.contains("read only"), "{}", read.content);
+        assert!(
+            !read.content.contains("<tool-repair>"),
+            "nested program calls must not be repaired: {}",
+            read.content
+        );
+
+        let write = dispatch(
+            "execute",
+            &json!({"code": "return tools.edit({ file_path: 'a.txt', old_string: 'read', new_string: 'write' });"}),
+            &ctx,
+        )
+        .await;
+        assert_eq!(
+            write.metadata.as_ref().and_then(|m| m["error"].as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "read only"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_codemode_bun_and_fetch_cross_the_rust_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = crate::WorkerManager::local(dir.path());
+        let ctx = coding(dir.path())
+            .with_full_codemode(true)
+            .with_worker_manager(manager);
+        let outcome = dispatch(
+            "execute",
+            &json!({
+                "code": "await Bun.write('sub/dir/out.txt', 'hello'); const text = await Bun.file('sub/dir/out.txt').text(); const files = new Bun.Glob('**/*.txt').scanSync(); const fetched = await (await fetch('data:text/plain,hi')).text(); return { text, files, fetched };"
+            }),
+            &ctx,
+        )
+        .await;
+        assert!(!outcome.is_error, "{}", outcome.content);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("sub/dir/out.txt")).unwrap(),
+            "hello"
+        );
+        assert!(
+            outcome.content.contains("\"text\":\"hello\""),
+            "{}",
+            outcome.content
+        );
+        assert!(outcome.content.contains("out.txt"), "{}", outcome.content);
+        assert!(
+            outcome.content.contains("\"fetched\":\"hi\""),
+            "{}",
+            outcome.content
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_on_keeps_its_own_inventory_after_another_initialize() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "inventory a").unwrap();
+        let ctx_a = coding(dir.path()).with_in_program(true);
+        let defs_a = codemode::tool_defs_for_context(&ctx_a);
+        // A different session with no program tools initializes last.
+        let ctx_b = coding(dir.path())
+            .with_in_program(true)
+            .with_allowed_tools(Some(Vec::new()));
+        let defs_b = codemode::tool_defs_for_context(&ctx_b);
+        assert!(!defs_a.is_empty());
+        assert!(defs_b.is_empty());
+
+        let manager = crate::WorkerManager::local(dir.path());
+        manager.initialize(&defs_a).await.unwrap();
+        manager.initialize(&defs_b).await.unwrap();
+        let inner = manager.prepare().await.unwrap();
+        let result = manager
+            .execute_on(
+                inner,
+                "run_inventory_a",
+                &ctx_a,
+                "return await tools.read({ file_path: 'a.txt' });",
+                false,
+                &defs_a,
+            )
+            .await
+            .unwrap();
+        assert!(!result.error, "{}", result.text);
+        assert!(result.text.contains("inventory a"), "{}", result.text);
+        assert!(
+            !result.text.contains("<tool-repair>"),
+            "the other inventory's initialize must not change this call: {}",
+            result.text
+        );
+    }
+
+    #[tokio::test]
+    async fn code_mode_workers_are_isolated_per_chat() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager_a = crate::WorkerManager::for_chat(dir.path(), "chat-a");
+        let manager_b = crate::WorkerManager::for_chat(dir.path(), "chat-b");
+        let cleanup_a = manager_a.clone();
+        let cleanup_b = manager_b.clone();
+        assert!(!Arc::ptr_eq(&manager_a, &manager_b));
+        assert!(Arc::ptr_eq(
+            &manager_a,
+            &crate::WorkerManager::for_chat(dir.path(), "chat-a")
+        ));
+
+        let ctx_a = coding(dir.path()).with_worker_manager(manager_a);
+        let cancel = ctx_a.cancel.clone();
+        let blocking = tokio::spawn(async move {
+            dispatch(
+                "execute",
+                &json!({"code": "for (;;) {}", "timeout": 600_000}),
+                &ctx_a,
+            )
+            .await
+        });
+        // Let A start its synchronous loop before testing B.
+        tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+
+        // Chat B must keep working while A is stuck.
+        let ctx_b = coding(dir.path()).with_worker_manager(manager_b);
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            dispatch("execute", &json!({"code": "return 2"}), &ctx_b),
+        )
+        .await
+        .expect("chat B must not wait on chat A");
+        assert!(!out.is_error, "{}", out.content);
+
+        cancel.cancel();
+        let out = tokio::time::timeout(std::time::Duration::from_secs(15), blocking)
+            .await
+            .expect("chat A cancel must not hang")
+            .unwrap();
+        assert_eq!(out.class, Some(ToolErrorClass::Cancelled));
+        cleanup_a.shutdown().await;
+        cleanup_b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn execute_short_circuits_an_already_cancelled_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let ctx = coding(dir.path()).with_cancel(cancel);
+        let out = dispatch("execute", &json!({"code": "return 1"}), &ctx).await;
+        assert!(out.is_error, "{}", out.content);
+        assert_eq!(
+            out.class,
+            Some(ToolErrorClass::Cancelled),
+            "{}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_kills_an_unresponsive_worker_and_respawns() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = crate::WorkerManager::local(dir.path());
+        let ctx = coding(dir.path()).with_worker_manager(manager.clone());
+        let cancel = ctx.cancel.clone();
+        let started = dir.path().join("started.txt");
+        let task = tokio::spawn(async move {
+            dispatch(
+                "execute",
+                &json!({
+                    "code": "await Bun.write('started.txt', '1'); for (;;) {}",
+                    "timeout": 600_000
+                }),
+                &ctx,
+            )
+            .await
+        });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !started.is_file() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the program never reached its loop"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let cancelled_at = tokio::time::Instant::now();
+        cancel.cancel();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(15), task)
+            .await
+            .expect("cancel must not hang on a synchronous program")
+            .unwrap();
+        assert!(outcome.is_error, "{}", outcome.content);
+        assert_eq!(
+            outcome.class,
+            Some(ToolErrorClass::Cancelled),
+            "{}",
+            outcome.content
+        );
+        assert!(
+            cancelled_at.elapsed() < std::time::Duration::from_secs(12),
+            "cancel took {:?}",
+            cancelled_at.elapsed()
+        );
+
+        // The killed child must be replaced lazily, not leave a dead manager.
+        let ctx = coding(dir.path()).with_worker_manager(manager);
+        let out = dispatch("execute", &json!({"code": "return 1"}), &ctx).await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains('1'), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn execute_results_use_opencode_truncation_and_spill() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = coding(dir.path()).with_worker_manager(crate::WorkerManager::local(dir.path()));
+        let outcome = dispatch(
+            "execute",
+            &json!({
+                "code": "return Array.from({ length: 3000 }, (_, i) => 'line ' + i).join('\\n');"
+            }),
+            &ctx,
+        )
+        .await;
+        assert!(!outcome.is_error, "{}", outcome.content);
+        assert!(
+            outcome
+                .content
+                .contains("[showing lines 1-2000 of 3000; full output saved to"),
+            "{}",
+            outcome.content
+        );
+        let metadata = outcome.metadata.expect("metadata");
+        assert_eq!(metadata["truncated"], true);
+        let path = metadata["outputPath"].as_str().expect("output path");
+        let full = std::fs::read_to_string(path).unwrap();
+        assert!(full.starts_with("line 0\n"));
+        assert!(full.ends_with("line 2999"));
+    }
+
+    #[tokio::test]
+    async fn background_job_results_are_truncated_and_delivered_once() {
+        use std::sync::Mutex;
+
+        let dir = tempfile::tempdir().unwrap();
+        let notices: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured = notices.clone();
+        let ctx = coding(dir.path())
+            .with_full_codemode(true)
+            .with_worker_manager(crate::WorkerManager::local(dir.path()))
+            .with_background_hook(Some(Arc::new(move |message| {
+                captured.lock().unwrap().push(message);
+            })));
+        let outcome = dispatch(
+            "execute",
+            &json!({
+                "background": true,
+                "code": "return Array.from({ length: 3000 }, (_, i) => 'line ' + i).join('\\n');"
+            }),
+            &ctx,
+        )
+        .await;
+        assert!(!outcome.is_error, "{}", outcome.content);
+        assert!(outcome.content.contains("still running"));
+
+        let mut message = String::new();
+        for _ in 0..100 {
+            if let Some(first) = notices.lock().unwrap().first().cloned() {
+                message = first;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            message.contains("[showing lines 1-2000 of 3000; full output saved to"),
+            "{message}"
+        );
+        assert!(
+            message.contains("<background-result kind=\"codemode\""),
+            "{message}"
+        );
+
+        // The delivered row is gone; only the spill file remains.
+        let rows = std::fs::read_dir(dir.path().join(".deep_agents/codemode"))
+            .map(|entries| entries.flatten().count())
+            .unwrap_or(0);
+        assert_eq!(rows, 0, "delivered job rows left: {rows}");
+        let spill = std::fs::read_dir(dir.path().join(".deep_agents/tool-output")).unwrap();
+        assert!(
+            spill
+                .flatten()
+                .any(|entry| { entry.file_name().to_string_lossy().starts_with("tool_") })
+        );
+    }
+
+    #[tokio::test]
+    async fn foreground_timeout_moves_the_script_to_the_background() {
+        use std::sync::Mutex;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 1024];
+            let _ = socket.read(&mut buffer).await;
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await;
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let notices: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured = notices.clone();
+        let deltas: Arc<Mutex<Vec<stark_contract::Delta>>> = Arc::new(Mutex::new(Vec::new()));
+        let progress = deltas.clone();
+        let ctx = coding(dir.path())
+            .with_full_codemode(true)
+            .with_worker_manager(crate::WorkerManager::local(dir.path()))
+            .with_code_delta(Arc::new(move |delta| {
+                progress.lock().unwrap().push(delta);
+            }))
+            .with_background_hook(Some(Arc::new(move |message| {
+                captured.lock().unwrap().push(message);
+            })));
+        let outcome = dispatch(
+            "execute",
+            &json!({
+                "timeout": 50,
+                "code": format!(
+                    "const text = await (await fetch('http://{address}/')).text(); await Bun.write('late.txt', text); return text;"
+                )
+            }),
+            &ctx,
+        )
+        .await;
+        assert!(!outcome.is_error, "{}", outcome.content);
+        let job_id = outcome
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata["jobID"].as_str())
+            .expect("job id");
+        assert!(job_id.starts_with("cm_"));
+        assert!(outcome.content.contains("still running"));
+
+        let mut delivered = false;
+        for _ in 0..80 {
+            if !notices.lock().unwrap().is_empty() {
+                delivered = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(delivered, "no background notice");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("late.txt")).unwrap(),
+            "ok"
+        );
+        let message = notices.lock().unwrap().first().cloned().unwrap_or_default();
+        assert!(
+            message.contains("<background-result kind=\"codemode\""),
+            "{message}"
+        );
+        assert!(message.contains("ok"), "{message}");
+
+        let progress: Vec<stark_contract::Delta> = deltas.lock().unwrap().clone();
+        assert!(
+            progress.iter().any(|delta| {
+                delta.kind == "tool_progress"
+                    && delta
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata["toolCalls"].as_array())
+                        .is_some_and(|calls| calls.iter().any(|call| call["tool"] == "fetch"))
+            }),
+            "{progress:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_codemode_bun_writes_respect_plan_and_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = coding(dir.path())
+            .with_mode("plan")
+            .with_full_codemode(true)
+            .with_worker_manager(crate::WorkerManager::local(dir.path()));
+        let outcome = dispatch(
+            "execute",
+            &json!({"code": "await Bun.write('blocked.txt', 'no'); return 'unreachable';"}),
+            &ctx,
+        )
+        .await;
+        assert_eq!(
+            outcome
+                .metadata
+                .as_ref()
+                .and_then(|value| value["error"].as_bool()),
+            Some(true)
+        );
+        assert!(outcome.content.contains("[BLOCKED]"), "{}", outcome.content);
+        assert!(!dir.path().join("blocked.txt").exists());
+
+        let read_only = coding(dir.path())
+            .with_access("read")
+            .with_full_codemode(true)
+            .with_worker_manager(crate::WorkerManager::local(dir.path()));
+        let outcome = dispatch(
+            "execute",
+            &json!({"code": "await Bun.write('blocked.txt', 'no'); return 'unreachable';"}),
+            &read_only,
+        )
+        .await;
+        assert_eq!(
+            outcome
+                .metadata
+                .as_ref()
+                .and_then(|value| value["error"].as_bool()),
+            Some(true)
+        );
+        assert!(outcome.content.contains("Read-only"), "{}", outcome.content);
+        assert!(!dir.path().join("blocked.txt").exists());
+    }
+
+    #[test]
+    fn full_codemode_matches_the_opencode_surface() {
+        let direct = tool_specs_for_run_with_code_mode_full(
+            "build",
+            "developer",
+            "write",
+            &HashSet::new(),
+            None,
+            None,
+            CodeMode::Only,
+            true,
+        );
+        let direct_names = names(&direct);
+        assert_eq!(direct_names.last(), Some(&"execute"), "{direct_names:?}");
+        assert!(!direct_names.contains(&"read"), "{direct_names:?}");
+        assert!(!direct_names.contains(&"edit"), "{direct_names:?}");
+        assert!(!direct_names.contains(&"bash"), "{direct_names:?}");
+        assert!(!direct_names.contains(&"glob"), "{direct_names:?}");
+        assert!(!direct_names.contains(&"grep"), "{direct_names:?}");
+
+        let execute = direct
+            .iter()
+            .find(|spec| spec["function"]["name"] == "execute")
+            .expect("execute");
+        let properties = execute
+            .pointer("/function/parameters/properties")
+            .expect("execute properties");
+        assert!(properties.get("timeout").is_some());
+        assert!(properties.get("background").is_some());
+        assert!(properties.get("max_tool_calls").is_none());
+        assert!(
+            execute["function"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Bun.file")
+        );
+
+        let program = program_specs_for_run_full("build", "developer", "write", None, None, true);
+        let program_names = names(&program);
+        assert!(program_names.contains(&"read"), "{program_names:?}");
+        assert!(program_names.contains(&"edit"), "{program_names:?}");
+        assert!(program_names.contains(&"bash"), "{program_names:?}");
+        assert!(!program_names.contains(&"glob"), "{program_names:?}");
+        assert!(!program_names.contains(&"grep"), "{program_names:?}");
+        let bash = program
+            .iter()
+            .find(|spec| spec["function"]["name"] == "bash")
+            .expect("bash");
+        assert!(
+            bash.pointer("/function/parameters/properties")
+                .unwrap()
+                .get("run_in_background")
+                .is_none()
+        );
+
+        let catalog =
+            render_code_mode_catalog_full("build", "developer", "write", None, None, true);
+        assert!(catalog.contains("tools.read({"), "{catalog}");
+        assert!(
+            catalog.contains(
+                "tools.apply_patch(/** Patch text. Start with *** Begin Patch and end with *** End Patch. */ input: string): Promise<string | null>"
+            ),
+            "{catalog}"
+        );
+        assert!(!catalog.contains("tools.glob("), "{catalog}");
+        assert!(!catalog.contains("tools.grep("), "{catalog}");
+    }
+
+    #[test]
+    fn custom_scope_can_opt_into_hybrid_code_mode_with_execute() {
+        let tools = vec![
+            "read".to_string(),
+            "files_changed".to_string(),
+            "execute".to_string(),
+        ];
+        let direct = tool_specs_for_run_with_code_mode(
+            "build",
+            "backend",
+            "read",
+            &HashSet::new(),
+            Some(&tools),
+            Some(&[]),
+            CodeMode::Hybrid,
+        );
+        let direct_names = names(&direct);
+        assert!(direct_names.contains(&"read"), "{direct_names:?}");
+        assert!(direct_names.contains(&"execute"), "{direct_names:?}");
+        assert!(!direct_names.contains(&"files_changed"), "{direct_names:?}");
+        let program =
+            program_specs_for_run_full("build", "backend", "read", Some(&tools), Some(&[]), false);
+        let program_names = names(&program);
+        assert!(
+            program_names.contains(&"files_changed"),
+            "{program_names:?}"
+        );
+        assert!(!program_names.contains(&"execute"), "{program_names:?}");
+    }
+
+    #[test]
+    fn custom_scope_is_closed_by_its_acl() {
+        let tools = vec!["read".to_string(), "grep".to_string()];
+        let specs = tool_specs_for_run_with_code_mode(
+            "build",
+            "backend",
+            "read",
+            &HashSet::new(),
+            Some(&tools),
+            Some(&[]),
+            CodeMode::Off,
+        );
+        let names = names(&specs);
+        assert_eq!(names, vec!["read", "grep"]);
+        assert!(!names.contains(&"edit"));
+        // A custom scope with no explicit ACL must expose nothing, not the
+        // whole built-in inventory.
+        let none = tool_specs_for_run_with_code_mode(
+            "build",
+            "backend",
+            "write",
+            &HashSet::new(),
+            None,
+            None,
+            CodeMode::Off,
+        );
+        assert!(names_of(&none).is_empty());
+    }
+
+    fn names_of(specs: &[serde_json::Value]) -> Vec<String> {
+        specs
+            .iter()
+            .filter_map(|spec| {
+                spec.get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect()
     }
 }

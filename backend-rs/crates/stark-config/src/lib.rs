@@ -25,6 +25,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 pub const CONFIG_VERSION: u32 = 1;
+/// Agent definitions are versioned independently from the provider file. v1
+/// files remain readable; every save writes v2.
+pub const AGENT_VERSION: u32 = 2;
 pub const THINKING_LEVELS: &[&str] = &["minimal", "low", "medium", "high"];
 
 const PROVIDER_KEYS_FILE: &str = "provider_keys.json";
@@ -148,6 +151,10 @@ pub struct ModelSpec {
     pub context: Option<usize>,
     #[serde(default)]
     pub reasoning: bool,
+    /// OpenCode freeform tool formats this model accepts: `text`, `lark`,
+    /// and/or `regex`. Empty keeps JSON function tools.
+    #[serde(default)]
+    pub freeform: Vec<String>,
     /// Accepted alternative spellings (old persisted slugs, UI labels).
     #[serde(default)]
     pub aliases: Vec<String>,
@@ -242,6 +249,7 @@ impl ProvidersFile {
                             label: "DeepSeek V4.1 Flash".to_string(),
                             context: Some(131_072),
                             reasoning: true,
+                            freeform: Vec::new(),
                             aliases: vec![
                                 "deepseek/deepseek-v4.1-flash-1017".to_string(),
                                 "deepseek/deepseek-v4.1-flash".to_string(),
@@ -258,6 +266,7 @@ impl ProvidersFile {
                             label: "MiMo V2.6 Flash".to_string(),
                             context: None,
                             reasoning: true,
+                            freeform: Vec::new(),
                             aliases: vec![
                                 "xiaomi/mimo-v2.6-flash".to_string(),
                                 "mimo-v2.6-flash".to_string(),
@@ -271,6 +280,7 @@ impl ProvidersFile {
                             label: "MiMo V2.6 Pro".to_string(),
                             context: None,
                             reasoning: true,
+                            freeform: Vec::new(),
                             aliases: vec![
                                 "xiaomi/mimo-v2.6-pro".to_string(),
                                 "mimo-v2.6-pro".to_string(),
@@ -284,6 +294,7 @@ impl ProvidersFile {
                             label: "Muse Spark 1.3 Contributor".to_string(),
                             context: None,
                             reasoning: true,
+                            freeform: Vec::new(),
                             aliases: vec!["meta/muse-spark-1.3-contributor".to_string()],
                         },
                     ),
@@ -308,6 +319,7 @@ impl ProvidersFile {
                         label: "DeepSeek V4.1 Flash (OpenRouter)".to_string(),
                         context: Some(131_072),
                         reasoning: false,
+                        freeform: Vec::new(),
                         aliases: vec![
                             "deepseek/deepseek-v4.1-flash".to_string(),
                             "deepseek-v4.1-flash".to_string(),
@@ -331,6 +343,7 @@ impl ProvidersFile {
                         label: "DeepSeek Chat".to_string(),
                         context: Some(65_536),
                         reasoning: false,
+                        freeform: Vec::new(),
                         aliases: vec![],
                     },
                 )]),
@@ -351,6 +364,7 @@ impl ProvidersFile {
                         label: "DeepSeek V4.1 Flash (Command)".to_string(),
                         context: None,
                         reasoning: true,
+                        freeform: Vec::new(),
                         aliases: vec!["deepseek-v4.1-flash".to_string()],
                     },
                 )]),
@@ -493,7 +507,57 @@ impl ProvidersFile {
     }
 }
 
-/// Per-agent overrides. `null` or a missing field means inherit.
+/// Prompt selection + additive persona for an agent definition.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentPromptFile {
+    /// `coding` uses the Developer composer; `general` uses the generic
+    /// composer. `null` keeps the built-in profile (or `general` for custom).
+    pub profile: Option<String>,
+    /// Appended after the harness/safety text. It can specialize the agent but
+    /// can never remove code-enforced guards.
+    pub persona: Option<String>,
+}
+
+/// Delegation capabilities. All default to false for custom agents.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentDelegationFile {
+    /// May be selected as a `delegate` target.
+    pub delegatable: Option<bool>,
+    /// May call `delegate` / inspect delegation state.
+    pub can_delegate: Option<bool>,
+    /// May spawn durable child agents.
+    pub can_spawn: Option<bool>,
+}
+
+/// UI metadata for the agent picker.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentUiFile {
+    pub visible: Option<bool>,
+    pub order: Option<i32>,
+}
+
+/// Opt-in routing for custom agents. Empty fields match any value; non-empty
+/// path and repo lists are ANDed.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentRoutingFile {
+    #[serde(default)]
+    pub workspace_kinds: Vec<String>,
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// Normalized repository identities (`host/owner/repo`).
+    #[serde(default)]
+    pub repos: Vec<String>,
+}
+
+/// Per-agent overrides for built-ins, or a full custom definition.
+///
+/// `null` or a missing field means inherit. For custom agents the runtime
+/// closes the surface: a missing `tools` list means no tools, and missing
+/// `skills`/`mcp` means none.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AgentFile {
@@ -504,6 +568,8 @@ pub struct AgentFile {
     #[serde(default)]
     pub display: String,
     #[serde(default)]
+    pub description: String,
+    #[serde(default)]
     pub tier: String,
     /// Provider id override (must exist in providers.json).
     pub provider: Option<String>,
@@ -511,22 +577,46 @@ pub struct AgentFile {
     pub model: Option<String>,
     /// `inherit`, `none`, or minimal|low|medium|high.
     pub thinking: Option<String>,
-    /// Extra allowlist on top of the scope's tool contract. `null` = contract
-    /// default; an empty list explicitly disables all tools.
+    /// Built-ins: extra allowlist on top of the scope's tool contract.
+    /// Custom agents: the complete, closed tool list.
     pub tools: Option<Vec<String>>,
-    /// Skill names to include. `null` = all discovered skills.
+    /// Skill names to include. Built-ins: `null` = all discovered skills.
+    /// Custom: `null` = none.
     pub skills: Option<Vec<String>>,
-    /// MCP servers (`["github"]`) or null for all configured servers.
+    /// Optional pinned SHA-256 for a skill's `SKILL.md` bytes. Names are
+    /// matched case-insensitively.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub skill_hashes: BTreeMap<String, String>,
+    /// MCP servers. Built-ins: `null` = all configured servers. Custom:
+    /// `null` = none.
     pub mcp: Option<Vec<String>>,
-    /// Replaces the built-in agent preamble. Harness/tool/safety text still
-    /// applies.
+    /// Legacy v1 persona. v2 writes `prompt.persona`; when both are present
+    /// the request is rejected so there is one source of truth.
     pub system_prompt: Option<String>,
+    /// Prompt profile + persona (v2).
+    pub prompt: Option<AgentPromptFile>,
+    /// Built-ins: `read`/`write`/`worktree` must match the compiled cap.
+    /// Custom: `read` (default) or `write`.
+    pub access: Option<String>,
+    /// Extra compatibility names. Aliases are never listed as agents.
+    pub aliases: Option<Vec<String>>,
+    pub delegation: Option<AgentDelegationFile>,
+    pub ui: Option<AgentUiFile>,
+    /// Custom-agent routing. Built-ins keep compiled routing.
+    pub routing: Option<AgentRoutingFile>,
+    /// Code Mode partition: `off`, `hybrid`, or `only`. `null` inherits the
+    /// scope default.
+    pub code_mode: Option<String>,
+    /// OpenCode `full_codemode`: Bun/path globals, `timeout`/`background`
+    /// script jobs, and the pinned file/shell catalog.
+    pub full_codemode: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct EffectiveAgent {
     pub key: String,
     pub display: String,
+    pub description: String,
     pub tier: String,
     pub provider: String,
     pub provider_label: String,
@@ -538,11 +628,43 @@ pub struct EffectiveAgent {
     pub reasoning: bool,
     pub tools: Option<Vec<String>>,
     pub skills: Option<Vec<String>>,
+    pub skill_hashes: BTreeMap<String, String>,
     pub mcp: Option<Vec<String>>,
     pub system_prompt: Option<String>,
+    /// `coding` or `general`.
+    pub prompt_profile: String,
+    /// Additive persona text (v2 `prompt.persona` or legacy `system_prompt`).
+    pub persona: Option<String>,
+    /// Stable key aliases (custom agents only; built-ins come from AgentSpec).
+    pub aliases: Vec<String>,
+    /// Resolved root access: `read`, `write`, or `worktree`.
+    pub access: String,
+    /// Resolved spawned/delegated access.
+    pub access_spawned: String,
+    /// True for the eight compiled agents, false for custom definitions.
+    pub builtin: bool,
+    pub delegatable: bool,
+    pub can_delegate: bool,
+    pub can_spawn: bool,
+    pub ui_visible: bool,
+    pub ui_order: i32,
+    /// Custom-agent routing filters. Empty for built-ins unless compiled.
+    pub routing_workspace_kinds: Vec<String>,
+    pub routing_paths: Vec<String>,
+    pub routing_repos: Vec<String>,
+    /// Resolved Code Mode partition (`off`, `hybrid`, or `only`).
+    pub code_mode: Option<String>,
+    /// Resolved OpenCode `full_codemode` override. `None` inherits the scope
+    /// default (coding agents default to on).
+    pub full_codemode: Option<bool>,
+    /// OpenCode freeform formats advertised by the selected model.
+    pub freeform: Vec<String>,
     /// Environment variable names that can hold this provider's key.
     pub key_env: Vec<String>,
     pub has_key: bool,
+    /// Stable hash of the raw agent definition (built-in spec + override, or
+    /// the custom file). Empty only for legacy ad-hoc effective agents.
+    pub definition_hash: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -563,6 +685,7 @@ pub struct ModelSummary {
     pub label: String,
     pub context: Option<usize>,
     pub reasoning: bool,
+    pub freeform: Vec<String>,
     pub aliases: Vec<String>,
 }
 
@@ -580,8 +703,16 @@ pub enum ConfigError {
     NoModels(String),
     #[error("invalid thinking level '{level}' (use inherit/none/minimal/low/medium/high)")]
     InvalidThinking { level: String },
+    #[error("invalid code mode '{value}' (use off/hybrid/only)")]
+    InvalidCodeMode { value: String },
     #[error("invalid agent key '{0}' (lowercase letters, digits, '_' or '-')")]
     InvalidAgentKey(String),
+    #[error("invalid agent alias '{0}' (lowercase letters, digits, '_' or '-')")]
+    InvalidAgentAlias(String),
+    #[error("invalid access '{0}' (use read or write; worktree is for spawned built-ins)")]
+    InvalidAccess(String),
+    #[error("invalid prompt profile '{0}' (use coding or general)")]
+    InvalidPromptProfile(String),
     #[error("invalid API key: {0}")]
     InvalidProviderKey(String),
     #[error("unknown API key '{0}'")]
@@ -600,6 +731,19 @@ struct Signature {
 }
 
 impl Signature {
+    fn revision(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.providers.hash(&mut hasher);
+        self.keys.hash(&mut hasher);
+        self.agents.len().hash(&mut hasher);
+        for (key, stamp) in &self.agents {
+            key.hash(&mut hasher);
+            stamp.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
     fn read(root: &Path) -> Self {
         let dir = root.join(".deep_agents").join("config");
         let providers = file_stamp(&dir.join("providers.json"));
@@ -681,6 +825,60 @@ fn file_stamp(path: &Path) -> Option<(u64, u128)> {
     Some((metadata.len(), modified))
 }
 
+/// Normalize a git remote or repository URL to `host/owner/repo`.
+///
+/// Accepts HTTPS, SSH, `git@host:owner/repo`, and already-normalized values.
+/// Local filesystem remotes are rejected: routing identities are portable.
+pub fn normalize_repo_identity(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let bytes = raw.as_bytes();
+    if raw.starts_with('/')
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && bytes[2] == b'/')
+    {
+        return None;
+    }
+    let mut value = raw
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .to_string();
+    if let Some((_, rest)) = value.split_once("://") {
+        value = rest.to_string();
+    }
+    if let Some((user, rest)) = value.split_once('@')
+        && !user.contains('/')
+    {
+        value = rest.to_string();
+    }
+    // `git@host:owner/repo` has a colon before the first slash.
+    if !raw.contains("://")
+        && let Some((host, path)) = value.split_once(':')
+        && !host.contains('/')
+    {
+        value = format!("{host}/{path}");
+    }
+    // Drop a port from `host:port/...`.
+    if let Some((host, rest)) = value.split_once('/') {
+        let host = host.split(':').next().unwrap_or(host);
+        value = format!("{host}/{rest}");
+    }
+    let value = value
+        .trim_matches('/')
+        .trim_end_matches(".git")
+        .trim_end_matches('/')
+        .to_ascii_lowercase();
+    let parts: Vec<&str> = value.split('/').filter(|part| !part.is_empty()).collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    Some(parts.join("/"))
+}
+
 pub fn builtin_effective(tier: &str) -> EffectiveAgent {
     let providers = ProvidersFile::builtin();
     let provider_id = providers.active_id();
@@ -699,9 +897,15 @@ pub fn builtin_effective(tier: &str) -> EffectiveAgent {
         .models
         .get(&model_key)
         .is_some_and(|model| model.reasoning);
+    let freeform = provider
+        .models
+        .get(&model_key)
+        .map(|model| model.freeform.clone())
+        .unwrap_or_default();
     EffectiveAgent {
         key: "default".to_string(),
         display: "Default".to_string(),
+        description: String::new(),
         tier: tier.to_string(),
         provider: provider_id,
         provider_label: provider.label().to_string(),
@@ -713,12 +917,31 @@ pub fn builtin_effective(tier: &str) -> EffectiveAgent {
             .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("inherit"))
             .map(|value| value.to_ascii_lowercase()),
         reasoning,
+        freeform,
         tools: None,
         skills: None,
+        skill_hashes: BTreeMap::new(),
         mcp: None,
         system_prompt: None,
+        prompt_profile: "general".to_string(),
+        persona: None,
+        aliases: Vec::new(),
+        access: "read".to_string(),
+        access_spawned: "read".to_string(),
+        builtin: false,
+        delegatable: false,
+        can_delegate: false,
+        can_spawn: false,
+        ui_visible: true,
+        ui_order: 0,
+        routing_workspace_kinds: Vec::new(),
+        routing_paths: Vec::new(),
+        routing_repos: Vec::new(),
+        code_mode: None,
+        full_codemode: None,
         key_env: provider.key_names(),
         has_key: false,
+        definition_hash: String::new(),
     }
 }
 
@@ -872,6 +1095,23 @@ impl ConfigStore {
         })
     }
 
+    /// Every parsed agent file, sorted by filename key. Invalid files remain
+    /// visible here so the registry/API can report exactly what is wrong; they
+    /// are never applied to a run.
+    pub fn agent_files(&self) -> Vec<(String, AgentFile)> {
+        self.ensure_fresh();
+        self.state
+            .read()
+            .map(|state| {
+                state
+                    .agents
+                    .iter()
+                    .map(|(key, agent)| (key.clone(), agent.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn issues(&self) -> Vec<String> {
         self.ensure_fresh();
         self.state
@@ -889,14 +1129,38 @@ impl ConfigStore {
             .state
             .read()
             .map_err(|_| ConfigError::Io("config lock poisoned".to_string()))?;
-        let providers = &state.providers;
         let agent = state
             .agents
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case(key))
             .map(|(_, agent)| agent.clone())
             .unwrap_or_default();
+        Self::effective_from_state(&state, key, default_tier, &agent)
+    }
 
+    /// Resolve an unsaved draft against the live provider table. Used by
+    /// preview/save validation so the UI sees the exact effective record.
+    pub fn effective_for_file(
+        &self,
+        key: &str,
+        default_tier: &str,
+        agent: &AgentFile,
+    ) -> Result<EffectiveAgent, ConfigError> {
+        self.ensure_fresh();
+        let state = self
+            .state
+            .read()
+            .map_err(|_| ConfigError::Io("config lock poisoned".to_string()))?;
+        Self::effective_from_state(&state, key, default_tier, agent)
+    }
+
+    fn effective_from_state(
+        state: &Loaded,
+        key: &str,
+        default_tier: &str,
+        agent: &AgentFile,
+    ) -> Result<EffectiveAgent, ConfigError> {
+        let providers = &state.providers;
         let provider_id = agent
             .provider
             .as_deref()
@@ -953,11 +1217,50 @@ impl ConfigStore {
             },
         };
 
+        let freeform = provider
+            .models
+            .get(&model_key)
+            .map(|model| model.freeform.clone())
+            .unwrap_or_default();
         let key_env = provider.key_names();
         // Resolve keys from the state we already hold: calling `resolve_key`
         // here would re-enter the lock.
-        let has_key = !Self::resolve_key_from(&state, &provider_id).is_empty();
+        let has_key = !Self::resolve_key_from(state, &provider_id).is_empty();
 
+        let persona = agent
+            .prompt
+            .as_ref()
+            .and_then(|prompt| prompt.persona.clone())
+            .or_else(|| agent.system_prompt.clone())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let prompt_profile = agent
+            .prompt
+            .as_ref()
+            .and_then(|prompt| prompt.profile.as_deref())
+            .map(|value| match value.trim().to_ascii_lowercase().as_str() {
+                "plain" => "general".to_string(),
+                other => other.to_string(),
+            })
+            .unwrap_or_else(|| "general".to_string());
+        let access = agent
+            .access
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| match value.to_ascii_lowercase().as_str() {
+                "readonly" | "read-only" => "read".to_string(),
+                other => other.to_string(),
+            })
+            .unwrap_or_else(|| "read".to_string());
+        let access_spawned = if access == "read" {
+            "read".to_string()
+        } else {
+            "worktree".to_string()
+        };
+        let delegation = agent.delegation.clone().unwrap_or_default();
+        let ui = agent.ui.clone().unwrap_or_default();
+        let routing = agent.routing.clone().unwrap_or_default();
         Ok(EffectiveAgent {
             key: key.to_ascii_lowercase(),
             display: if agent.display.is_empty() {
@@ -965,6 +1268,7 @@ impl ConfigStore {
             } else {
                 agent.display.clone()
             },
+            description: agent.description.clone(),
             tier,
             provider: provider_id,
             provider_label: provider.label().to_string(),
@@ -973,12 +1277,45 @@ impl ConfigStore {
             model: model_id,
             thinking,
             reasoning,
+            freeform,
             tools: agent.tools.clone(),
             skills: agent.skills.clone(),
+            skill_hashes: agent.skill_hashes.clone(),
             mcp: agent.mcp.clone(),
             system_prompt: agent.system_prompt.clone(),
+            prompt_profile,
+            persona,
+            aliases: agent.aliases.clone().unwrap_or_default(),
+            access,
+            access_spawned,
+            builtin: false,
+            delegatable: delegation.delegatable.unwrap_or(false),
+            can_delegate: delegation.can_delegate.unwrap_or(false),
+            can_spawn: delegation.can_spawn.unwrap_or(false),
+            ui_visible: ui.visible.unwrap_or(true),
+            ui_order: ui.order.unwrap_or(0),
+            routing_workspace_kinds: routing
+                .workspace_kinds
+                .iter()
+                .map(|kind| kind.trim().to_ascii_lowercase())
+                .filter(|kind| !kind.is_empty())
+                .collect(),
+            routing_paths: routing
+                .paths
+                .iter()
+                .map(|path| path.trim().replace('\\', "/"))
+                .filter(|path| !path.is_empty())
+                .collect(),
+            routing_repos: routing
+                .repos
+                .iter()
+                .filter_map(|repo| normalize_repo_identity(repo))
+                .collect(),
+            code_mode: agent.code_mode.clone(),
+            full_codemode: agent.full_codemode,
             key_env,
             has_key,
+            definition_hash: String::new(),
         })
     }
 
@@ -1284,6 +1621,7 @@ impl ConfigStore {
                     },
                     context: model.context,
                     reasoning: model.reasoning,
+                    freeform: model.freeform.clone(),
                     aliases: model.aliases.clone(),
                 })
                 .collect();
@@ -1313,6 +1651,12 @@ impl ConfigStore {
         self.write_providers(&file)
     }
 
+    /// Validate a definition without writing it. Used by the API preview and
+    /// save paths before the registry/runtime checks run.
+    pub fn validate_agent(&self, agent: &AgentFile) -> Result<(), ConfigError> {
+        validate_agent(&self.providers(), agent)
+    }
+
     pub fn save_agent(&self, key: &str, mut agent: AgentFile) -> Result<(), ConfigError> {
         let key = key.trim().to_ascii_lowercase();
         if !valid_agent_key(&key) {
@@ -1320,9 +1664,7 @@ impl ConfigStore {
         }
         let providers = self.providers();
         agent.key = key.clone();
-        if agent.version == 0 {
-            agent.version = CONFIG_VERSION;
-        }
+        agent.version = AGENT_VERSION;
         validate_agent(&providers, &agent)?;
         let dir = self.root.join(".deep_agents").join("config").join("agents");
         std::fs::create_dir_all(&dir).map_err(|error| ConfigError::Io(error.to_string()))?;
@@ -1386,6 +1728,17 @@ impl ConfigStore {
             .read()
             .map(|state| state.has_file)
             .unwrap_or(false)
+    }
+
+    /// Cheap generation marker for caches keyed by config files. It covers
+    /// providers, agent files, and provider keys; unrelated config changes
+    /// simply invalidate once.
+    pub fn revision(&self) -> u64 {
+        self.ensure_fresh();
+        self.signature
+            .lock()
+            .map(|signature| signature.revision())
+            .unwrap_or(0)
     }
 
     pub fn root(&self) -> &Path {
@@ -1590,6 +1943,71 @@ fn validate_agent(providers: &ProvidersFile, agent: &AgentFile) -> Result<(), Co
     {
         validate_thinking(thinking)?;
     }
+    if let Some(code_mode) = agent
+        .code_mode
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        validate_code_mode(code_mode)?;
+    }
+    if let Some(access) = agent
+        .access
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        match access.to_ascii_lowercase().as_str() {
+            "read" | "readonly" | "read-only" | "write" => {}
+            _ => {
+                return Err(ConfigError::InvalidAccess(access.to_string()));
+            }
+        }
+    }
+    if let Some(prompt) = &agent.prompt {
+        if let Some(profile) = prompt
+            .profile
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            match profile.to_ascii_lowercase().as_str() {
+                "coding" | "general" | "plain" => {}
+                _ => {
+                    return Err(ConfigError::InvalidPromptProfile(profile.to_string()));
+                }
+            }
+        }
+        let persona = prompt
+            .persona
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let legacy = agent
+            .system_prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if persona.is_some() && legacy.is_some() {
+            return Err(ConfigError::Parse(
+                "use either prompt.persona or the legacy system_prompt, not both".to_string(),
+            ));
+        }
+    }
+    if let Some(aliases) = &agent.aliases {
+        let mut seen = std::collections::BTreeSet::new();
+        for alias in aliases {
+            let alias = alias.trim().to_ascii_lowercase();
+            if !valid_agent_key(&alias) {
+                return Err(ConfigError::InvalidAgentAlias(alias));
+            }
+            if !seen.insert(alias.clone()) {
+                return Err(ConfigError::InvalidAgentAlias(format!(
+                    "duplicate alias '{alias}'"
+                )));
+            }
+        }
+    }
     if let Some(model) = agent
         .model
         .as_deref()
@@ -1607,6 +2025,15 @@ fn validate_agent(providers: &ProvidersFile, agent: &AgentFile) -> Result<(), Co
         providers.resolve_model(&provider_id, model)?;
     }
     Ok(())
+}
+
+fn validate_code_mode(value: &str) -> Result<(), ConfigError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "off" | "none" | "disabled" | "hybrid" | "both" | "preferred" | "only" | "strict" => Ok(()),
+        _ => Err(ConfigError::InvalidCodeMode {
+            value: value.to_string(),
+        }),
+    }
 }
 
 fn validate_thinking(level: &str) -> Result<Option<String>, ConfigError> {
@@ -1648,6 +2075,41 @@ mod tests {
         assert_eq!(effective.model, "deepseek-v4.1-flash");
         assert_eq!(effective.thinking.as_deref(), Some("high"));
         assert!(effective.key_env.contains(&"OPENCODE_API_KEY".to_string()));
+    }
+
+    #[test]
+    fn model_freeform_capability_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join(".deep_agents/config");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(
+            config.join("providers.json"),
+            r#"{
+                "version": 1,
+                "active": "custom",
+                "providers": {
+                    "custom": {
+                        "label": "Custom",
+                        "base_url": "https://example.test/v1",
+                        "key_env": "CUSTOM_KEY",
+                        "models": {
+                            "m": {
+                                "id": "model-m",
+                                "freeform": ["text", "lark"]
+                            }
+                        },
+                        "default_model": "m"
+                    }
+                },
+                "matrix": {"custom": {"workspace": {"model": "m"}}}
+            }"#,
+        )
+        .unwrap();
+        let store = ConfigStore::open(dir.path());
+        let effective = store.effective("developer", "workspace").unwrap();
+        assert_eq!(effective.provider, "custom");
+        assert_eq!(effective.model, "model-m");
+        assert_eq!(effective.freeform, vec!["text", "lark"]);
     }
 
     #[test]
@@ -1825,6 +2287,188 @@ mod tests {
             store.effective("developer", "workspace").unwrap().provider,
             "opencode"
         );
+    }
+
+    #[test]
+    fn code_mode_round_trips_and_rejects_unknown_values() {
+        let (_dir, store) = temp_root();
+        store
+            .save_agent(
+                "developer",
+                AgentFile {
+                    code_mode: Some("only".to_string()),
+                    ..AgentFile::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .effective("developer", "workspace")
+                .unwrap()
+                .code_mode
+                .as_deref(),
+            Some("only")
+        );
+        let invalid = store.save_agent(
+            "developer",
+            AgentFile {
+                code_mode: Some("turbo".to_string()),
+                ..AgentFile::default()
+            },
+        );
+        assert!(matches!(invalid, Err(ConfigError::InvalidCodeMode { .. })));
+    }
+
+    #[test]
+    fn full_codemode_round_trips() {
+        let (_dir, store) = temp_root();
+        store
+            .save_agent(
+                "developer",
+                AgentFile {
+                    full_codemode: Some(false),
+                    ..AgentFile::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .effective("developer", "workspace")
+                .unwrap()
+                .full_codemode,
+            Some(false)
+        );
+        assert_eq!(
+            store.effective("ui", "workspace").unwrap().full_codemode,
+            None
+        );
+    }
+
+    #[test]
+    fn agent_v2_prompt_access_and_delegation_round_trip() {
+        let (dir, store) = temp_root();
+        store
+            .save_agent(
+                "developer",
+                AgentFile {
+                    display: "Dev".to_string(),
+                    access: Some("read".to_string()),
+                    prompt: Some(AgentPromptFile {
+                        profile: Some("coding".to_string()),
+                        persona: Some("Own the code.".to_string()),
+                    }),
+                    delegation: Some(AgentDelegationFile {
+                        delegatable: Some(false),
+                        can_delegate: Some(false),
+                        can_spawn: Some(false),
+                    }),
+                    ui: Some(AgentUiFile {
+                        visible: Some(false),
+                        order: Some(3),
+                    }),
+                    routing: Some(AgentRoutingFile {
+                        workspace_kinds: vec!["Coding".to_string()],
+                        paths: vec!["D:\\work\\**".to_string()],
+                        repos: vec!["git@github.com:Org/Repo.git".to_string()],
+                    }),
+                    ..AgentFile::default()
+                },
+            )
+            .unwrap();
+        let path = dir.path().join(".deep_agents/config/agents/developer.json");
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(raw["version"], 2);
+        let effective = store.effective("developer", "workspace").unwrap();
+        assert_eq!(effective.access, "read");
+        assert_eq!(effective.access_spawned, "read");
+        assert_eq!(effective.prompt_profile, "coding");
+        assert_eq!(effective.persona.as_deref(), Some("Own the code."));
+        assert!(!effective.ui_visible);
+        assert_eq!(effective.ui_order, 3);
+        assert_eq!(effective.routing_workspace_kinds, vec!["coding"]);
+        assert_eq!(effective.routing_paths, vec!["D:/work/**"]);
+        assert_eq!(effective.routing_repos, vec!["github.com/org/repo"]);
+    }
+
+    #[test]
+    fn revision_tracks_agent_file_changes() {
+        let (_dir, store) = temp_root();
+        let before = store.revision();
+        store
+            .save_agent(
+                "backend",
+                AgentFile {
+                    display: "Backend".to_string(),
+                    tools: Some(vec!["read".to_string()]),
+                    ..AgentFile::default()
+                },
+            )
+            .unwrap();
+        let after = store.revision();
+        assert_ne!(before, after);
+        assert_eq!(after, store.revision());
+    }
+
+    #[test]
+    fn repo_identities_normalize_across_url_forms() {
+        for raw in [
+            "https://github.com/Org/Repo.git",
+            "git@github.com:Org/Repo.git",
+            "ssh://git@github.com/Org/Repo",
+            "github.com/org/repo",
+            "https://github.com:8443/org/repo/",
+        ] {
+            assert_eq!(
+                normalize_repo_identity(raw).as_deref(),
+                Some("github.com/org/repo"),
+                "{raw}"
+            );
+        }
+        assert!(normalize_repo_identity("").is_none());
+        assert!(normalize_repo_identity("repo").is_none());
+        assert!(normalize_repo_identity("/home/me/repo").is_none());
+        assert!(normalize_repo_identity("C:\\work\\repo").is_none());
+    }
+
+    #[test]
+    fn agent_v1_system_prompt_maps_to_persona() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join(".deep_agents/config/agents");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(
+            config.join("developer.json"),
+            r#"{"system_prompt":"Legacy persona."}"#,
+        )
+        .unwrap();
+        let store = ConfigStore::open(dir.path());
+        let effective = store.effective("developer", "workspace").unwrap();
+        assert_eq!(effective.persona.as_deref(), Some("Legacy persona."));
+    }
+
+    #[test]
+    fn agent_rejects_two_persona_sources_and_invalid_access() {
+        let (_dir, store) = temp_root();
+        let both = store.save_agent(
+            "developer",
+            AgentFile {
+                system_prompt: Some("legacy".to_string()),
+                prompt: Some(AgentPromptFile {
+                    persona: Some("new".to_string()),
+                    ..AgentPromptFile::default()
+                }),
+                ..AgentFile::default()
+            },
+        );
+        assert!(both.is_err());
+        let access = store.save_agent(
+            "developer",
+            AgentFile {
+                access: Some("worktree".to_string()),
+                ..AgentFile::default()
+            },
+        );
+        assert!(matches!(access, Err(ConfigError::InvalidAccess(_))));
     }
 
     #[test]

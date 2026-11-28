@@ -1,0 +1,14 @@
+{
+  "type": "custom",
+  "custom": {
+    "name": "execute",
+    "description": "desc\n\nTo set the parameters below, start with a `// @options:` line holding a JSON object of them, then write `code` from the next line. Leave the line out to use the defaults.\n- `timeout` (integer): Optional time in milliseconds to wait for the script before moving it to the background (default 120000). The script keeps running in the background after that; it is never stopped. With `background: true` the call returns immediately instead.\n- `background` (boolean): Run the script in the background and return immediately with its job ID (useful for long-running work). You will be notified when it completes. DO NOT poll for completion.\nFor example:\n// @options: {\"background\": true}\n<code>",
+    "format": {
+      "type": "grammar",
+      "grammar": {
+        "syntax": "lark",
+        "definition": "start: ff_line ff_body | ff_plain\nff_line: \"// @options:\" \" \"* \"{\" \" \"* ff_pair (\" \"* \",\" \" \"* ff_pair)* \" \"* \"}\" \"\\n\"\nff_pair: \"\\\"timeout\\\"\" \" \"* \":\" \" \"* /[1-9][0-9]*/ | \"\\\"background\\\"\" \" \"* \":\" \" \"* (\"true\" | \"false\")\nff_body: /[\\s\\S]+/\nff_plain: /(?:[^\\/]|\\/[^\\/]|\\/\\/[^ ]|\\/\\/ [^@]|\\/\\/ @[^o]|\\/\\/ @o[^p]|\\/\\/ @op[^t]|\\/\\/ @opt[^i]|\\/\\/ @opti[^o]|\\/\\/ @optio[^n]|\\/\\/ @option[^s]|\\/\\/ @options[^:])[\\s\\S]*|\\/|\\/\\/|\\/\\/ |\\/\\/ @|\\/\\/ @o|\\/\\/ @op|\\/\\/ @opt|\\/\\/ @opti|\\/\\/ @optio|\\/\\/ @option|\\/\\/ @options/"
+      }
+    }
+  }
+}

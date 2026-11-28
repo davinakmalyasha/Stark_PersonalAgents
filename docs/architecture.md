@@ -114,6 +114,18 @@ State is plain Rust. Host traits (`TranscriptHost`, `CanvasHost`,
 active thread or panel without borrowing the whole app. Handlers capture stable
 IDs or keys, never row indices.
 
+### Group projects
+
+Group projects are independent SQLite databases under
+`.deep_agents/groups/<id>/.gp/state.db`. The database is metadata only; agents
+execute in the project's explicit **work folder**. A project owns member slots
+(one row per unit), a current cycle, milestones/items, a schedule/repeat anchor,
+planner state, per-run usage, and a durable message/event log. The runner is
+capacity-aware (per-slot and `max_parallel`), retries failed items, blocks the
+project when retries are exhausted, and creates a fresh plan copy for each
+repeat cycle while keeping prior cycles visible. See
+[`group-projects.md`](group-projects.md) for the lifecycle and API.
+
 ### Run transport
 
 1. `POST /api/chats/{chat_id}/run` starts a run and returns
@@ -163,19 +175,198 @@ is needed.
 
 `stark-tools/src/inventory.rs` is the source of truth for built-in tool
 metadata. `backend-rs/specs/tool-specs.json` is the frozen model-facing
-contract. Tools are grouped into scopes such as `developer`, `coder`,
+contract. Tools are grouped into scopes such as `developer`,
 `general`, `house`, `dfd`, `orchestrator`, `devops`, `explore`, and `ui`.
 
 Dispatch passes through the policy and plan guards, the question broker, the
 process manager, and MCP routing. Tool output is bounded before it reaches the
 model.
 
+### Agent registry
+
+`stark-core/src/agent_registry.rs` is the runtime source of truth. It merges
+the eight compiled `AgentSpec` seeds with custom records from
+`.deep_agents/config/agents/*.json` into one `EffectiveAgent` shape used by the
+picker, run selection, prompts, tools, access, delegation, schedules, and
+groups.
+
+- Built-ins are immutable seeds with compiled access, prompt-profile,
+  delegation, and tool caps. A config file can narrow but never widen them.
+- Custom agents have a closed tool list. Missing `tools` is an error; an
+  explicit `[]` is a talk-only agent. Omitted `skills`/`mcp` means none for
+  custom agents, not all. The per-agent skill allowlist is enforced both in
+  the prompt catalog and at the `skill` dispatch gate.
+- Invalid definitions are quarantined and reported; they are never partially
+  applied.
+- Aliases resolve at read time and are never listed. `coder` remains an alias
+  for `developer`.
+- Every run snapshots its runtime record. A chat stores its resolved
+  `agent_key`; deleting that custom agent makes the next run fail explicitly
+  instead of silently falling back to a more privileged built-in.
+- Custom agents can opt into base Code Mode with `code_mode: "hybrid"` plus
+  `execute` in their closed tool list. `execute` is the capability marker;
+  custom `only`/`full_codemode` are rejected and stay built-in Developer
+  features. Built-in Code Mode defaults are unchanged.
+- Custom routing is opt-in and only used when no explicit agent/chat identity
+  exists. A unique workspace-kind/path/repo match wins; ambiguous matches fall
+  back to the built-in heuristic with a warning. Paths are normalized absolute
+  globs: separators and Windows verbatim prefixes are canonicalized, matching
+  is case-insensitive on Windows/macOS, and short/long Windows path forms are
+  both tried. Invalid or relative rules are dropped with a warning at load
+  instead of quarantining the agent. `routing.repos` matches a normalized
+  `host/owner/repo` git remote; path and repo rules are ANDed when both exist.
+- A workspace can be pinned to an agent explicitly through
+  `PUT /api/workspaces/{id}/agent-binding`. Binding is never created
+  automatically. Precedence is explicit run agent → chat `agentKey` →
+  workspace binding → routing → built-in fallback.
+- The registry is cached by `ConfigStore::revision()` (file mtimes/sizes), so
+  the picker and a run see the same generation without parsing JSON on every
+  request. Every effective agent carries a `definition_hash`; chats store the
+  hash of their last run so a changed agent surfaces as `agent_changed`.
+- Dispatch checks the effective ACL for every non-MCP tool. An unknown scope
+  without an explicit ACL exposes nothing, not the full inventory.
+
+The builder contract is documented in `docs/agent-builder-api.md` and
+`backend-rs/specs/agent-def.schema.json`.
+
+### Code Mode
+
+The coding scope (`developer`) defaults to OpenCode's base Code Mode.
+Core tools (`bash`, `read`, `apply_patch`, `edit`, `glob`, `grep`) stay on the
+direct provider surface; the long-tail tools go into the `# Code Mode`
+catalog and are called through `execute` alongside the direct-only tools
+(`job`, `update_plan`, `skill`, `ask_user_question`, and delegation). Base
+Code Mode exposes the `fetch` global only. `full_codemode` is opt-in and
+defaults off, matching OpenCode release builds; enabling it pins the file and
+shell tools into the catalog, hides `glob`/`grep`, adds the script
+`timeout`/`background` inputs, and exposes `path` plus
+Bun's `Bun.file`/`Bun.write`/`Bun.Glob`, exactly like OpenCode's full Code
+Mode. `code_mode: "only"` is the execute-only full surface; `hybrid` is the
+base surface; `off` removes `execute`.
+
+`execute` runs the program in a Bun sidecar (`backend-rs/codemode-worker`,
+Bun + `@opencode/codemode` on psychoscript) and is a dispatcher, not a
+writer: nested calls cross back into Rust `dispatch` and pass through the same
+plan, read-only, approval, MCP, cancellation, and output-bound gates as direct
+calls. `fetch` and the Bun file APIs also cross back into Rust for
+`webfetch`/`read`/`edit`/`external_directory` approval and plan/read-only
+guards. MCP tools appear in programs under dotted paths (`github.get_issue`
+for `mcp__github__get_issue`). A direct call to a catalog-only tool is
+transparently repaired into an implicit one-call program and returns a
+`<tool-repair>` note. With `full_codemode`, foreground `execute` blocks up to
+`timeout` (default 2 minutes); slower scripts move to the background, return
+`Script cm_... is still running; ...` with a job ID, and report through
+`<background-result kind="codemode" ...>` follow-ups. OpenCode does not resume
+Code Mode programs across a server restart: a running script becomes
+`Interrupted by server restart.` and the server delivers that notice once at
+boot. Its durable row is deleted only after the notice is queued, so a crash
+before delivery produces it again instead of losing it. Workers are scoped per
+chat (idle managers are reaped, and a process cap falls back to the
+least-recently-used worker), so a synchronous program in one conversation
+cannot block or kill another. Each `execute`
+carries its own inventory key; the sidecar caches runtimes per inventory
+(OpenCode's `WeakMap<Inventory, Runtime>` equivalent) instead of letting the
+last `initialize` decide what a concurrent session sees. Because that sidecar
+outlives sessions, it retains the four most recent inventories rather than an
+unbounded set of language runtimes; this is transport-internal and never
+model-visible. Production prefers a standalone `codemode-worker` binary built
+with `bun build --compile`; Bun + source is the development fallback. The
+server reports availability/runtime in `/api/health`. A delivered
+background job is removed from memory and disk; no additional age or row cap
+is applied. Like OpenCode, a script that stops yielding is not killed by the
+two-minute foreground block; it only moves to the background. Stop is still
+reliable: the host waits two seconds for the worker to acknowledge `cancel`,
+then kills the Bun child (failing concurrent runs in that worker) and respawns
+it lazily on the next call. Built-in
+Developer config can set `code_mode` to `off`, `hybrid`, or `only`;
+`off` restores the full direct surface and removes `execute`, while
+`hybrid` keeps the base surface (core tools direct, long-tail through
+`execute`, fetch only, no script timeout/background). Custom agents may opt
+into `hybrid` by listing `execute`; their program catalog is built from the
+same closed tool ACL.
+
+The Code Mode catalog is an instruction source with OpenCode's split
+delivery. The first observation is the chat's frozen epoch baseline: it is
+rendered from the initial catalog, placed in the system prompt, and never
+rewritten. A later `CodeModeInstructions.update`/`removed` delta is rendered
+once and stored as a chronological system message, which the provider lowers
+to OpenCode's XML-escaped `<system-update>` user text (merging into an
+adjacent user message when one is last). The update precedes the user turn,
+matching `InstructionState.prepare` before input promotion. A complete-to-partial
+transition adds the `search` note; a removed tool/namespace gets OpenCode's
+removal line; re-enabling after removal restates the full catalog as an update,
+never as the baseline. A completed compaction advances the epoch like OpenCode's
+`InstructionState.advanceEpoch`: the current catalog becomes the new baseline
+and the in-memory system prompt is rebuilt for the next step, so updates that
+fell out of history are not lost.
+
+While a script runs, the worker publishes throttled `tool_progress` deltas
+(at most one per 100 ms, with a trailing update) carrying the running
+`toolCalls` rows and file diffs. The payload is OpenCode's `context.progress`
+payload; only the transport differs (Stark has a dedicated delta, OpenCode
+attaches the same data to the running tool call's state). The final result
+carries the complete rows and diffs.
+
+Every `execute` result and every background job notice passes through
+OpenCode's `ToolOutput.truncate`: at most 2,000 lines and 50 KiB of UTF-8,
+cut once at the line/byte boundary without splitting a grapheme, followed by
+the exact `[showing lines …; full output saved to …]` marker. The full text
+is spilled under `.deep_agents/tool-output/tool_<identifier>` and swept with
+OpenCode's seven-day, hourly cleanup for that directory. This is the post-tool
+stage OpenCode applies to all normalized tool results; without it a program
+returning a large array would put megabytes into history and the next provider
+request. The absolute directory is the harness data root and the identifier
+carries OpenCode's random 12-hex/14-base62 tail, so fixtures substitute exactly
+`tool-output/tool_FILE` for that one data field and byte-compare the rest of
+the marker. The save-failure variant formats the runtime's OS error text and is
+therefore not fixture-claimed across platforms.
+
+Byte parity with OpenCode v2.4.1 is fixture-proven for the Code Mode surface:
+
+- The catalog baseline, every update/removed block, the search-note
+  transition, and the `<system-update>` wrapper are generated by the real
+  OpenCode source under Bun and replayed against the Rust port
+  (`backend-rs/codemode-worker/test/opencode-parity/`).
+- `execute` and `apply_patch` custom-tool conversion is compared across every
+  freeform format combination. `apply_patch` uses OpenCode's fixed
+  `patch-grammar.txt` bytes when the model advertises Lark; text-only models
+  keep the JSON tool.
+- Freeform parse, exact `// @options:` header replay, malformed-header
+  handling, streamed JSON fragments, and function-call argument normalization
+  are compared with the real `OpenAIFreeform` helpers.
+- `ToolOutput.truncate` is compared with the real source over line, byte,
+  CRLF, and emoji/grapheme boundary cases, including the spill marker.
+
+Not all provider-envelope fields are identical, because they depend on model
+policy outside Code Mode: OpenCode computes `max_tokens` from its
+models.dev output limits and context estimate, while Stark leaves the output
+cap to the provider unless `STARK_MAX_OUTPUT_TOKENS` is set; Stark always sends
+its configured temperature, while OpenCode only sends one the selected
+model/agent sets; cache/store options follow each harness's provider layer.
+Stark omits `tool_choice`, matching OpenCode's normal requests. These fields do
+not change the Code Mode tools, messages, or results.
+
+OpenCode declares `execute` freeform (`{ type: "text", field: "code" }`) and
+uses OpenAI custom tools only when the selected model advertises a freeform
+format. Stark models can declare `"freeform": ["text", "lark"]`; the provider
+then sends `execute` as an OpenAI custom tool: plain text for `{ code }`, and
+for `{ code, timeout, background }` either unconstrained text with the
+`// @options:` first line or the exact Lark grammar when the model advertises
+`lark`. It parses custom tool calls back into the normal JSON arguments and
+replays past calls as custom calls. Models without the capability keep the JSON function
+form, exactly as OpenCode does. The Zen `deepseek-v4.1-flash` model used here
+advertises no freeform format, so it still receives the JSON function tool.
+
 ### Skills
 
 Skills are directories at `.agents/skills/<name>/SKILL.md` (workspace or
 harness level). The catalog is injected into the prompt; the model loads a
 skill with the `skill` tool. Agent configuration can restrict the visible
-catalog.
+catalog. Workspace skills are trusted instructions from the repository;
+symlinked skill directories and `SKILL.md` files are ignored in every root so
+a cloned repo cannot point at an arbitrary host file. An agent may pin a skill
+to the SHA-256 of its `SKILL.md`; a changed pinned skill is refused at
+dispatch. The preview API returns each resolved skill's source and hash.
 
 ### MCP
 
@@ -209,6 +400,12 @@ The harness root holds:
 Rollout ordinals are the durable cursor for the run log. Database snapshots,
 backups, and retention are handled by `stark-store` and `stark-tools`.
 
+Security/operations events also land in the `audit_events` table: route
+decisions, ACL and skill denials, skill loads, worker kills, and agent
+create/delete/reset. Audit rows carry keys, hashes, and reasons only — never
+prompt text or file contents. `GET /api/audit` exposes a bounded, filterable
+view, and rows older than 90 days are pruned at store open.
+
 ## Security and execution
 
 - `stark-policy` decides which commands and tools require approval.
@@ -234,6 +431,10 @@ tasks, not part of the Stark application stack.
 
 - `desktop-rune/packaging/` builds the portable, versioned Rune install and
   the updater payload.
+- The Code Mode worker is built with `bun run build` into a standalone
+  `codemode-worker` binary (`backend-rs/codemode-worker/dist/`). The server
+  discovers it next to itself, under `resources/`, or via
+  `STARK_CODEMODE_WORKER_BIN`; dev checkouts fall back to Bun + source.
 - `stark-launcher` owns `current.json`, `pending.json`, `blocked.json`, server
   lifecycle, and rollback. It is a Windows GUI-subsystem binary; the launcher,
   UI and bundled server embed the Stark icon, and the UI plus shortcuts share

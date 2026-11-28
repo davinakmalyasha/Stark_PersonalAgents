@@ -94,6 +94,7 @@ scratch/gen10_crashed_smoke/
 
 # Rust build output
 backend-rs/target/
+backend-rs/codemode-worker/dist/
 target/
 **/*.rs.bk
 

@@ -175,12 +175,12 @@ pub fn create() -> io::Result<ProcessTree> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
 
     #[cfg(windows)]
     #[test]
     fn windows_job_terminates_a_running_child() {
         use std::os::windows::io::AsRawHandle;
+        use std::time::{Duration, Instant};
 
         let tree = ProcessTree::create().expect("create job");
         let mut child = std::process::Command::new("cmd")

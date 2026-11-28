@@ -357,15 +357,21 @@ mod tests {
         ]
     }
 
+    /// Git may materialize text fixtures with CRLF on Windows. The catalog
+    /// sent to providers is always LF, so normalize the expected side.
+    fn fixture(text: &str) -> String {
+        text.replace("\r\n", "\n")
+    }
+
     #[test]
     fn catalog_prompt_matches_opencode_source() {
         let full = render(&summarize(&inventory(), 2_000));
-        assert_eq!(full, include_str!("testdata/opencode_catalog.txt"));
+        assert_eq!(full, fixture(include_str!("testdata/opencode_catalog.txt")));
 
         let partial = render(&summarize(&inventory(), 30));
         assert_eq!(
             partial,
-            include_str!("testdata/opencode_catalog_partial.txt")
+            fixture(include_str!("testdata/opencode_catalog_partial.txt"))
         );
     }
 

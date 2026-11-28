@@ -1782,6 +1782,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn routing_matches_canonical_path_for_dot_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let project = work.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(work.join("sub")).unwrap();
+        let canonical = project.canonicalize().unwrap();
+        let mut backend = custom("backend", &["read"], "read");
+        backend.routing = Some(stark_config::AgentRoutingFile {
+            workspace_kinds: vec!["coding".to_string()],
+            paths: vec![canonical.to_string_lossy().replace('\\', "/")],
+        });
+        write_agent(
+            dir.path(),
+            "backend",
+            serde_json::to_value(&backend).unwrap(),
+        );
+        let config = ConfigStore::open(dir.path());
+        let registry = AgentRegistry::load(&config, dir.path());
+        let agent = registry.get("backend").unwrap();
+        // The literal path still contains `sub/../`; only the canonical
+        // fallback matches the exact (non-glob) pattern.
+        let dotted = work.join("sub").join("..").join("project");
+        assert!(routing_matches(agent, "coding", &dotted));
+    }
+
     #[cfg(windows)]
     #[test]
     fn routing_matches_windows_case_and_separators() {

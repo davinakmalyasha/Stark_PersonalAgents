@@ -18,7 +18,7 @@ use crate::updater::UpdateEvent;
 use std::path::PathBuf;
 use std::sync::mpsc;
 
-use rune::{col, row, text, El, TextEdit};
+use rune::{col, row, text, text_input, El, TextEdit};
 
 /// Product version shown by Settings, distinct
 /// from the Rune crate version stamped into the binary.
@@ -236,6 +236,9 @@ pub struct SettingsState {
     pub update: UpdateState,
     /// Native Stark Island + voice preferences (local, not server config).
     pub live: crate::prefs::LivePrefs,
+    /// The Settings vocabulary field, edited as `term | spelling, spelling`
+    /// lines and saved to `live.vocabulary` on change.
+    pub vocabulary_edit: TextEdit,
     pub loading: bool,
     generation: u64,
     load_inbox: Option<mpsc::Receiver<LoadResult>>,
@@ -263,6 +266,7 @@ impl Default for SettingsState {
             backup_root: TextEdit::new(""),
             update: UpdateState::default(),
             live: crate::prefs::LivePrefs::default(),
+            vocabulary_edit: TextEdit::new(""),
             loading: false,
             generation: 0,
             load_inbox: None,
@@ -289,6 +293,7 @@ impl Clone for SettingsState {
             backup_root: self.backup_root.clone(),
             update: self.update.clone(),
             live: self.live.clone(),
+            vocabulary_edit: self.vocabulary_edit.clone(),
             loading: self.loading,
             generation: self.generation,
             load_inbox: None,
@@ -345,6 +350,21 @@ impl SettingsState {
         crate::prefs::save(&self.live);
     }
 
+    /// Save the Settings vocabulary field. Parsing is cheap, and an unchanged
+    /// field is not written again.
+    pub fn save_vocabulary_text(&mut self) {
+        if self.live.set_vocabulary_text(&self.vocabulary_edit.text) {
+            crate::prefs::save(&self.live);
+        }
+    }
+
+    /// Persist a boost choice; the server reads it with the next dictation.
+    pub fn set_vocabulary_boost(&mut self, boost: crate::prefs::VocabularyBoost) {
+        if self.live.set_vocabulary_boost(boost) {
+            crate::prefs::save(&self.live);
+        }
+    }
+
     /// Register/unregister the installed launcher for sign-in. A missing
     /// launcher is reported in the settings error line instead of writing a
     /// broken startup command.
@@ -361,6 +381,9 @@ impl SettingsState {
 
     /// Open and reload migration status, like `useEffect(() => load(), [isOpen])`.
     pub fn open(&mut self, host: String, port: u16) {
+        if !self.open {
+            self.vocabulary_edit = TextEdit::new(self.live.vocabulary_text());
+        }
         self.open = true;
         self.host = host;
         self.port = port;
@@ -1018,6 +1041,106 @@ fn toggle_row<S: SettingsHost + 'static>(
         )
 }
 
+/// The shared vocabulary Parakeet biases toward, and its rescoring strength.
+/// A term is one line; "sounds like" spellings follow `|` as a comma list.
+fn vocabulary_card<S: SettingsHost + 'static>(s: &SettingsState) -> El {
+    let mut boosts = row().w_full().items_center().gap(4.0);
+    for boost in crate::prefs::VocabularyBoost::ALL {
+        let selected = s.live.vocabulary_boost == boost;
+        boosts = boosts.child(
+            text(boost.label().to_string())
+                .key(format!("settings-vocabulary-boost-{}", boost.label()))
+                .role("button")
+                .focusable(true)
+                .label(format!("Vocabulary boost {}", boost.label()))
+                .px(9.0)
+                .py(4.0)
+                .radius(7.0)
+                .font(text_style(10.5, if selected { 600.0 } else { 500.0 }))
+                .color(ink(if selected { "#0a0a0d" } else { "#a1a1aa" }))
+                .fill(if selected {
+                    ink("#ffffff")
+                } else {
+                    rgba(1.0, 1.0, 1.0, 0.04)
+                })
+                .hover(rgba(1.0, 1.0, 1.0, 0.09))
+                .on_press_tx_enter(move |s: &mut S, _tx: &mut rune::Tx| {
+                    s.settings_mut().set_vocabulary_boost(boost);
+                }),
+        );
+    }
+    let count = s.live.vocabulary.len();
+    let read = count.min(64);
+    let detail = if count == 0 {
+        "One term per line. Names and jargon Parakeet should spell right; an optional `|` adds sounds-like spellings (comma-separated).".to_string()
+    } else if s.live.vocabulary_boost == crate::prefs::VocabularyBoost::Off {
+        format!(
+            "{count} {} saved; the boost is off, so Parakeet ignores them.",
+            if count == 1 { "term" } else { "terms" }
+        )
+    } else if count > read {
+        format!(
+            "{count} terms; Parakeet reads the first {read}. Add sounds-like spellings after `|`."
+        )
+    } else {
+        format!(
+            "{count} {} · applies to the next dictation. Add sounds-like spellings after `|`.",
+            if count == 1 { "term" } else { "terms" }
+        )
+    };
+    col()
+        .key("settings-vocabulary")
+        .w_full()
+        .gap(8.0)
+        .px(14.0)
+        .py(12.0)
+        .radius(12.0)
+        .fill(rgba(1.0, 1.0, 1.0, 0.02))
+        .border(1.0, rgba(1.0, 1.0, 1.0, 0.06))
+        .border_layout()
+        .child(heading("Vocabulary"))
+        .child(muted_flat(&detail))
+        .child(
+            text_input(&s.vocabulary_edit, text_style(11.0, 400.0))
+                .key("settings-vocabulary-input")
+                .w_full()
+                .min_h(88.0)
+                .px(8.0)
+                .py(6.0)
+                .radius(6.0)
+                .fill(rgba(0.0, 0.0, 0.0, 0.30))
+                .border(1.0, rgba(1.0, 1.0, 1.0, 0.10))
+                .border_layout()
+                .placeholder(
+                    "Stark\nOpenCode | open code\nKaffar | caffer",
+                    ink("#52525b"),
+                )
+                .color(ink("#e4e4e7"))
+                .caret(ink("#e4e4e7"), crate::motion::TEXT_SELECTION)
+                .focus_within_ring(
+                    1.0,
+                    -1.0,
+                    rgba(99.0 / 255.0, 102.0 / 255.0, 241.0 / 255.0, 0.60),
+                )
+                .on_edit(|s: &mut S| &mut s.settings_mut().vocabulary_edit)
+                .on_input_change(|s: &mut S, _tx: &mut rune::Tx| {
+                    s.settings_mut().save_vocabulary_text();
+                }),
+        )
+        .child(
+            row()
+                .w_full()
+                .items_center()
+                .gap(8.0)
+                .child(
+                    text("Boost".to_string())
+                        .font(text_style(10.5, 500.0))
+                        .color(ink("#71717a")),
+                )
+                .child(boosts),
+        )
+}
+
 /// Settings sheet. `width`/`height` are the window (or standalone view)
 /// bounds, so the panel uses the reference UI's viewport-relative min() caps.
 pub fn settings_sheet<S: SettingsHost + 'static>(s: &SettingsState, width: f32, height: f32) -> El {
@@ -1149,6 +1272,7 @@ pub fn settings_sheet<S: SettingsHost + 'static>(s: &SettingsState, width: f32, 
                 s.settings_mut().set_island_capture_exclusion(next);
             },
         ))
+        .child(vocabulary_card::<S>(s))
         .child(
             text("Ctrl+Space arms live mode, then toggles listening. Ctrl+Alt+S opens Stark.".to_string())
                 .w_full()

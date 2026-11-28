@@ -62,6 +62,7 @@ pub enum ServerEvent {
     Ready,
     Partial(String),
     Final(String),
+    Discarded,
     Error(String),
     Stopped,
     Ignore,
@@ -85,6 +86,7 @@ pub fn parse_event(json: &str) -> ServerEvent {
         Some("session.ready") => ServerEvent::Ready,
         Some("transcript") => ServerEvent::Partial(text_of("text")),
         Some("turn_final") => ServerEvent::Final(text_of("text")),
+        Some("turn_discarded") => ServerEvent::Discarded,
         Some("session.error") => ServerEvent::Error(text_of("error")),
         Some("session.stopped") => ServerEvent::Stopped,
         _ => ServerEvent::Ignore,
@@ -109,10 +111,30 @@ pub fn pcm16le(samples: &[f32]) -> Vec<u8> {
     bytes
 }
 
+/// The `session.start` frame: the vocabulary is read by the bundled server,
+/// which owns Parakeet, and applies to this capture's turns.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn session_start(
+    vocabulary: &[crate::prefs::VocabularyEntry],
+    boost: crate::prefs::VocabularyBoost,
+) -> String {
+    serde_json::json!({
+        "type": "session.start",
+        "vocabulary": vocabulary,
+        "vocabulary_boost": boost,
+    })
+    .to_string()
+}
+
 /// Connect + handshake + `session.start`. Returns the open socket on
 /// success; every failure is a one-line reason the caller can fall back on.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn try_open(host: &str, port: u16) -> Result<Ws, String> {
+pub fn try_open(
+    host: &str,
+    port: u16,
+    vocabulary: &[crate::prefs::VocabularyEntry],
+    boost: crate::prefs::VocabularyBoost,
+) -> Result<Ws, String> {
     let addr = (host, port)
         .to_socket_addrs()
         .map_err(|e| format!("voice link {host}:{port}: {e}"))?
@@ -129,7 +151,7 @@ pub fn try_open(host: &str, port: u16) -> Result<Ws, String> {
     // Dialogue mode: short polls instead of one blocking read.
     let _ = socket.get_ref().set_read_timeout(Some(READ_POLL));
     socket
-        .send(Message::text(r#"{"type":"session.start"}"#))
+        .send(Message::text(session_start(vocabulary, boost)))
         .map_err(|e| format!("voice link {host}:{port}: {e}"))?;
     Ok(socket)
 }
@@ -191,6 +213,9 @@ fn run_session(
                         is_final: true,
                     });
                     break;
+                }
+                ServerEvent::Discarded => {
+                    let _ = tx.send(VoiceMsg::Discarded);
                 }
                 ServerEvent::Error(message) => {
                     // Honest note (e.g. a server built without Parakeet); the
@@ -254,6 +279,20 @@ mod tests {
     }
 
     #[test]
+    fn session_start_carries_terms_spellings_and_boost() {
+        let entries = [crate::prefs::VocabularyEntry {
+            term: "OpenCode".into(),
+            sounds_like: vec!["open code".into()],
+        }];
+        let text = session_start(&entries, crate::prefs::VocabularyBoost::Strong);
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["type"], "session.start");
+        assert_eq!(value["vocabulary"][0]["term"], "OpenCode");
+        assert_eq!(value["vocabulary"][0]["sounds_like"][0], "open code");
+        assert_eq!(value["vocabulary_boost"], "strong");
+    }
+
+    #[test]
     fn server_events_map_to_the_voice_protocol() {
         assert_eq!(
             parse_event(r#"{"type":"session.ready","model":"parakeet-unified-en-0.6b"}"#),
@@ -270,6 +309,10 @@ mod tests {
         assert_eq!(
             parse_event(r#"{"type":"session.error","error":"Parakeet STT is not available"}"#),
             ServerEvent::Error("Parakeet STT is not available".to_string())
+        );
+        assert_eq!(
+            parse_event(r#"{"type":"turn_discarded","turn_id":"t1"}"#),
+            ServerEvent::Discarded
         );
         assert_eq!(
             parse_event(r#"{"type":"session.stopped"}"#),
@@ -297,10 +340,13 @@ mod tests {
                 .expect("timeout");
             let mut socket = tungstenite::accept(stream).expect("ws handshake");
             let start = socket.read().expect("session.start");
-            assert!(
-                matches!(&start, Message::Text(t) if t.as_str().contains("session.start")),
-                "expected session.start, got {start:?}"
-            );
+            let Message::Text(start) = start else {
+                panic!("expected session.start, got {start:?}");
+            };
+            let start: serde_json::Value = serde_json::from_str(start.as_str()).unwrap();
+            assert_eq!(start["type"], "session.start");
+            assert_eq!(start["vocabulary"][0]["term"], "Stark");
+            assert_eq!(start["vocabulary_boost"], "normal");
             socket
                 .send(Message::text(r#"{"type":"session.ready","model":"test"}"#))
                 .expect("ready");
@@ -336,7 +382,9 @@ mod tests {
         let (pcm_tx, pcm_rx) = std::sync::mpsc::channel();
         let (tx, rx) = std::sync::mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
-        let socket = try_open("127.0.0.1", port).expect("open voice link");
+        let prefs = crate::prefs::LivePrefs::default();
+        let socket = try_open("127.0.0.1", port, &prefs.vocabulary, prefs.vocabulary_boost)
+            .expect("open voice link");
         spawn_with(socket, pcm_rx, tx, stop).expect("spawn worker");
         // The server answers a single frame, so later sends may race the
         // worker's exit (final receipt stops the session): only the first
@@ -377,7 +425,13 @@ mod tests {
     fn unreachable_server_returns_a_reason() {
         // Port 1 is never a Stark server on this box; the failure must be a
         // string (the caller falls back), not a panic.
-        let err = try_open("127.0.0.1", 1).expect_err("must fail");
+        let err = try_open(
+            "127.0.0.1",
+            1,
+            &crate::prefs::LivePrefs::default().vocabulary,
+            crate::prefs::VocabularyBoost::Normal,
+        )
+        .expect_err("must fail");
         assert!(err.starts_with("voice link 127.0.0.1:1"), "got: {err}");
     }
 }

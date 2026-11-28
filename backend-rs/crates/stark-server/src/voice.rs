@@ -11,7 +11,7 @@ use base64::Engine;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use stark_voice::{SttService, TtsEvent, TtsService};
+use stark_voice::{SttService, TtsEvent, TtsService, Vocabulary, VocabularyBoost, VocabularyEntry};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
@@ -362,12 +362,14 @@ pub async fn voice_status_handler(State(state): State<ServerState>) -> Json<Valu
         .unwrap_or("unloaded");
     let device = stt.as_ref().map(|stt| stt.device()).unwrap_or("unloaded");
     let loaded = stt.as_ref().is_some_and(|stt| stt.is_loaded());
+    let vad = stt.as_ref().is_some_and(|stt| stt.vad_installed());
     Json(json!({
         "active": false,
         "stt_model": model,
         "stt_backend": backend,
         "stt_device": device,
         "stt_loaded": loaded,
+        "stt_vad": vad,
     }))
 }
 
@@ -400,48 +402,81 @@ pub async fn transcribe_handler(
         };
     let mut bytes = Vec::new();
     let mut extension = "wav".to_string();
+    let mut vocabulary_json = None;
+    let mut vocabulary_boost = None;
     while let Ok(Some(field)) = multipart.next_field().await {
-        if field.name() == Some("file") {
-            if let Some(name) = field.file_name()
-                && let Some(ext) = Path::new(name).extension().and_then(|e| e.to_str())
-            {
-                let safe: String = ext
-                    .chars()
-                    .filter(|ch| ch.is_ascii_alphanumeric())
-                    .take(8)
-                    .collect();
-                if !safe.is_empty() {
-                    extension = safe;
+        match field.name() {
+            Some("file") => {
+                if let Some(name) = field.file_name()
+                    && let Some(ext) = Path::new(name).extension().and_then(|e| e.to_str())
+                {
+                    let safe: String = ext
+                        .chars()
+                        .filter(|ch| ch.is_ascii_alphanumeric())
+                        .take(8)
+                        .collect();
+                    if !safe.is_empty() {
+                        extension = safe;
+                    }
+                }
+                match field.bytes().await {
+                    Ok(data) => bytes = data.to_vec(),
+                    Err(error) => {
+                        return error_json(
+                            StatusCode::BAD_REQUEST,
+                            &format!("cannot read upload: {error}"),
+                        );
+                    }
                 }
             }
-            match field.bytes().await {
-                Ok(data) => bytes = data.to_vec(),
+            Some("vocabulary") => match field.text().await {
+                Ok(text) if !text.trim().is_empty() => vocabulary_json = Some(text),
+                Ok(_) => {}
                 Err(error) => {
                     return error_json(
                         StatusCode::BAD_REQUEST,
-                        &format!("cannot read upload: {error}"),
+                        &format!("cannot read vocabulary: {error}"),
                     );
                 }
-            }
+            },
+            Some("vocabulary_boost") => match field.text().await {
+                Ok(text) if !text.trim().is_empty() => vocabulary_boost = Some(text),
+                Ok(_) => {}
+                Err(error) => {
+                    return error_json(
+                        StatusCode::BAD_REQUEST,
+                        &format!("cannot read vocabulary boost: {error}"),
+                    );
+                }
+            },
+            _ => {}
         }
     }
     if bytes.is_empty() {
         return error_json(StatusCode::BAD_REQUEST, "Empty audio file");
     }
+    let vocabulary = match vocabulary_from_fields(vocabulary_json, vocabulary_boost) {
+        Ok(vocabulary) => vocabulary,
+        Err(message) => return error_json(StatusCode::BAD_REQUEST, &message),
+    };
     let temp = std::env::temp_dir().join(format!("stark_stt_{}.{}", Uuid::new_v4(), extension));
     if let Err(error) = tokio::fs::write(&temp, &bytes).await {
         return unavailable(&format!("cannot store upload: {error}"));
     }
     let path = temp.clone();
-    let result = tokio::task::spawn_blocking(move || stt.transcribe_file(&path)).await;
+    let result = tokio::task::spawn_blocking(move || stt.transcribe_file(&path, &vocabulary)).await;
     let _ = tokio::fs::remove_file(&temp).await;
     match result {
-        Ok(Ok(text)) if !text.trim().is_empty() => {
+        Ok(Ok(Some(text))) if !text.trim().is_empty() => {
             Json(json!({"text": text.trim(), "engine": "parakeet"})).into_response()
         }
-        Ok(Ok(_)) => error_json(
+        Ok(Ok(Some(_))) => error_json(
             StatusCode::UNPROCESSABLE_ENTITY,
             "Parakeet could not transcribe the audio (empty result)",
+        ),
+        Ok(Ok(None)) => error_json(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "No speech detected in the audio",
         ),
         Ok(Err(error)) => unavailable(&format!("Parakeet ASR unavailable: {error:#}")),
         Err(error) => unavailable(&format!("Transcription task failed: {error}")),
@@ -457,6 +492,25 @@ pub async fn turn_detection_handler() -> Json<Value> {
         "min_round_ms": env_i64("TURN_MIN_ROUND_MS", 250),
         "max_round_ms": env_i64("TURN_MAX_ROUND_MS", 30000),
     }))
+}
+
+/// Build the per-request vocabulary from the optional multipart fields the
+/// app sends. A malformed list is a client error, never a silent empty bias.
+pub fn vocabulary_from_fields(
+    vocabulary_json: Option<String>,
+    boost: Option<String>,
+) -> Result<Vocabulary, String> {
+    let entries: Vec<VocabularyEntry> = match vocabulary_json {
+        Some(text) => serde_json::from_str(&text)
+            .map_err(|error| format!("vocabulary is not a valid term list: {error}"))?,
+        None => Vec::new(),
+    };
+    let boost = match boost {
+        Some(text) => serde_json::from_value::<VocabularyBoost>(Value::String(text))
+            .map_err(|error| format!("unknown vocabulary boost: {error}"))?,
+        None => VocabularyBoost::default(),
+    };
+    Ok(Vocabulary { entries, boost }.sanitized())
 }
 
 fn env_i64(name: &str, default: i64) -> i64 {
@@ -573,5 +627,24 @@ mod tests {
         // A missing bundle stays an honest error, never a panic.
         assert!(runtime.ensure_stt().is_err());
         assert!(runtime.stt().is_none());
+    }
+
+    #[test]
+    fn multipart_vocabulary_fields_become_a_sanitized_bias() {
+        let vocabulary = vocabulary_from_fields(
+            Some(r#"[" Stark ", {"term": "OpenCode", "sounds_like": ["open code"]}]"#.into()),
+            Some("strong".into()),
+        )
+        .unwrap();
+        assert_eq!(vocabulary.entries.len(), 2);
+        assert_eq!(vocabulary.entries[0].term, "Stark");
+        assert_eq!(vocabulary.entries[1].sounds_like, ["open code"]);
+        assert_eq!(vocabulary.boost, VocabularyBoost::Strong);
+    }
+
+    #[test]
+    fn a_malformed_vocabulary_is_a_client_error() {
+        assert!(vocabulary_from_fields(Some("{".into()), None).is_err());
+        assert!(vocabulary_from_fields(None, Some("loud".into())).is_err());
     }
 }

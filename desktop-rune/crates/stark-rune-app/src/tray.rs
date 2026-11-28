@@ -231,6 +231,7 @@ mod tests {
             auto_send_voice: true,
             exclude_from_capture: false,
             start_with_windows: false,
+            ..LivePrefs::default()
         };
         let labels: Vec<String> = menu(&model(), &prefs)
             .into_iter()

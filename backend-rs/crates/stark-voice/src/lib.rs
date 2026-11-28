@@ -12,4 +12,4 @@ mod service;
 
 pub use live::{LiveEvent, LiveSession};
 pub use service::{F32Backend, PocketModel, TtsEvent, TtsService, TtsStream, resolve_models_dir};
-pub use stt::{SttBackend, SttService};
+pub use stt::{SttBackend, SttService, Vocabulary, VocabularyBoost, VocabularyEntry};

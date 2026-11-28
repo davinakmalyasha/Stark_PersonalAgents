@@ -906,7 +906,7 @@ pub struct ComposerButtons<S: 'static> {
     pub model_pick: Pick<S>,
     /// Usage popover "View details" → stats modal.
     pub stats: Press<S>,
-    /// Provider pill → agents & providers modal.
+    /// Provider pill → provider keys and OpenCode Go allowance.
     pub config: Press<S>,
     /// Attach control (opens the native file dialog).
     pub attach: PressTx<S>,

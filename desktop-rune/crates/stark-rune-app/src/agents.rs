@@ -1699,7 +1699,7 @@ mod tests {
             path: format!("/ws/{id}"),
             parent_id: parent.map(str::to_string),
             scope: "ws".to_string(),
-            role: "coder".to_string(),
+            role: "developer".to_string(),
             nickname: format!("nick-{id}"),
             status: status.to_string(),
             model: "m".to_string(),

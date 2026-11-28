@@ -58,6 +58,12 @@ fn parse_stamp(raw: &str) -> Option<u64> {
     parse_rfc3339(raw)
 }
 
+/// Parse an RFC 3339 / ISO timestamp to Unix milliseconds. Public for
+/// provider allowance reset times and other small wire values.
+pub fn iso_millis(raw: &str) -> Option<u64> {
+    parse_rfc3339(raw)
+}
+
 fn parse_rfc3339(raw: &str) -> Option<u64> {
     let split = raw.find(['T', 't', ' '])?;
     let (date, timed) = raw.split_at(split);

@@ -539,6 +539,17 @@ pub struct AgentUiFile {
     pub order: Option<i32>,
 }
 
+/// Opt-in routing for custom agents. Empty fields match any value; both
+/// non-empty means both must match.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentRoutingFile {
+    #[serde(default)]
+    pub workspace_kinds: Vec<String>,
+    #[serde(default)]
+    pub paths: Vec<String>,
+}
+
 /// Per-agent overrides for built-ins, or a full custom definition.
 ///
 /// `null` or a missing field means inherit. For custom agents the runtime
@@ -584,6 +595,8 @@ pub struct AgentFile {
     pub aliases: Option<Vec<String>>,
     pub delegation: Option<AgentDelegationFile>,
     pub ui: Option<AgentUiFile>,
+    /// Custom-agent routing. Built-ins keep compiled routing.
+    pub routing: Option<AgentRoutingFile>,
     /// Code Mode partition: `off`, `hybrid`, or `only`. `null` inherits the
     /// scope default.
     pub code_mode: Option<String>,
@@ -627,6 +640,9 @@ pub struct EffectiveAgent {
     pub can_spawn: bool,
     pub ui_visible: bool,
     pub ui_order: i32,
+    /// Custom-agent routing filters. Empty for built-ins unless compiled.
+    pub routing_workspace_kinds: Vec<String>,
+    pub routing_paths: Vec<String>,
     /// Resolved Code Mode partition (`off`, `hybrid`, or `only`).
     pub code_mode: Option<String>,
     /// Resolved OpenCode `full_codemode` override. `None` inherits the scope
@@ -838,6 +854,8 @@ pub fn builtin_effective(tier: &str) -> EffectiveAgent {
         can_spawn: false,
         ui_visible: true,
         ui_order: 0,
+        routing_workspace_kinds: Vec::new(),
+        routing_paths: Vec::new(),
         code_mode: None,
         full_codemode: None,
         key_env: provider.key_names(),
@@ -1160,6 +1178,7 @@ impl ConfigStore {
         };
         let delegation = agent.delegation.clone().unwrap_or_default();
         let ui = agent.ui.clone().unwrap_or_default();
+        let routing = agent.routing.clone().unwrap_or_default();
         Ok(EffectiveAgent {
             key: key.to_ascii_lowercase(),
             display: if agent.display.is_empty() {
@@ -1192,6 +1211,18 @@ impl ConfigStore {
             can_spawn: delegation.can_spawn.unwrap_or(false),
             ui_visible: ui.visible.unwrap_or(true),
             ui_order: ui.order.unwrap_or(0),
+            routing_workspace_kinds: routing
+                .workspace_kinds
+                .iter()
+                .map(|kind| kind.trim().to_ascii_lowercase())
+                .filter(|kind| !kind.is_empty())
+                .collect(),
+            routing_paths: routing
+                .paths
+                .iter()
+                .map(|path| path.trim().replace('\\', "/"))
+                .filter(|path| !path.is_empty())
+                .collect(),
             code_mode: agent.code_mode.clone(),
             full_codemode: agent.full_codemode,
             key_env,
@@ -2235,6 +2266,10 @@ mod tests {
                         visible: Some(false),
                         order: Some(3),
                     }),
+                    routing: Some(AgentRoutingFile {
+                        workspace_kinds: vec!["Coding".to_string()],
+                        paths: vec!["D:\\work\\**".to_string()],
+                    }),
                     ..AgentFile::default()
                 },
             )
@@ -2250,6 +2285,8 @@ mod tests {
         assert_eq!(effective.persona.as_deref(), Some("Own the code."));
         assert!(!effective.ui_visible);
         assert_eq!(effective.ui_order, 3);
+        assert_eq!(effective.routing_workspace_kinds, vec!["coding"]);
+        assert_eq!(effective.routing_paths, vec!["D:/work/**"]);
     }
 
     #[test]

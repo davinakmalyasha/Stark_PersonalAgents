@@ -1511,10 +1511,16 @@ fn canvas_target(state: &ServerState, chat: &Value) -> Result<RunTarget, String>
         } else {
             "orchestrator"
         };
-        registry
-            .get(scope)
-            .cloned()
-            .unwrap_or_else(|| registry.route(scope, &workspace, &state.harness_root))
+        match registry.get(scope).cloned() {
+            Some(agent) => agent,
+            None => {
+                let decision = registry.route_decision(scope, &workspace, &state.harness_root);
+                if let Some(warning) = &decision.warning {
+                    tracing::warn!("{warning}");
+                }
+                decision.agent
+            }
+        }
     };
     let mut effective = agent.clone();
     let model = chat["model"]
@@ -2050,6 +2056,7 @@ struct StartedRun {
     chat_id: String,
     run_id: String,
     after_seq: u64,
+    route_warning: Option<String>,
 }
 
 enum StartRunError {
@@ -2158,6 +2165,7 @@ Attached files:
         state.harness_root.clone()
     };
     let registry = agent_registry(state);
+    let mut route_warning = None;
     let requested_agent = request.agent.trim();
     let agent = if !requested_agent.is_empty() {
         registry.get(requested_agent).cloned().ok_or_else(|| {
@@ -2188,7 +2196,18 @@ Attached files:
                     }),
                 )
             })?,
-            None => registry.route(&request.workspace_kind, &workspace, &state.harness_root),
+            None => {
+                let decision = registry.route_decision(
+                    &request.workspace_kind,
+                    &workspace,
+                    &state.harness_root,
+                );
+                if let Some(warning) = &decision.warning {
+                    tracing::warn!("{warning}");
+                    route_warning = Some(warning.clone());
+                }
+                decision.agent
+            }
         }
     };
     let mut effective = agent.clone();
@@ -2379,6 +2398,7 @@ Attached files:
         chat_id: started_chat_id,
         run_id,
         after_seq,
+        route_warning,
     })
 }
 
@@ -2404,6 +2424,7 @@ async fn run_command_handler(
             "chat_id": started.chat_id,
             "run_id": started.run_id,
             "after_seq": started.after_seq,
+            "route_warning": started.route_warning,
         })),
     ))
 }
@@ -4237,6 +4258,9 @@ struct ProviderRequest {
 struct AgentQuery {
     #[serde(default)]
     tier: Option<String>,
+    /// Optional project workspace used to validate workspace-local skills.
+    #[serde(default)]
+    workspace_path: Option<String>,
 }
 
 async fn models_handler(State(state): State<ServerState>) -> Json<Value> {
@@ -4744,6 +4768,16 @@ fn agent_issues(registry: &AgentRegistry, key: &str) -> Vec<String> {
         .collect()
 }
 
+fn agent_warnings(registry: &AgentRegistry, key: &str) -> Vec<String> {
+    let prefix = format!("{key}:");
+    registry
+        .warnings()
+        .iter()
+        .filter(|warning| warning.starts_with(&prefix))
+        .cloned()
+        .collect()
+}
+
 fn builtin_spec(key: &str) -> Option<stark_core::AgentSpec> {
     stark_core::workspace_agents()
         .iter()
@@ -4784,6 +4818,7 @@ async fn agents_config_handler(State(state): State<ServerState>) -> Json<Value> 
                 "configured": configured.is_some(),
                 "valid": issues.is_empty(),
                 "errors": issues,
+                "warnings": agent_warnings(&registry, spec.key),
                 "override": configured,
                 "effective": effective,
             }),
@@ -4818,6 +4853,7 @@ async fn agents_config_handler(State(state): State<ServerState>) -> Json<Value> 
                 "configured": true,
                 "valid": effective.is_some() && issues.is_empty(),
                 "errors": issues,
+                "warnings": agent_warnings(&registry, &key),
                 "override": file,
                 "effective": effective,
             }),
@@ -4827,6 +4863,7 @@ async fn agents_config_handler(State(state): State<ServerState>) -> Json<Value> 
     Json(json!({
         "agents": agents.into_iter().map(|(_, _, value)| value).collect::<Vec<_>>(),
         "issues": registry.issues(),
+        "warnings": registry.warnings(),
         "config_issues": state.config.issues(),
         "active_provider": state.config.active_provider(),
         "providers": state.config.provider_summaries(),
@@ -4836,7 +4873,8 @@ async fn agents_config_handler(State(state): State<ServerState>) -> Json<Value> 
         "capabilities": {
             "agent_builder": true,
             "custom_agents": true,
-            "custom_code_mode": false,
+            "custom_code_mode": true,
+            "custom_routing": true,
             "schema_version": 2,
         },
     }))
@@ -4881,6 +4919,7 @@ async fn agent_config_handler(
         "deletable": builtin.is_none(),
         "valid": effective.is_some() && issues.is_empty(),
         "errors": issues,
+        "warnings": agent_warnings(&registry, &canonical),
         "override": override_file,
         "effective": effective,
     })))
@@ -4889,6 +4928,7 @@ async fn agent_config_handler(
 async fn save_agent_handler(
     State(state): State<ServerState>,
     Path(key): Path<String>,
+    Query(query): Query<AgentQuery>,
     Json(agent): Json<AgentFile>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let registry = agent_registry(&state);
@@ -4896,12 +4936,19 @@ async fn save_agent_handler(
     let canonical = registry
         .canonical_key(&requested)
         .unwrap_or_else(|| requested.clone());
-    let check = validate_definition(
+    let workspace = query
+        .workspace_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
+    let check = stark_core::validate_definition_in(
         &state.config,
         &state.harness_root,
         &canonical,
         &agent,
         &registry,
+        workspace.as_deref(),
     );
     if !check.errors.is_empty() {
         return Err((
@@ -4924,11 +4971,15 @@ async fn save_agent_handler(
         })?;
     let registry = agent_registry(&state);
     let effective = registry.get(&canonical).cloned();
+    let mut warnings = check.warnings;
+    warnings.extend(agent_warnings(&registry, &canonical));
+    warnings.sort();
+    warnings.dedup();
     Ok(Json(json!({
         "ok": true,
         "key": canonical,
         "builtin": builtin_spec(&canonical).is_some(),
-        "warnings": check.warnings,
+        "warnings": warnings,
         "override": state.config.agent(&canonical),
         "effective": effective,
         "errors": effective.is_none().then(|| agent_issues(&registry, &canonical)),
@@ -5019,12 +5070,19 @@ async fn preview_agent_handler(
             Json(json!({"error": format!("unknown agent '{key}'")})),
         ));
     };
-    let check = validate_definition(
+    let workspace = if request.workspace_path.trim().is_empty() {
+        state.harness_root.clone()
+    } else {
+        PathBuf::from(request.workspace_path.trim())
+    };
+    let workspace_hint = (!request.workspace_path.trim().is_empty()).then_some(workspace.as_path());
+    let check = stark_core::validate_definition_in(
         &state.config,
         &state.harness_root,
         &canonical,
         &file,
         &registry,
+        workspace_hint,
     );
     if !check.errors.is_empty() {
         return Err((
@@ -5038,11 +5096,6 @@ async fn preview_agent_handler(
     }
     let effective = resolve_definition(&state.config, &state.harness_root, &canonical, &file)
         .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({"error": error}))))?;
-    let workspace = if request.workspace_path.trim().is_empty() {
-        state.harness_root.clone()
-    } else {
-        PathBuf::from(request.workspace_path.trim())
-    };
     let workspace_id = state
         .store
         .workspace_id_for_path(workspace.to_string_lossy().as_ref());
@@ -5090,7 +5143,7 @@ async fn preview_agent_handler(
         Vec::new()
     };
     let mut warnings = check.warnings;
-    warnings.extend(agent_issues(&registry, &canonical));
+    warnings.extend(agent_warnings(&registry, &canonical));
     Ok(Json(json!({
         "ok": true,
         "key": canonical,
@@ -5170,16 +5223,24 @@ async fn duplicate_agent_handler(
         persona: (!persona.is_empty()).then_some(persona),
     });
     file.system_prompt = None;
-    // Custom agents are direct-only, so the execute dispatcher cannot be
-    // copied from Developer.
     let read_only = source.access == "read";
+    let source_mode = source
+        .code_mode
+        .as_deref()
+        .and_then(stark_tools::CodeMode::parse)
+        .unwrap_or_default();
+    let copy_code_mode = source_mode.enabled()
+        && source
+            .tools
+            .as_deref()
+            .is_some_and(stark_tools::has_execute_tool);
     file.tools = source.tools.as_ref().map(|tools| {
         tools
             .iter()
-            .filter(|tool| tool.as_str() != "execute")
             // A read-only custom agent cannot carry mutating tools. Built-in
             // read-only agents enforce the same rule at the surface layer.
             .filter(|tool| !read_only || !stark_tools::is_read_blocked(tool))
+            .filter(|tool| copy_code_mode || tool.as_str() != "execute")
             .cloned()
             .collect()
     });
@@ -5205,7 +5266,12 @@ async fn duplicate_agent_handler(
         visible: Some(source.ui_visible),
         order: Some(source.ui_order),
     });
-    file.code_mode = Some("off".to_string());
+    file.routing = (!source.routing_workspace_kinds.is_empty() || !source.routing_paths.is_empty())
+        .then(|| stark_config::AgentRoutingFile {
+            workspace_kinds: source.routing_workspace_kinds.clone(),
+            paths: source.routing_paths.clone(),
+        });
+    file.code_mode = Some(if copy_code_mode { "hybrid" } else { "off" }.to_string());
     file.full_codemode = None;
     let check = validate_definition(
         &state.config,
@@ -5271,6 +5337,10 @@ async fn agent_catalog_handler(State(state): State<ServerState>) -> Json<Value> 
                 "tools": agent.tools,
                 "code_mode": agent.code_mode,
                 "ui_order": agent.ui_order,
+                "routing": {
+                    "workspace_kinds": agent.routing_workspace_kinds,
+                    "paths": agent.routing_paths,
+                },
             })
         })
         .collect();
@@ -5282,7 +5352,8 @@ async fn agent_catalog_handler(State(state): State<ServerState>) -> Json<Value> 
         "capabilities": {
             "agent_builder": true,
             "custom_agents": true,
-            "custom_code_mode": false,
+            "custom_code_mode": true,
+            "custom_routing": true,
             "duplicate": true,
             "preview": true,
         },
@@ -5294,6 +5365,7 @@ async fn agent_catalog_handler(State(state): State<ServerState>) -> Json<Value> 
         "providers": state.config.provider_summaries(),
         "active_provider": state.config.active_provider(),
         "issues": registry.issues(),
+        "warnings": registry.warnings(),
     }))
 }
 
@@ -8409,6 +8481,10 @@ mod tests {
         let saved = save_agent_handler(
             State(state.clone()),
             Path("backend".to_string()),
+            Query(AgentQuery {
+                tier: None,
+                workspace_path: None,
+            }),
             Json(file),
         )
         .await
@@ -8451,7 +8527,10 @@ mod tests {
         let after = agent_config_handler(
             State(state.clone()),
             Path("backend".to_string()),
-            Query(AgentQuery { tier: None }),
+            Query(AgentQuery {
+                tier: None,
+                workspace_path: None,
+            }),
         )
         .await;
         assert!(after.is_err());
@@ -8512,8 +8591,8 @@ mod tests {
         .await
         .unwrap();
         let tools = developer.0["effective"]["tools"].as_array().unwrap();
-        assert!(!tools.iter().any(|tool| tool == "execute"));
-        assert_eq!(developer.0["effective"]["code_mode"], "off");
+        assert!(tools.iter().any(|tool| tool == "execute"));
+        assert_eq!(developer.0["effective"]["code_mode"], "hybrid");
         assert_eq!(developer.0["effective"]["prompt_profile"], "coding");
 
         let house = duplicate_agent_handler(
@@ -8532,6 +8611,239 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn custom_hybrid_code_mode_previews_direct_and_program_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = group_test_state(dir.path(), "http://127.0.0.1:9".to_string()).await;
+        let file: AgentFile = serde_json::from_value(json!({
+            "version": 2,
+            "display": "Hybrid",
+            "access": "read",
+            "tools": ["read", "files_changed", "execute"],
+            "skills": [],
+            "mcp": [],
+            "code_mode": "hybrid"
+        }))
+        .unwrap();
+        let saved = save_agent_handler(
+            State(state.clone()),
+            Path("hybrid".to_string()),
+            Query(AgentQuery {
+                tier: None,
+                workspace_path: None,
+            }),
+            Json(file),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.0["effective"]["code_mode"], "hybrid");
+        let preview = preview_agent_handler(
+            State(state),
+            Path("hybrid".to_string()),
+            Json(PreviewRequest {
+                draft: None,
+                workspace_path: dir.path().to_string_lossy().to_string(),
+                mode: "build".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        let direct: Vec<&str> = preview.0["tools"]["direct"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(direct.contains(&"read"), "{direct:?}");
+        assert!(direct.contains(&"execute"), "{direct:?}");
+        assert!(!direct.contains(&"files_changed"), "{direct:?}");
+        let program: Vec<&str> = preview.0["tools"]["program"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(program, vec!["files_changed"]);
+        let prompt = preview.0["system_prompt"].as_str().unwrap();
+        assert!(prompt.contains("# Code Mode"), "{prompt}");
+        assert!(prompt.contains("tools.files_changed"), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn custom_hybrid_code_mode_advertises_execute_and_catalog() {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::http::header;
+        use axum::routing::post;
+
+        async fn capture_provider(
+            State(seen): State<Arc<Mutex<Vec<Value>>>>,
+            Json(body): Json<Value>,
+        ) -> Response {
+            seen.lock().unwrap().push(body);
+            let body = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            );
+            Response::builder()
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(body))
+                .unwrap()
+        }
+
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let captured = seen.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/chat/completions", post(capture_provider))
+                    .with_state(captured),
+            )
+            .await
+            .unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let state = group_test_state(dir.path(), format!("http://{address}")).await;
+        let file: AgentFile = serde_json::from_value(json!({
+            "version": 2,
+            "display": "Hybrid Live",
+            "access": "read",
+            "tools": ["read", "files_changed", "execute"],
+            "skills": [],
+            "mcp": [],
+            "code_mode": "hybrid"
+        }))
+        .unwrap();
+        let _ = save_agent_handler(
+            State(state.clone()),
+            Path("hybrid-live".to_string()),
+            Query(AgentQuery {
+                tier: None,
+                workspace_path: None,
+            }),
+            Json(file),
+        )
+        .await
+        .unwrap();
+        let _ = run_command_handler(
+            State(state.clone()),
+            Path("chat-hybrid".to_string()),
+            Json(RunRequest {
+                prompt: "inspect".to_string(),
+                model: "mock".to_string(),
+                temperature: 0.0,
+                workspace_path: dir.path().to_string_lossy().to_string(),
+                workspace_id: "_general".to_string(),
+                chat_id: "chat-hybrid".to_string(),
+                attachments: Vec::new(),
+                workspace_kind: "general".to_string(),
+                agent: "hybrid-live".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        for _ in 0..400 {
+            if !state.runs.is_running("chat-hybrid") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let requests = seen.lock().unwrap();
+        let body = &requests[0];
+        let tools: Vec<String> = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| {
+                tool.pointer("/function/name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
+        assert!(tools.contains(&"read".to_string()), "{tools:?}");
+        assert!(tools.contains(&"execute".to_string()), "{tools:?}");
+        assert!(!tools.contains(&"files_changed".to_string()), "{tools:?}");
+        let system = body["messages"][0]["content"].as_str().unwrap_or("");
+        assert!(system.contains("# Code Mode"), "{system}");
+        assert!(system.contains("tools.files_changed"), "{system}");
+    }
+
+    #[tokio::test]
+    async fn workspace_local_skill_validates_saves_and_previews() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("project");
+        let skill_dir = workspace.join(".agents/skills/review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: review\ndescription: Review code.\n---\n# Review\n",
+        )
+        .unwrap();
+        let state = group_test_state(dir.path(), "http://127.0.0.1:9".to_string()).await;
+        let file: AgentFile = serde_json::from_value(json!({
+            "version": 2,
+            "display": "Reviewer",
+            "access": "read",
+            "tools": ["read", "skill"],
+            "skills": ["review"],
+            "mcp": []
+        }))
+        .unwrap();
+        let saved = save_agent_handler(
+            State(state.clone()),
+            Path("reviewer".to_string()),
+            Query(AgentQuery {
+                tier: None,
+                workspace_path: Some(workspace.to_string_lossy().to_string()),
+            }),
+            Json(file.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.0["effective"]["skills"], json!(["review"]));
+        let preview = preview_agent_handler(
+            State(state.clone()),
+            Path("reviewer".to_string()),
+            Json(PreviewRequest {
+                draft: None,
+                workspace_path: workspace.to_string_lossy().to_string(),
+                mode: "build".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            preview.0["system_prompt"]
+                .as_str()
+                .unwrap()
+                .contains("review: Review code.")
+        );
+        // Without a workspace the same skill is a warning, not a hard error,
+        // because it may be project-local.
+        let saved = save_agent_handler(
+            State(state),
+            Path("reviewer".to_string()),
+            Query(AgentQuery {
+                tier: None,
+                workspace_path: None,
+            }),
+            Json(file),
+        )
+        .await
+        .unwrap();
+        assert!(
+            saved.0["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning.as_str().unwrap_or("").contains("workspace-local"))
+        );
+    }
+
+    #[tokio::test]
     async fn custom_agent_rejects_unsafe_definitions() {
         let dir = tempfile::tempdir().unwrap();
         let state = group_test_state(dir.path(), "http://127.0.0.1:9".to_string()).await;
@@ -8540,8 +8852,16 @@ mod tests {
             "tools": ["read", "not_a_tool"]
         }))
         .unwrap();
-        let result =
-            save_agent_handler(State(state.clone()), Path("bad".to_string()), Json(unknown)).await;
+        let result = save_agent_handler(
+            State(state.clone()),
+            Path("bad".to_string()),
+            Query(AgentQuery {
+                tier: None,
+                workspace_path: None,
+            }),
+            Json(unknown),
+        )
+        .await;
         assert!(result.is_err());
 
         let read_only_edit: AgentFile = serde_json::from_value(json!({
@@ -8553,6 +8873,10 @@ mod tests {
         let result = save_agent_handler(
             State(state.clone()),
             Path("readonly".to_string()),
+            Query(AgentQuery {
+                tier: None,
+                workspace_path: None,
+            }),
             Json(read_only_edit),
         )
         .await;
@@ -8988,6 +9312,10 @@ mod tests {
         let _ = save_agent_handler(
             State(state.clone()),
             Path("backend".to_string()),
+            Query(AgentQuery {
+                tier: None,
+                workspace_path: None,
+            }),
             Json(file),
         )
         .await

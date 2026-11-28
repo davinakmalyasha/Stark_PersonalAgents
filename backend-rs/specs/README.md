@@ -108,7 +108,11 @@ Rules for custom definitions:
 - `tools` is the complete allowlist; omitted tools means an invalid definition.
 - Unknown tools/skills/MCP servers are rejected on save.
 - Read-only agents cannot receive mutating tools.
-- Custom Code Mode is off; `execute` is rejected.
+- Custom Code Mode is opt-in `hybrid` and requires `execute` in the closed
+  list. Custom `only`/`full_codemode` are rejected and remain built-in
+  Developer features.
+- `routing` is custom-only, unique-match, and ignored when an explicit agent
+  or chat agent key exists.
 - Built-ins can narrow their compiled caps but never widen them.
 
 Schema: `agent-def.schema.json`. API: `docs/agent-builder-api.md`.

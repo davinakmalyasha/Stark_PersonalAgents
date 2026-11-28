@@ -12,7 +12,8 @@
 //!   "all tools"; an explicit empty list is a talk-only agent.
 //! - Custom MCP/skills default to none, not all.
 //! - Invalid definitions are quarantined, never partially applied.
-//! - Custom Code Mode is off until the additive capability hook lands.
+//! - Custom Code Mode is opt-in hybrid and requires the explicit `execute`
+//!   tool; custom `only`/`full_codemode` stay built-in Developer features.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -30,6 +31,27 @@ pub struct AgentRegistry {
     by_key: HashMap<String, usize>,
     aliases: HashMap<String, String>,
     issues: Vec<String>,
+    warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RouteDecision {
+    pub agent: EffectiveAgent,
+    /// Where the decision came from, e.g. `workspace_kind:developer`.
+    pub matched: Option<String>,
+    /// Set only when multiple custom routing rules matched; the built-in
+    /// fallback is used.
+    pub warning: Option<String>,
+}
+
+impl Default for RouteDecision {
+    fn default() -> Self {
+        Self {
+            agent: stark_config::builtin_effective("workspace"),
+            matched: None,
+            warning: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -185,22 +207,96 @@ impl AgentRegistry {
         &self.issues
     }
 
-    /// Route a request when the client did not name an agent. Explicit
-    /// `workspace_kind` wins; unknown kinds fall back exactly like the old
-    /// resolver. The result always comes from the registry.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
+    /// Route a request when the client did not name an agent. The decision
+    /// keeps the warning (ambiguous routing) so the caller can log/expose it.
+    pub fn route_decision(
+        &self,
+        workspace_kind: &str,
+        workspace_path: &Path,
+        harness_root: &Path,
+    ) -> RouteDecision {
+        let kind = workspace_kind.trim().to_ascii_lowercase();
+        // An explicit custom key/alias wins.
+        if !kind.is_empty()
+            && let Some(agent) = self.get(&kind)
+            && !agent.builtin
+        {
+            return RouteDecision {
+                agent: agent.clone(),
+                matched: Some(format!("workspace_kind:{kind}")),
+                warning: None,
+            };
+        }
+        // Explicit built-in keys and virtual workspace kinds win over custom
+        // routing. Generic aliases like "coding" do not.
+        if is_explicit_builtin_kind(&kind) {
+            return RouteDecision {
+                agent: self.builtin_route(&kind, workspace_path, harness_root),
+                matched: Some(format!("workspace_kind:{kind}")),
+                warning: None,
+            };
+        }
+        let matches: Vec<&EffectiveAgent> = self
+            .agents
+            .iter()
+            .filter(|agent| !agent.builtin && agent.ui_visible)
+            .filter(|agent| routing_matches(agent, &kind, workspace_path))
+            .collect();
+        if matches.len() == 1 {
+            let agent = matches[0].clone();
+            return RouteDecision {
+                agent,
+                matched: Some(format!("routing:{kind}")),
+                warning: None,
+            };
+        }
+        let warning = (matches.len() > 1).then(|| {
+            format!(
+                "ambiguous agent routing for workspace kind '{kind}' and path '{}': {}",
+                workspace_path.display(),
+                matches
+                    .iter()
+                    .map(|agent| agent.key.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        });
+        let agent = self.builtin_route(&kind, workspace_path, harness_root);
+        RouteDecision {
+            agent,
+            matched: None,
+            warning,
+        }
+    }
+
+    /// Compatibility wrapper for callers that do not need the warning.
     pub fn route(
         &self,
         workspace_kind: &str,
         workspace_path: &Path,
         harness_root: &Path,
     ) -> EffectiveAgent {
-        let kind = workspace_kind.trim().to_ascii_lowercase();
+        self.route_decision(workspace_kind, workspace_path, harness_root)
+            .agent
+    }
+
+    fn builtin_route(
+        &self,
+        kind: &str,
+        workspace_path: &Path,
+        harness_root: &Path,
+    ) -> EffectiveAgent {
         if !kind.is_empty()
-            && let Some(agent) = self.get(&kind)
+            && let Some(agent) = self.get(kind)
+            && agent.builtin
         {
             return agent.clone();
         }
-        let key = match kind.as_str() {
+        let key = match kind {
             "house" | "house_workspace" => "house",
             "personal" | "personal_workspace" | "general_workspace" => "general",
             "dfd" | "dfd_workspace" => "dfd",
@@ -245,6 +341,8 @@ impl AgentRegistry {
         effective.can_delegate = spec.can_delegate;
         effective.can_spawn = spec.can_spawn;
         effective.ui_order = spec.ui_order;
+        effective.routing_workspace_kinds.clear();
+        effective.routing_paths.clear();
         // Start from the compiled seed. The optional override applies on top,
         // so an ignored/invalid override can never leak a field through.
         effective.display = spec.display.to_string();
@@ -431,37 +529,41 @@ impl AgentRegistry {
         effective.prompt_profile = normalize_profile(&effective.prompt_profile)
             .unwrap_or("general")
             .to_string();
+        let (routing_kinds, routing_paths) = custom_routing(file)?;
+        effective.routing_workspace_kinds = routing_kinds;
+        effective.routing_paths = routing_paths;
         let tools = file.tools.as_ref().ok_or_else(|| {
             "custom agents must declare an explicit tools list (use [] for none)".to_string()
         })?;
         let tools = validate_custom_tools(tools, access, true)?;
+        let code_mode = custom_code_mode(file, &tools)?;
+        if matches!(code_mode, stark_tools::CodeMode::Hybrid)
+            && !tools.iter().any(|tool| stark_tools::is_codemode(tool))
+        {
+            self.warnings.push(format!(
+                "{key}: hybrid Code Mode has no catalog tools; add a program-capable tool or use off"
+            ));
+        }
         let delegation = file.delegation.clone().unwrap_or_default();
         let can_delegate = delegation.can_delegate.unwrap_or(false);
         let can_spawn = delegation.can_spawn.unwrap_or(false);
         validate_capability_tools(&tools, can_delegate, can_spawn)?;
         effective.tools = Some(tools);
-        effective.skills = Some(validate_custom_skills(
-            harness_root,
-            file.skills.as_deref().unwrap_or(&[]),
-        )?);
-        effective.mcp = Some(validate_custom_mcp(
-            harness_root,
-            file.mcp.as_deref().unwrap_or(&[]),
-        )?);
-        // Custom Code Mode is deliberately deferred: it needs a dynamic
-        // execute capability, not just a flag.
-        if file
-            .code_mode
-            .as_deref()
-            .and_then(stark_tools::CodeMode::parse)
-            .is_some_and(|mode| mode.enabled())
-        {
-            return Err(
-                "custom agents are direct-tools-only; Code Mode is not enabled for custom agents"
-                    .to_string(),
-            );
+        // Skills may be workspace-local; keep the declared allowlist and let
+        // the runtime catalog filter it. MCP servers are global config, so a
+        // missing server is dropped with a warning.
+        let (skills, _) =
+            inspect_custom_skills(None, harness_root, file.skills.as_deref().unwrap_or(&[]));
+        effective.skills = Some(skills);
+        let (mcp, unknown_mcp) =
+            inspect_custom_mcp(harness_root, file.mcp.as_deref().unwrap_or(&[]));
+        for server in unknown_mcp {
+            self.warnings.push(format!(
+                "{key}: MCP server '{server}' is not configured; dropped"
+            ));
         }
-        effective.code_mode = Some("off".to_string());
+        effective.mcp = Some(mcp);
+        effective.code_mode = Some(code_mode.as_str().to_string());
         effective.full_codemode = None;
         effective.delegatable = delegation.delegatable.unwrap_or(false);
         effective.can_delegate = can_delegate;
@@ -515,6 +617,57 @@ impl AgentRegistry {
         }
         self.aliases = alias_owner;
     }
+}
+
+fn is_explicit_builtin_kind(kind: &str) -> bool {
+    if kind.is_empty() {
+        return false;
+    }
+    const VIRTUAL: &[&str] = &[
+        "house",
+        "house_workspace",
+        "personal",
+        "personal_workspace",
+        "general_workspace",
+        "dfd",
+        "dfd_workspace",
+        "design",
+        "design_workspace",
+    ];
+    workspace_agents().iter().any(|spec| spec.key == kind) || VIRTUAL.contains(&kind)
+}
+
+fn routing_matches(agent: &EffectiveAgent, kind: &str, workspace_path: &Path) -> bool {
+    if agent.routing_workspace_kinds.is_empty() && agent.routing_paths.is_empty() {
+        return false;
+    }
+    if !agent.routing_workspace_kinds.is_empty()
+        && !agent
+            .routing_workspace_kinds
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(kind))
+    {
+        return false;
+    }
+    if agent.routing_paths.is_empty() {
+        return true;
+    }
+    let normalized = workspace_path.to_string_lossy().replace('\\', "/");
+    let canonical = workspace_path
+        .canonicalize()
+        .ok()
+        .map(|path| path.to_string_lossy().replace('\\', "/"));
+    agent.routing_paths.iter().any(|pattern| {
+        globset::Glob::new(pattern)
+            .ok()
+            .map(|glob| glob.compile_matcher())
+            .is_some_and(|matcher| {
+                matcher.is_match(&normalized)
+                    || canonical
+                        .as_deref()
+                        .is_some_and(|path| matcher.is_match(path))
+            })
+    })
 }
 
 fn builtin_runtime(key: &str, registry: &AgentRegistry) -> EffectiveAgent {
@@ -595,12 +748,6 @@ fn validate_custom_tools(
         if !seen.insert(name.clone()) {
             continue;
         }
-        if name == "execute" {
-            return Err(
-                "custom agents cannot list 'execute'; Code Mode is not available to custom agents"
-                    .to_string(),
-            );
-        }
         let Some(spec) = contract().tool(&name) else {
             if strict {
                 return Err(format!("unknown tool '{name}'"));
@@ -626,6 +773,63 @@ fn validate_custom_tools(
     out.sort();
     out.dedup();
     Ok(out)
+}
+
+fn custom_routing(file: &AgentFile) -> Result<(Vec<String>, Vec<String>), String> {
+    let Some(routing) = &file.routing else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let mut kinds: Vec<String> = routing
+        .workspace_kinds
+        .iter()
+        .map(|kind| kind.trim().to_ascii_lowercase())
+        .filter(|kind| !kind.is_empty())
+        .collect();
+    kinds.sort();
+    kinds.dedup();
+    let mut paths = Vec::new();
+    for raw in &routing.paths {
+        let pattern = raw.trim().replace('\\', "/");
+        if pattern.is_empty() {
+            continue;
+        }
+        globset::Glob::new(&pattern)
+            .map_err(|error| format!("invalid routing path glob '{pattern}': {error}"))?;
+        paths.push(pattern);
+    }
+    paths.sort();
+    paths.dedup();
+    if kinds.is_empty() && paths.is_empty() {
+        return Err("routing needs at least one workspace kind or path pattern".to_string());
+    }
+    Ok((kinds, paths))
+}
+
+fn custom_code_mode(file: &AgentFile, tools: &[String]) -> Result<stark_tools::CodeMode, String> {
+    let mode = file
+        .code_mode
+        .as_deref()
+        .and_then(stark_tools::CodeMode::parse)
+        .unwrap_or_default();
+    if matches!(mode, stark_tools::CodeMode::Only) {
+        return Err(
+            "custom agents support code_mode off or hybrid; 'only' is built-in Developer only"
+                .to_string(),
+        );
+    }
+    if file.full_codemode == Some(true) {
+        return Err("full_codemode is built-in Developer only".to_string());
+    }
+    let has_execute = stark_tools::has_execute_tool(tools);
+    match mode {
+        stark_tools::CodeMode::Hybrid if !has_execute => {
+            Err("code_mode 'hybrid' requires the execute tool in the custom tools list".to_string())
+        }
+        stark_tools::CodeMode::Off if has_execute => {
+            Err("the execute tool requires code_mode 'hybrid' for custom agents".to_string())
+        }
+        _ => Ok(mode),
+    }
 }
 
 fn validate_capability_tools(
@@ -658,46 +862,51 @@ fn validate_capability_tools(
     Ok(())
 }
 
-fn validate_custom_skills(harness_root: &Path, skills: &[String]) -> Result<Vec<String>, String> {
-    let known: HashSet<String> = stark_tools::skill_names(harness_root, harness_root)
+fn normalize_names(names: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = names
+        .iter()
+        .map(|name| name.trim().to_ascii_lowercase())
+        .filter(|name| !name.is_empty())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Returns `(normalized, unknown)`. An unknown skill may still be valid in a
+/// workspace that was not supplied at save/load time, so callers decide
+/// whether it is an error, a warning, or a runtime filter.
+fn inspect_custom_skills(
+    workspace: Option<&Path>,
+    harness_root: &Path,
+    skills: &[String],
+) -> (Vec<String>, Vec<String>) {
+    let root = workspace.unwrap_or(harness_root);
+    let known: HashSet<String> = stark_tools::skill_names(root, harness_root)
         .into_iter()
         .map(|name| name.to_ascii_lowercase())
         .collect();
-    let mut out = Vec::new();
-    for raw in skills {
-        let name = raw.trim().to_ascii_lowercase();
-        if name.is_empty() {
-            continue;
-        }
-        if !known.contains(&name) {
-            return Err(format!("unknown skill '{name}'"));
-        }
-        out.push(name);
-    }
-    out.sort();
-    out.dedup();
-    Ok(out)
+    let normalized = normalize_names(skills);
+    let unknown = normalized
+        .iter()
+        .filter(|name| !known.contains(*name))
+        .cloned()
+        .collect();
+    (normalized, unknown)
 }
 
-fn validate_custom_mcp(harness_root: &Path, servers: &[String]) -> Result<Vec<String>, String> {
+fn inspect_custom_mcp(harness_root: &Path, servers: &[String]) -> (Vec<String>, Vec<String>) {
     let known: HashSet<String> = stark_tools::configured_servers(harness_root)
         .into_iter()
         .map(|name| name.to_ascii_lowercase())
         .collect();
-    let mut out = Vec::new();
-    for raw in servers {
-        let name = raw.trim().to_ascii_lowercase();
-        if name.is_empty() {
-            continue;
-        }
-        if !known.contains(&name) {
-            return Err(format!("unknown MCP server '{name}'"));
-        }
-        out.push(name);
-    }
-    out.sort();
-    out.dedup();
-    Ok(out)
+    let normalized = normalize_names(servers);
+    let unknown = normalized
+        .iter()
+        .filter(|name| !known.contains(*name))
+        .cloned()
+        .collect();
+    (normalized, unknown)
 }
 
 fn builtin_override_errors(spec: &AgentSpec, file: &AgentFile) -> Vec<String> {
@@ -740,6 +949,13 @@ fn builtin_override_errors(spec: &AgentSpec, file: &AgentFile) -> Vec<String> {
         if delegation.can_spawn == Some(true) && !spec.can_spawn {
             errors.push("built-in cannot spawn agents".to_string());
         }
+    }
+    if file
+        .routing
+        .as_ref()
+        .is_some_and(|routing| !routing.workspace_kinds.is_empty() || !routing.paths.is_empty())
+    {
+        errors.push("routing is available to custom agents only".to_string());
     }
     let scope_tools: HashSet<String> = contract()
         .scope_map
@@ -804,6 +1020,20 @@ pub fn validate_definition(
     key: &str,
     file: &AgentFile,
     existing: &AgentRegistry,
+) -> DefinitionCheck {
+    validate_definition_in(config, harness_root, key, file, existing, None)
+}
+
+/// Workspace-aware validation used by the save/preview API. A workspace lets
+/// project-local skills validate strictly; without one they are warnings
+/// because they may exist only in the project being edited.
+pub fn validate_definition_in(
+    config: &ConfigStore,
+    harness_root: &Path,
+    key: &str,
+    file: &AgentFile,
+    existing: &AgentRegistry,
+    workspace: Option<&Path>,
 ) -> DefinitionCheck {
     let mut check = DefinitionCheck::default();
     let key = key.trim().to_ascii_lowercase();
@@ -876,15 +1106,8 @@ pub fn validate_definition(
         check.errors.extend(builtin_override_errors(spec, file));
     } else {
         // Custom definition.
-        if file
-            .code_mode
-            .as_deref()
-            .and_then(stark_tools::CodeMode::parse)
-            .is_some_and(|mode| mode.enabled())
-        {
-            check
-                .errors
-                .push("custom agents are direct-tools-only (code_mode must be off)".to_string());
+        if let Err(error) = custom_routing(file) {
+            check.errors.push(error);
         }
         let access = file
             .access
@@ -901,6 +1124,18 @@ pub fn validate_definition(
                         delegation.can_spawn.unwrap_or(false),
                     ) {
                         check.errors.push(error);
+                    }
+                    match custom_code_mode(file, &tools) {
+                        Ok(stark_tools::CodeMode::Hybrid) => {
+                            if !tools.iter().any(|tool| stark_tools::is_codemode(tool)) {
+                                check.warnings.push(
+                                    "hybrid Code Mode has no catalog tools; add a program-capable tool or use off"
+                                        .to_string(),
+                                );
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(error) => check.errors.push(error),
                     }
                     if tools.is_empty() {
                         check
@@ -920,13 +1155,24 @@ pub fn validate_definition(
                 "custom agents must declare an explicit tools list (use [] for none)".to_string(),
             ),
         }
-        match validate_custom_skills(harness_root, file.skills.as_deref().unwrap_or(&[])) {
-            Ok(_) => {}
-            Err(error) => check.errors.push(error),
+        let (_, unknown_skills) = inspect_custom_skills(
+            workspace,
+            harness_root,
+            file.skills.as_deref().unwrap_or(&[]),
+        );
+        for skill in unknown_skills {
+            let message = format!("unknown skill '{skill}'");
+            if workspace.is_some() {
+                check.errors.push(message);
+            } else {
+                check
+                    .warnings
+                    .push(format!("{message}; it may be workspace-local"));
+            }
         }
-        match validate_custom_mcp(harness_root, file.mcp.as_deref().unwrap_or(&[])) {
-            Ok(_) => {}
-            Err(error) => check.errors.push(error),
+        let (_, unknown_mcp) = inspect_custom_mcp(harness_root, file.mcp.as_deref().unwrap_or(&[]));
+        for server in unknown_mcp {
+            check.errors.push(format!("unknown MCP server '{server}'"));
         }
         if !file.skills.as_deref().unwrap_or(&[]).is_empty()
             && !file
@@ -1251,22 +1497,131 @@ mod tests {
     }
 
     #[test]
-    fn custom_code_mode_is_rejected() {
+    fn custom_code_mode_requires_execute_and_hybrid() {
         let dir = tempfile::tempdir().unwrap();
         let config = ConfigStore::open(dir.path());
         let registry = AgentRegistry::load(&config, dir.path());
-        let file = AgentFile {
+        let no_execute = AgentFile {
             code_mode: Some("hybrid".to_string()),
             tools: Some(vec!["read".to_string()]),
             ..AgentFile::default()
         };
-        let check = validate_definition(&config, dir.path(), "backend", &file, &registry);
+        let check = validate_definition(&config, dir.path(), "backend", &no_execute, &registry);
         assert!(
             check
                 .errors
                 .iter()
-                .any(|error| error.contains("direct-tools-only"))
+                .any(|error| error.contains("requires the execute"))
         );
+        let only = AgentFile {
+            code_mode: Some("only".to_string()),
+            tools: Some(vec!["read".to_string(), "execute".to_string()]),
+            ..AgentFile::default()
+        };
+        let check = validate_definition(&config, dir.path(), "backend", &only, &registry);
+        assert!(
+            check
+                .errors
+                .iter()
+                .any(|error| error.contains("built-in Developer only"))
+        );
+        let full = AgentFile {
+            code_mode: Some("hybrid".to_string()),
+            full_codemode: Some(true),
+            tools: Some(vec!["read".to_string(), "execute".to_string()]),
+            ..AgentFile::default()
+        };
+        let check = validate_definition(&config, dir.path(), "backend", &full, &registry);
+        assert!(
+            check
+                .errors
+                .iter()
+                .any(|error| error.contains("full_codemode"))
+        );
+        let hybrid = AgentFile {
+            code_mode: Some("hybrid".to_string()),
+            tools: Some(vec![
+                "read".to_string(),
+                "files_changed".to_string(),
+                "execute".to_string(),
+            ]),
+            ..AgentFile::default()
+        };
+        let check = validate_definition(&config, dir.path(), "backend", &hybrid, &registry);
+        assert!(check.errors.is_empty(), "{:?}", check.errors);
+        let effective = resolve_definition(&config, dir.path(), "backend", &hybrid).unwrap();
+        assert_eq!(effective.code_mode.as_deref(), Some("hybrid"));
+        assert!(
+            effective
+                .tools
+                .as_ref()
+                .unwrap()
+                .contains(&"execute".to_string())
+        );
+    }
+
+    #[test]
+    fn custom_routing_is_unique_match_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("work");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(dir.path().join(".deep_agents/config/agents")).unwrap();
+        let path_pattern = workspace.to_string_lossy().replace('\\', "/");
+        let mut backend = custom("backend", &["read"], "read");
+        backend.routing = Some(stark_config::AgentRoutingFile {
+            workspace_kinds: vec!["coding".to_string()],
+            paths: vec![path_pattern.clone()],
+        });
+        write_agent(
+            dir.path(),
+            "backend",
+            serde_json::to_value(backend).unwrap(),
+        );
+        let config = ConfigStore::open(dir.path());
+        let registry = AgentRegistry::load(&config, dir.path());
+        let decision = registry.route_decision("coding", &workspace, dir.path());
+        assert_eq!(decision.agent.key, "backend");
+        assert!(decision.warning.is_none());
+        // A virtual workspace kind is explicit and wins over routing.
+        let decision = registry.route_decision("design", &workspace, dir.path());
+        assert_eq!(decision.agent.key, "ui");
+        let decision = registry.route_decision("general_workspace", &workspace, dir.path());
+        assert_eq!(decision.agent.key, "general");
+    }
+
+    #[test]
+    fn ambiguous_routing_falls_back_with_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("work");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let path_pattern = workspace.to_string_lossy().replace('\\', "/");
+        for key in ["alpha", "beta"] {
+            let mut file = custom(key, &["read"], "read");
+            file.routing = Some(stark_config::AgentRoutingFile {
+                workspace_kinds: vec!["coding".to_string()],
+                paths: vec![path_pattern.clone()],
+            });
+            write_agent(dir.path(), key, serde_json::to_value(file).unwrap());
+        }
+        let config = ConfigStore::open(dir.path());
+        let registry = AgentRegistry::load(&config, dir.path());
+        let decision = registry.route_decision("coding", &workspace, dir.path());
+        assert_eq!(decision.agent.key, "developer");
+        assert!(decision.warning.is_some());
+    }
+
+    #[test]
+    fn routing_requires_valid_nonempty_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ConfigStore::open(dir.path());
+        let registry = AgentRegistry::load(&config, dir.path());
+        let mut file = custom("backend", &["read"], "read");
+        file.routing = Some(stark_config::AgentRoutingFile {
+            workspace_kinds: Vec::new(),
+            paths: vec!["[".to_string()],
+        });
+        let check = validate_definition(&config, dir.path(), "backend", &file, &registry);
+        assert!(check.errors.iter().any(|error| error.contains("glob")));
     }
 
     #[test]

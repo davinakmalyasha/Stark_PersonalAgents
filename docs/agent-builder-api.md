@@ -18,10 +18,15 @@ unchanged.
   Custom access defaults to `read`. A read-only agent cannot receive a
   mutating tool. Depth ≥ 2 is always read-only.
 - **Closed MCP/skills.** For custom agents, omitted `skills`/`mcp` means none,
-  not all. Names must exist in the live catalogs when the definition is saved.
-- **Custom Code Mode is off.** Custom agents are direct-tools-only in v2. The
-  `capabilities.custom_code_mode` flag is `false`; `execute` is rejected in a
-  custom tool list. Built-in Code Mode defaults are unchanged.
+  not all. MCP names must exist in the live config when saved. Skills are
+  workspace-aware: save/preview with `workspace_path` validates strictly;
+  without it unknown skills are warnings because they may be project-local.
+  The `skill` tool enforces the same allowlist at dispatch.
+- **Custom Code Mode is opt-in hybrid.** A custom agent may set
+  `code_mode: "hybrid"` and include `execute` in `tools`. `off` must not
+  contain `execute`; `hybrid` requires it. Custom `only`/`full_codemode` are
+  rejected; those remain built-in Developer features. Built-in Code Mode
+  defaults are unchanged.
 - **Capabilities gate orchestration.** `delegate`/`delegation_status`/`job_*`
   require `delegation.can_delegate`; `spawn_agent`/`message_agent`/`wait_agent`/
   `interrupt_agent`/`close_agent`/`agent` require `delegation.can_spawn`.
@@ -57,7 +62,20 @@ Schema: [`backend-rs/specs/agent-def.schema.json`](../backend-rs/specs/agent-def
     "can_spawn": false
   },
   "ui": { "visible": true, "order": 25 },
+  "routing": {
+    "workspace_kinds": ["coding"],
+    "paths": ["D:/work/backend/**"]
+  },
   "code_mode": "off"
+}
+```
+
+For base Code Mode:
+
+```json
+{
+  "code_mode": "hybrid",
+  "tools": ["read", "files_changed", "execute"]
 }
 ```
 
@@ -70,7 +88,13 @@ Notes:
   profile is fixed.
 - `aliases` are optional for custom agents; they must not shadow any key or
   alias. Aliases are never listed as agents.
-- `code_mode` must be `off` for custom agents.
+- `code_mode` is `off` (default) or `hybrid` for custom agents. `execute` is
+  required for hybrid and forbidden for off.
+- `routing` is custom-only. It applies only when no explicit agent or chat
+  `agentKey` exists and the workspace kind is generic. Both lists non-empty
+  means both must match. A unique match wins; multiple matches fall back with
+  a warning. Explicit built-in keys and virtual kinds (`general`, `house`,
+  `personal`, `design`, …) win over routing.
 
 ## Endpoints
 
@@ -84,7 +108,8 @@ Returns the builder's pick lists and capability flags:
   "capabilities": {
     "agent_builder": true,
     "custom_agents": true,
-    "custom_code_mode": false,
+    "custom_code_mode": true,
+    "custom_routing": true,
     "duplicate": true,
     "preview": true
   },
@@ -139,7 +164,7 @@ Lists built-ins and custom agents. Invalid custom files are listed with
     }
   }],
   "issues": [],
-  "capabilities": { "custom_agents": true, "custom_code_mode": false }
+  "capabilities": { "custom_agents": true, "custom_code_mode": true, "custom_routing": true }
 }
 ```
 
@@ -153,6 +178,10 @@ Resolves a key or alias. Built-in aliases (for example `coder`) resolve to
 Creates a custom agent or writes a built-in override. The body is the
 definition above. The same path is used for built-in overrides; unknown keys
 create a custom agent.
+
+Optional query `?workspace_path=D:/project` validates project-local skills
+strictly. Without it, skills not found in the harness catalog are warnings
+because they may exist only in a workspace.
 
 Success:
 
@@ -226,7 +255,7 @@ Body:
 
 Copies the effective surface into a safe custom definition:
 
-- `execute` is removed (custom Code Mode is off).
+- `execute`/hybrid Code Mode is preserved when the source offers it.
 - Mutating tools are removed when the source is read-only.
 - Built-in general-profile instructions are folded into the persona.
 - `skills`/`mcp` are materialized from the current catalogs.
@@ -246,7 +275,9 @@ Existing request plus optional `agent` (alias: `agent_key`):
 
 If `agent` is omitted, the registry routes by workspace kind/path **unless**
 the chat already has an `agentKey`; the persisted agent wins. The resolved key
-is stored on the chat and returned as `agentKey` by chat reads.
+is stored on the chat and returned as `agentKey` by chat reads. An ambiguous
+custom routing match falls back to the built-in heuristic and returns
+`route_warning` in the run acceptance response.
 
 ## Errors
 

@@ -212,6 +212,13 @@ pub async fn skill(ctx: &ToolContext, args: &Value) -> ToolOutcome {
     {
         return ToolOutcome::err("Error: invalid skill name");
     }
+    if let Some(allowed) = &ctx.allowed_skills
+        && !allowed.contains(&name.to_ascii_lowercase())
+    {
+        return ToolOutcome::err(format!(
+            "Error: skill '{name}' is not enabled for this agent"
+        ));
+    }
     for root in roots(ctx) {
         let path = root.join(name).join("SKILL.md");
         if !path.is_file() {
@@ -256,6 +263,25 @@ mod tests {
         let loaded = skill(&ctx, &serde_json::json!({"name": "review"})).await;
         assert!(!loaded.is_error, "{}", loaded.content);
         assert!(loaded.content.contains("# Review"), "{}", loaded.content);
+    }
+
+    #[tokio::test]
+    async fn per_agent_skill_allowlist_blocks_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join(".agents/skills/review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: review\ndescription: Review code.\n---\n# Review\n",
+        )
+        .unwrap();
+        let ctx = context(dir.path()).with_allowed_skills(Some(vec!["other".to_string()]));
+        let out = skill(&ctx, &serde_json::json!({"name": "review"})).await;
+        assert!(out.is_error);
+        assert!(out.content.contains("not enabled"));
+        let ctx = context(dir.path()).with_allowed_skills(Some(vec!["review".to_string()]));
+        let out = skill(&ctx, &serde_json::json!({"name": "review"})).await;
+        assert!(!out.is_error, "{}", out.content);
     }
 
     #[tokio::test]

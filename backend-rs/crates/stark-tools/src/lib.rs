@@ -177,6 +177,19 @@ pub fn scope_supports_code_mode(scope: &str) -> bool {
         .is_some_and(|tools| tools.iter().any(|tool| tool == "execute"))
 }
 
+/// Custom agents have no frozen contract scope. Their explicit `execute` tool
+/// is the capability marker; built-ins keep the contract-based check.
+pub fn supports_execute(scope: &str, has_execute: bool) -> bool {
+    scope_supports_code_mode(scope) || has_execute
+}
+
+/// Whether an explicit tool-name list contains the Code Mode capability.
+pub fn has_execute_tool(tools: &[String]) -> bool {
+    tools
+        .iter()
+        .any(|tool| tool.trim().eq_ignore_ascii_case("execute"))
+}
+
 #[derive(Clone)]
 pub struct ToolContext {
     pub workspace: PathBuf,
@@ -216,6 +229,9 @@ pub struct ToolContext {
     /// Optional per-agent allowlist. `None` keeps the scope contract; `Some`
     /// is enforced both when advertising tools and at dispatch time.
     pub allowed_tools: Option<Arc<HashSet<String>>>,
+    /// Optional per-agent skill allowlist. `None` means every discovered
+    /// skill; `Some(empty)` disables skill loading even if the tool is listed.
+    pub allowed_skills: Option<Arc<HashSet<String>>>,
     /// Optional per-agent MCP server allowlist (`["github"]`). Tool names are
     /// shaped `mcp__<server>__<tool>`.
     pub mcp_servers: Option<Arc<HashSet<String>>>,
@@ -262,6 +278,7 @@ impl ToolContext {
             in_program: false,
             active_mcp: Arc::new(Mutex::new(HashSet::new())),
             allowed_tools: None,
+            allowed_skills: None,
             mcp_servers: None,
             code_delta: None,
             worker_manager: None,
@@ -343,6 +360,18 @@ impl ToolContext {
         self
     }
 
+    pub fn with_allowed_skills(mut self, allowed: Option<Vec<String>>) -> Self {
+        self.allowed_skills = allowed.map(|names| {
+            Arc::new(
+                names
+                    .into_iter()
+                    .map(|name| name.to_ascii_lowercase())
+                    .collect(),
+            )
+        });
+        self
+    }
+
     pub fn with_mcp_servers(mut self, servers: Option<Vec<String>>) -> Self {
         self.mcp_servers = servers.map(|names| {
             Arc::new(
@@ -366,7 +395,15 @@ impl ToolContext {
         // The dispatcher is infrastructure, not an optional tool: when Code
         // Mode is on, `tools: ["read"]` must not silently hide the only way
         // to call `read`. Turn Code Mode off instead.
-        if name == "execute" && self.code_mode.enabled() && scope_supports_code_mode(&self.scope) {
+        if name == "execute"
+            && self.code_mode.enabled()
+            && supports_execute(
+                &self.scope,
+                self.allowed_tools
+                    .as_ref()
+                    .is_some_and(|tools| tools.iter().any(|tool| tool == "execute")),
+            )
+        {
             return true;
         }
         // MCP tools are governed by the server allowlist, not the tool list:
@@ -936,7 +973,8 @@ pub fn tool_specs_for_run_with_code_mode_full(
     // OpenCode enables Code Mode only where `execute` is reachable. Without
     // it, every tool (including catalog tools) stays direct.
     let code_mode_enabled = code_mode.enabled();
-    let partition = code_mode_enabled && scope_supports_code_mode(scope);
+    let explicit_execute = allowed_tools.is_some_and(has_execute_tool);
+    let partition = code_mode_enabled && supports_execute(scope, explicit_execute);
     // `Only` is the execute-only full surface; `Hybrid` is the base surface
     // unless `full_codemode` promotes it.
     let full = partition && (full || matches!(code_mode, CodeMode::Only));
@@ -3101,6 +3139,36 @@ mod code_mode_policy_tests {
         );
         assert!(!catalog.contains("tools.glob("), "{catalog}");
         assert!(!catalog.contains("tools.grep("), "{catalog}");
+    }
+
+    #[test]
+    fn custom_scope_can_opt_into_hybrid_code_mode_with_execute() {
+        let tools = vec![
+            "read".to_string(),
+            "files_changed".to_string(),
+            "execute".to_string(),
+        ];
+        let direct = tool_specs_for_run_with_code_mode(
+            "build",
+            "backend",
+            "read",
+            &HashSet::new(),
+            Some(&tools),
+            Some(&[]),
+            CodeMode::Hybrid,
+        );
+        let direct_names = names(&direct);
+        assert!(direct_names.contains(&"read"), "{direct_names:?}");
+        assert!(direct_names.contains(&"execute"), "{direct_names:?}");
+        assert!(!direct_names.contains(&"files_changed"), "{direct_names:?}");
+        let program =
+            program_specs_for_run_full("build", "backend", "read", Some(&tools), Some(&[]), false);
+        let program_names = names(&program);
+        assert!(
+            program_names.contains(&"files_changed"),
+            "{program_names:?}"
+        );
+        assert!(!program_names.contains(&"execute"), "{program_names:?}");
     }
 
     #[test]

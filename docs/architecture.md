@@ -108,7 +108,8 @@ groups.
   delegation, and tool caps. A config file can narrow but never widen them.
 - Custom agents have a closed tool list. Missing `tools` is an error; an
   explicit `[]` is a talk-only agent. Omitted `skills`/`mcp` means none for
-  custom agents, not all.
+  custom agents, not all. The per-agent skill allowlist is enforced both in
+  the prompt catalog and at the `skill` dispatch gate.
 - Invalid definitions are quarantined and reported; they are never partially
   applied.
 - Aliases resolve at read time and are never listed. `coder` remains an alias
@@ -116,9 +117,13 @@ groups.
 - Every run snapshots its runtime record. A chat stores its resolved
   `agent_key`; deleting that custom agent makes the next run fail explicitly
   instead of silently falling back to a more privileged built-in.
-- Custom agents are direct-tools-only in v2. Code Mode for custom agents is
-  deferred until the additive `execute` capability lands; built-in Developer
-  defaults are unchanged.
+- Custom agents can opt into base Code Mode with `code_mode: "hybrid"` plus
+  `execute` in their closed tool list. `execute` is the capability marker;
+  custom `only`/`full_codemode` are rejected and stay built-in Developer
+  features. Built-in Code Mode defaults are unchanged.
+- Custom routing is opt-in and only used when no explicit agent/chat identity
+  exists. A unique workspace-kind/path match wins; ambiguous matches fall back
+  to the built-in heuristic with a warning.
 - Dispatch checks the effective ACL for every non-MCP tool. An unknown scope
   without an explicit ACL exposes nothing, not the full inventory.
 
@@ -169,8 +174,9 @@ two-minute foreground block only moves it to the background. Built-in
 Developer config can set `code_mode` to `off`, `hybrid`, or `only`;
 `off` restores the full direct surface and removes `execute`, while
 `hybrid` keeps the base surface (core tools direct, long-tail through
-`execute`, fetch only, no script timeout/background). Custom agents are
-direct-tools-only in v2 and cannot set an enabled `code_mode`.
+`execute`, fetch only, no script timeout/background). Custom agents may opt
+into `hybrid` by listing `execute`; their program catalog is built from the
+same closed tool ACL.
 
 The Code Mode catalog is an instruction source with OpenCode's split
 delivery. The first observation is the chat's frozen epoch baseline: it is

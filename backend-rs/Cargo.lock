@@ -4722,6 +4722,7 @@ dependencies = [
  "axum",
  "chrono",
  "futures-util",
+ "globset",
  "serde",
  "serde_json",
  "stark-config",

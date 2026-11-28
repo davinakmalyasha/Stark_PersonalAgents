@@ -38,8 +38,8 @@ mod workspace_state;
 mod workspaces;
 pub mod worktree;
 pub use agent_registry::{
-    AgentRegistry, DefinitionCheck, access_for as agent_access_for, resolve_definition,
-    root_access, spawned_access, validate_definition,
+    AgentRegistry, DefinitionCheck, RouteDecision, access_for as agent_access_for,
+    resolve_definition, root_access, spawned_access, validate_definition, validate_definition_in,
 };
 pub use agents::{
     AgentSpec, FileAccess, access_from_str, default_access, for_scope as agent_for_scope,
@@ -320,7 +320,12 @@ fn code_mode_for(ctx: &RunContext) -> stark_tools::CodeMode {
         .and_then(|config| config.code_mode.as_deref())
         .and_then(stark_tools::CodeMode::parse);
     let mode = configured.unwrap_or_else(|| stark_tools::default_code_mode(&ctx.scope));
-    if mode.enabled() && !stark_tools::scope_supports_code_mode(&ctx.scope) {
+    let has_execute = ctx
+        .config
+        .as_ref()
+        .and_then(|config| config.tools.as_deref())
+        .is_some_and(stark_tools::has_execute_tool);
+    if mode.enabled() && !stark_tools::supports_execute(&ctx.scope, has_execute) {
         stark_tools::CodeMode::Off
     } else {
         mode
@@ -877,6 +882,7 @@ async fn run_agent_inner(
     .with_mode(mode.clone())
     .with_depth(ctx.depth)
     .with_allowed_tools(ctx.config.as_ref().and_then(|config| config.tools.clone()))
+    .with_allowed_skills(ctx.config.as_ref().and_then(|config| config.skills.clone()))
     .with_mcp_servers(ctx.config.as_ref().and_then(|config| config.mcp.clone()))
     .with_cancel(ctx.cancel.clone());
     if let Some(checkpoint) = &ctx.checkpoint {

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://stark.local/specs/agent-def.schema.json",
   "title": "Stark Agent Definition v2",
-  "description": "One file per agent under .deep_agents/config/agents/<key>.json. Built-in keys are validated overrides with compiled caps; any other key is a full custom definition. Custom agents are closed-world: tools is required (use [] for none); missing skills/mcp means none; Code Mode is off.",
+  "description": "One file per agent under .deep_agents/config/agents/<key>.json. Built-in keys are validated overrides with compiled caps; any other key is a full custom definition. Custom agents are closed-world: tools is required (use [] for none); missing skills/mcp means none. Custom Code Mode is opt-in hybrid and requires the execute tool.",
   "type": "object",
   "additionalProperties": false,
   "required": ["version", "display"],
@@ -81,7 +81,7 @@
     },
     "skills": {
       "type": "array",
-      "description": "Skill names discovered under .agents/skills or .deep_agents/skills. Built-ins: null/omitted means all. Custom: omitted means none.",
+      "description": "Skill names discovered under workspace or harness .agents/skills and .deep_agents/skills. Built-ins: null/omitted means all. Custom: omitted means none. Save/preview accepts workspace_path to validate project-local skills; without it unknown names are warnings.",
       "uniqueItems": true,
       "items": {
         "type": "string"
@@ -139,14 +139,36 @@
         }
       }
     },
+    "routing": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Custom-agent auto-routing. Applied only when no explicit agent/chat agentKey exists and the workspace kind is generic. A unique match wins; multiple matches fall back to the built-in heuristic with a warning. Both lists non-empty means both must match.",
+      "properties": {
+        "workspace_kinds": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
+        "paths": {
+          "type": "array",
+          "description": "Glob patterns over the normalised absolute workspace path.",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
     "code_mode": {
       "type": "string",
       "enum": ["off", "none", "disabled", "hybrid", "both", "preferred", "only", "strict"],
-      "description": "Built-in Developer only. Custom agents must use off until the additive Code Mode capability lands."
+      "description": "Custom agents support off or hybrid. hybrid requires the execute tool. only and full_codemode are built-in Developer features."
     },
     "full_codemode": {
       "type": ["boolean", "null"],
-      "description": "Built-in Developer only. Opt-in promotion of hybrid to the full OpenCode surface."
+      "description": "Built-in Developer only. Custom agents cannot enable it; use hybrid Code Mode for the base surface."
     }
   }
 }

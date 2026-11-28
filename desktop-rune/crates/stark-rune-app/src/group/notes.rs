@@ -23,7 +23,7 @@ fn note_card<S: ProjectsHost + 'static>(note: &AgentNote, armed: bool) -> El {
         .w_full()
         .gap(6.0)
         .radius(12.0)
-        .border(1.0, ink("#fbbf2433"))
+        .border(1.0, ink("#a1a1aa33"))
         .border_layout()
         .fill(ink("#151311"))
         .px(12.0)
@@ -62,7 +62,7 @@ fn note_card<S: ProjectsHost + 'static>(note: &AgentNote, armed: bool) -> El {
                 .child(
                     text(if done { "☑" } else { "☐" }.to_string())
                         .font(rune::tok::TextStyle::new(11.0, 400.0))
-                        .color(if done { ink("#fbbf24") } else { ink("#71717a") }),
+                        .color(if done { ink("#a1a1aa") } else { ink("#71717a") }),
                 )
                 .child(
                     text(todo.text.clone())
@@ -131,7 +131,7 @@ pub fn group_notes_sheet<S: ProjectsHost + 'static>(notes: &NotesState, project_
                 .w_full()
                 .items_center()
                 .gap(8.0)
-                .child(icon(14.0, crate::icons::sticky_note(14.0, ink("#fcd34d"))))
+                .child(icon(14.0, crate::icons::sticky_note(14.0, ink("#a1a1aa"))))
                 .child(
                     text("Notes".to_string())
                         .grow(1.0)
@@ -184,7 +184,7 @@ pub fn group_notes_sheet<S: ProjectsHost + 'static>(notes: &NotesState, project_
             .w_full()
             .gap(8.0)
             .radius(12.0)
-            .border(1.0, ink("#fbbf2440"))
+            .border(1.0, ink("#a1a1aa40"))
             .border_layout()
             .fill(ink("#151311"))
             .px(12.0)
@@ -236,7 +236,7 @@ pub fn group_notes_sheet<S: ProjectsHost + 'static>(notes: &NotesState, project_
                             .py(6.0)
                             .radius(8.0)
                             .font(rune::tok::TextStyle::new(11.0, 600.0))
-                            .fill(ink("#fbbf24"))
+                            .fill(ink("#a1a1aa"))
                             .color(ink("#0a0a0d"))
                             .role("button")
                             .focusable(true)

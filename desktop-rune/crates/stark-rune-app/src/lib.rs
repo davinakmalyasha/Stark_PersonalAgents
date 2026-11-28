@@ -35,6 +35,9 @@ pub mod icons;
 #[cfg(feature = "rune-real")]
 #[path = "image_cache.rs"]
 pub mod image_cache;
+#[cfg(all(feature = "rune-real", not(target_arch = "wasm32")))]
+#[path = "island.rs"]
+pub mod island;
 #[cfg(feature = "rune-real")]
 #[path = "keys.rs"]
 pub mod keys;
@@ -45,8 +48,20 @@ pub mod motion;
 #[path = "notes.rs"]
 pub mod notes;
 #[cfg(feature = "rune-real")]
+#[path = "prefs.rs"]
+pub mod prefs;
+#[cfg(all(feature = "rune-real", not(target_arch = "wasm32")))]
+#[path = "presence.rs"]
+pub mod presence;
+#[cfg(all(feature = "rune-real", target_arch = "wasm32"))]
+#[path = "presence_web.rs"]
+pub mod presence;
+#[cfg(feature = "rune-real")]
 #[path = "projects.rs"]
 pub mod projects;
+#[cfg(feature = "rune-real")]
+#[path = "provider_keys.rs"]
+pub mod provider_keys;
 #[cfg(feature = "rune-real")]
 #[path = "rooms.rs"]
 pub mod rooms;
@@ -56,12 +71,18 @@ pub mod rune_canvas;
 #[cfg(feature = "rune-real")]
 #[path = "rune_transcript.rs"]
 pub mod rune_transcript;
+#[cfg(all(feature = "rune-real", not(target_arch = "wasm32")))]
+#[path = "screen.rs"]
+pub mod screen;
 #[cfg(feature = "rune-real")]
 #[path = "settings.rs"]
 pub mod settings;
 #[cfg(feature = "rune-real")]
 #[path = "shell.rs"]
 pub mod shell;
+#[cfg(feature = "rune-real")]
+#[path = "startup.rs"]
+pub mod startup;
 #[cfg(feature = "rune-real")]
 #[path = "stream.rs"]
 pub mod stream;
@@ -72,9 +93,6 @@ pub mod stream_accum;
 #[path = "stream_presentation.rs"]
 pub mod stream_presentation;
 #[cfg(feature = "rune-real")]
-#[path = "stt.rs"]
-pub mod stt;
-#[cfg(feature = "rune-real")]
 #[path = "token_stats.rs"]
 pub mod token_stats;
 #[cfg(feature = "rune-real")]
@@ -83,12 +101,21 @@ pub mod tool_labels;
 #[cfg(feature = "rune-real")]
 #[path = "transport.rs"]
 pub mod transport;
+#[cfg(all(feature = "rune-real", not(target_arch = "wasm32")))]
+#[path = "tray.rs"]
+pub mod tray;
+#[cfg(all(feature = "rune-real", not(target_arch = "wasm32")))]
+#[path = "tts.rs"]
+pub mod tts;
 #[cfg(feature = "rune-real")]
 #[path = "updater.rs"]
 pub mod updater;
 #[cfg(feature = "rune-real")]
 #[path = "voice.rs"]
 pub mod voice;
+#[cfg(feature = "rune-real")]
+#[path = "voice_audio.rs"]
+pub mod voice_audio;
 #[cfg(feature = "rune-real")]
 #[path = "voice_ws.rs"]
 pub mod voice_ws;

@@ -16,6 +16,8 @@ StarkRune.exe                 stable GUI-subsystem launcher/supervisor
 current.json                  atomic { version, previous }
 app/<version>/                stark-rune.exe + stark-server.exe + runtime
 models/                       shared voice models, not duplicated per version
+  stt/parakeet-unified-en-0.6b/parakeet-unified-en-0.6b-Q8_0.gguf
+                              Parakeet Unified English, 731 MB
 updates/                      staged payloads
 stark.ico                     shortcut/installer icon
 set-appid.ps1                 installer helper for the taskbar identity
@@ -45,10 +47,6 @@ pre-release identifiers compare numerically, so `master.10` is newer than
    davinakmalyasha/Stark_Rune_Releases
    ```
 
-   The build-only ONNX Runtime 1.26 DLL is published once as the `rune-deps`
-   prerelease in that repo. It is a dependency, not an update target; the
-   `rune-master` workflow downloads it by tag.
-
 2. Generate a passwordless minisign keypair outside the repository:
 
    ```bash
@@ -69,14 +67,23 @@ pre-release identifiers compare numerically, so `master.10` is newer than
    Optional Authenticode signing: `WINDOWS_CERT_BASE64` and
    `WINDOWS_CERT_PASSWORD`. Minisign is required regardless.
 
-4. Add a `models` junction in the install root if voice should reuse the old
-   local model bundle:
+4. Add a `models` junction in the install root and install the shared
+   Parakeet model (731 MB, SHA-256 below):
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File scripts/install-parakeet.ps1
+   ```
+
+   Or use the existing junction:
 
    ```powershell
    New-Item -ItemType Junction `
      -Path "$env:LOCALAPPDATA\Programs\StarkRune\models" `
      -Target "D:\Stark\resources\models"
    ```
+
+   Parakeet SHA-256:
+   `4b50b6dd862bf6e346929aaf4f5eaacec003bfa3f56462d6c874b41ef2f38795`
 
 ## What a master push does
 

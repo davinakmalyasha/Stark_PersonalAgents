@@ -164,13 +164,13 @@ pub fn avatar(name: &str, small: bool, owner: bool) -> El {
 
 pub fn status_chip(status: &str, awaiting: bool) -> El {
     let (bg, fg) = if awaiting {
-        (rgba(251.0, 191.0, 36.0, 0.14), ink("#fcd34d"))
+        (rgba(251.0, 191.0, 36.0, 0.14), ink("#a1a1aa"))
     } else {
         match status {
             "done" => (rgba(126.0, 224.0, 168.0, 0.13), ink("#7ee0a8")),
-            "doing" => (rgba(125.0, 211.0, 252.0, 0.13), ink("#7dd3fc")),
+            "doing" => (rgba(125.0, 211.0, 252.0, 0.13), ink("#e4e4e7")),
             "blocked" | "failed" => (rgba(251.0, 113.0, 133.0, 0.13), ink("#fb7185")),
-            "invalidated" => (rgba(179.0, 160.0, 255.0, 0.13), ink("#b3a0ff")),
+            "invalidated" => (rgba(179.0, 160.0, 255.0, 0.13), ink("#a1a1aa")),
             _ => (rgba(255.0, 255.0, 255.0, 0.07), ink("#a1a1aa")),
         }
     };

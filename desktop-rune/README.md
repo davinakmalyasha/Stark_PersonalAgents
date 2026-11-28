@@ -92,6 +92,11 @@ over approximating a CSS property.
   the band drags the window and keeps Aero Snap, snap layouts and the window
   menu. The browser renders the same band without caption buttons; Linux keeps
   its native frame.
+- **Provider keys** — the prompt-dock provider pill opens a Rune sheet that
+  lists masked OpenCode Go keys, lets you add/select/remove them, and shows
+  the active key's 5-hour, weekly and monthly allowance from the official
+  usage endpoint. Saved keys live in the harness secrets directory and take
+  effect on the next run; the `.env` key remains a fallback.
 - **Updates** — `updater.rs` follows the master feed. It checks on launch and
   every five minutes, downloads and verifies the signed payload, and stages it
   under `app/<version>`; `stark-launcher` switches `current.json` after the UI

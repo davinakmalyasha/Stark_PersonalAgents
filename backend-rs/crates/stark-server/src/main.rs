@@ -1204,16 +1204,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/tts", post(voice::tts_handler))
         .route("/api/tts/stream", post(voice::tts_stream_handler))
         .route("/api/tts/cancel", post(voice::tts_cancel_handler))
-        .route("/api/voice/start", post(voice::voice_start_handler))
         .route("/api/voice/status", get(voice::voice_status_handler))
-        .route("/api/voice/stop", post(voice::voice_stop_handler))
-        .route("/api/voice/mute", post(voice::voice_mute_handler))
         .route("/api/voice/interrupt", post(voice::voice_interrupt_handler))
-        .route("/api/voice/peek", get(voice::voice_peek_handler))
-        .route("/api/voice/send", post(voice::voice_send_handler))
         .route("/api/voice/warm_tts", post(voice::tts_warm_handler))
         .route("/api/voice/release_tts", post(voice::tts_release_handler))
         .route("/api/voice/release_asr", post(voice::release_asr_handler))
+        .route("/api/voice/warm_stt", post(voice::stt_warm_handler))
         .route("/api/voice/tts_status", get(voice::tts_status_handler))
         .route(
             "/api/transcribe",
@@ -8162,6 +8158,25 @@ mod tests {
         assert_eq!(usage["monthly"]["status"], "rate-limited");
         assert!(parse_opencode_usage(&json!({})).is_null());
         assert!(parse_opencode_usage(&json!({"usage": {}})).is_null());
+    }
+
+    #[test]
+    fn usage_passthrough_keeps_dashboard_fields_when_present() {
+        let value = json!({
+            "usage": {
+                "rolling": {"status": "ok", "percent": 1, "resetsAt": "2099-01-01T00:00:00Z"},
+                "weekly": {"status": "ok", "percent": 2, "resetsAt": "2099-01-02T00:00:00Z"},
+                "monthly": {"status": "ok", "percent": 3, "resetsAt": "2099-01-03T00:00:00Z"},
+                "tokens": 6930000000u64,
+                "requests": 19893u64,
+                "by_model": [{"model": "deepseek-v4.1-flash", "tokens": 100}]
+            }
+        });
+        let usage = parse_opencode_usage(&value);
+        assert_eq!(usage["rolling"]["percent"], 1.0);
+        assert_eq!(usage["tokens"], 6930000000u64);
+        assert_eq!(usage["requests"], 19893u64);
+        assert_eq!(usage["by_model"][0]["model"], "deepseek-v4.1-flash");
     }
 
     async fn group_provider_response(

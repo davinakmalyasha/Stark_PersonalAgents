@@ -61,13 +61,8 @@ cp "$DESKTOP/assets/stark.ico" "$STAGE/stark.ico"
 cp "$DESKTOP/packaging/set-appid.ps1" "$STAGE/set-appid.ps1"
 printf '{\n  "version": "%s",\n  "previous": null\n}\n' "$VERSION" > "$STAGE/current.json"
 
-# Shared runtime data stays outside versioned app folders.
-for dll in "$ROOT/backend-rs/onnxruntime.dll" "${STARK_ONNXRUNTIME_DLL:-}"; do
-  if [ -n "$dll" ] && [ -f "$dll" ]; then
-    cp "$dll" "$APP/onnxruntime.dll"
-    break
-  fi
-done
+# Shared runtime data stays outside versioned app folders. Parakeet is a
+# GGUF model linked into the server; no ONNX Runtime DLL ships with it.
 MODELS="${STARK_MODELS_DIR:-$ROOT/backend-rs/models}"
 if [ -d "$MODELS" ]; then
   mkdir -p "$STAGE/models"
@@ -77,7 +72,7 @@ if [ -n "${STARK_UPDATE_PUBKEY_FILE:-}" ] && [ -f "$STARK_UPDATE_PUBKEY_FILE" ];
   cp "$STARK_UPDATE_PUBKEY_FILE" "$STAGE/update.pub"
 fi
 mkdir -p "$STAGE/licenses"
-for license in POCKET_TTS_LICENSE THIRD_PARTY_VOICE.md; do
+for license in POCKET_TTS_LICENSE PARAKEET_LICENSE THIRD_PARTY_VOICE.md; do
   if [ -f "$ROOT/backend-rs/crates/stark-voice/$license" ]; then
     cp "$ROOT/backend-rs/crates/stark-voice/$license" "$STAGE/licenses/$license"
   fi

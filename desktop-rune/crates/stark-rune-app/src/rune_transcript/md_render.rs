@@ -38,17 +38,17 @@ fn rgba(r: f32, g: f32, b: f32, a: f32) -> rune::Color {
 fn syntax_theme() -> rune_kit::syntax::SyntaxTheme {
     use rune_kit::syntax::{Syntax, SyntaxTheme};
     SyntaxTheme::neutral(true)
-        .with(Syntax::Keyword, ink("#c678dd"))
+        .with(Syntax::Keyword, ink("#a1a1aa"))
         .with(Syntax::String, ink("#98c379"))
-        .with(Syntax::Number, ink("#d19a66"))
+        .with(Syntax::Number, ink("#a1a1aa"))
         .with(Syntax::Comment, ink("#5c6370"))
-        .with(Syntax::Type, ink("#d19a66"))
-        .with(Syntax::Function, ink("#61afef"))
+        .with(Syntax::Type, ink("#a1a1aa"))
+        .with(Syntax::Function, ink("#a1a1aa"))
         .with(Syntax::Property, ink("#e06c75"))
-        .with(Syntax::Punctuation, ink("#abb2bf"))
+        .with(Syntax::Punctuation, ink("#a1a1aa"))
         .with(Syntax::Inserted, ink("#98c379"))
         .with(Syntax::Deleted, ink("#e06c75"))
-        .with(Syntax::Parameter, ink("#abb2bf"))
+        .with(Syntax::Parameter, ink("#a1a1aa"))
 }
 
 /// Inline runs flattened to `rich` text + spans + link/strike maps.
@@ -95,16 +95,47 @@ fn inline_code_span(start: usize, end: usize) -> (rune::Span, rune::TextHighligh
         rune::Span::new(start, end)
             .mono()
             .size(INLINE_CODE_SIZE)
-            .color(ink("#a5b4fc")),
+            .color(ink("#a1a1aa")),
         rune::TextHighlight::new(start..end, rgba(39.0, 39.0, 42.0, 0.8))
             .ring(rgba(63.0, 63.0, 70.0, 0.5), 1.0)
             .pad(6.0),
     )
 }
 
+/// Inline code needs real advance around it: the well's paint-only 6px pad
+/// otherwise covers the neighbouring space and reads as `is`+`General`
+/// glued together. EN spaces are inserted into the display text (copy still
+/// uses the raw markdown), one when the neighbour is whitespace, two when
+/// the code butts against a word.
+const CODE_SPACE: char = '\u{2002}';
+
+fn inline_edge(inline: &stark_kit::markdown::Inline, first: bool) -> Option<char> {
+    use stark_kit::markdown::Inline;
+    let pick = |text: &str| {
+        if first {
+            text.chars().next()
+        } else {
+            text.chars().last()
+        }
+    };
+    match inline {
+        Inline::Text(t) | Inline::Code(t) => pick(t),
+        Inline::Bold(items) | Inline::Italic(items) | Inline::Strike(items) => {
+            let item = if first { items.first() } else { items.last() }?;
+            inline_edge(item, first)
+        }
+        Inline::Link { text, .. } => {
+            let item = if first { text.first() } else { text.last() }?;
+            inline_edge(item, first)
+        }
+        Inline::Image { alt, .. } => pick(alt),
+        Inline::Break => Some('\n'),
+    }
+}
+
 fn inlines(runs: &mut Runs, list: &[stark_kit::markdown::Inline], italic: bool) {
     use stark_kit::markdown::Inline;
-    for inline in list {
+    for (index, inline) in list.iter().enumerate() {
         match inline {
             Inline::Text(t) => {
                 let start = runs.text.len();
@@ -116,12 +147,31 @@ fn inlines(runs: &mut Runs, list: &[stark_kit::markdown::Inline], italic: bool) 
             }
             Inline::Break => runs.text.push('\n'),
             Inline::Code(t) => {
+                // Breathing room around the well (see `CODE_SPACE`).
+                let prev = runs.text.chars().last();
+                let next = list.get(index + 1).and_then(|item| inline_edge(item, true));
+                match prev {
+                    None => {}
+                    Some(c) if c.is_whitespace() => runs.text.push(CODE_SPACE),
+                    Some(_) => {
+                        runs.text.push(CODE_SPACE);
+                        runs.text.push(CODE_SPACE);
+                    }
+                }
                 let start = runs.text.len();
                 runs.text.push_str(t);
                 let (span, highlight) = inline_code_span(start, runs.text.len());
                 runs.spans.push(span);
                 runs.highlights.push(highlight);
                 runs.codes.push((start, runs.text.len()));
+                match next {
+                    None => {}
+                    Some(c) if c.is_whitespace() => runs.text.push(CODE_SPACE),
+                    Some(_) => {
+                        runs.text.push(CODE_SPACE);
+                        runs.text.push(CODE_SPACE);
+                    }
+                }
             }
             Inline::Bold(inner) => {
                 let start = runs.text.len();
@@ -153,7 +203,7 @@ fn inlines(runs: &mut Runs, list: &[stark_kit::markdown::Inline], italic: bool) 
                 let at = runs.spans.len();
                 runs.spans.push(
                     rune::Span::new(start, start)
-                        .color(ink("#60a5fa"))
+                        .color(ink("#a1a1aa"))
                         .underline(rgba(59.0, 130.0, 246.0, 0.4)),
                 );
                 inlines(runs, text, italic);
@@ -163,8 +213,8 @@ fn inlines(runs: &mut Runs, list: &[stark_kit::markdown::Inline], italic: bool) 
                     runs.links.push(
                         rune::Link::new(start..runs.text.len(), href.clone()).hover(
                             rune::LinkPaint::new()
-                                .color(ink("#93c5fd"))
-                                .underline(ink("#60a5fa")),
+                                .color(ink("#a1a1aa"))
+                                .underline(ink("#a1a1aa")),
                         ),
                     );
                 } else {
@@ -985,7 +1035,7 @@ fn code_block<S: TranscriptHost + 'static>(
     // sixteenth line for it.
     let code = code.strip_suffix('\n').unwrap_or(code);
     let base = if highlighted {
-        ink("#abb2bf")
+        ink("#a1a1aa")
     } else {
         ink("#d4d4d8")
     };
@@ -1411,9 +1461,9 @@ fn diff<S: TranscriptHost + 'static>(s: &S, which: Thread, key: &str, raw: &str)
                 .child(rune::el().size(13.0, 13.0).inert().shape(icon_chevron(
                     !expanded,
                     13.0,
-                    ink("#818cf8"),
+                    ink("#6ee7b7"),
                 )))
-                .child(text(label).font(label_style).color(ink("#818cf8")))
+                .child(text(label).font(label_style).color(ink("#6ee7b7")))
                 .on_press_enter(move |s: &mut S| {
                     let t = s.thread_mut(which);
                     let expanded = &mut t.expanded_diffs;
@@ -1576,6 +1626,34 @@ mod streaming_tests {
         );
         // Empty items and non-para first blocks pass through untouched.
         assert!(prepend_space(&[]).is_empty());
+    }
+
+    #[test]
+    fn inline_code_gets_breathing_room() {
+        use stark_kit::markdown::Inline;
+        let mut runs = Runs::default();
+        inlines(
+            &mut runs,
+            &[
+                Inline::Text("is ".into()),
+                Inline::Code("General".into()),
+                Inline::Text(" (the".into()),
+            ],
+            false,
+        );
+        assert!(
+            runs.text.starts_with("is \u{2002}General\u{2002} "),
+            "spaces stay around the code well: {:?}",
+            runs.text
+        );
+        // Word-adjacent code gets two EN spaces so the 6px pad cannot overlap.
+        let mut tight = Runs::default();
+        inlines(
+            &mut tight,
+            &[Inline::Text("foo".into()), Inline::Code("bar".into())],
+            false,
+        );
+        assert!(tight.text.starts_with("foo\u{2002}\u{2002}bar"));
     }
 
     #[test]

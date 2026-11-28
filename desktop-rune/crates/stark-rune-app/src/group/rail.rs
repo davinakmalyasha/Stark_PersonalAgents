@@ -684,7 +684,7 @@ fn team(detail: &GroupDetail) -> El {
                         .size(5.0, 5.0)
                         .radius(2.5)
                         .fill(if active.is_some() {
-                            ink("#7dd3fc")
+                            ink("#e4e4e7")
                         } else {
                             ink("#3f3f46")
                         }),

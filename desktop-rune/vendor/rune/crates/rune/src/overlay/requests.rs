@@ -25,6 +25,8 @@ pub(super) struct Requests<T> {
     pub macos_level: Option<isize>,
     pub exclude_from_capture: Option<bool>,
     pub xwayland_input: Option<bool>,
+    /// Whether a click can activate the overlay so a text field takes keys.
+    pub activatable: Option<bool>,
     /// The `setup` waker fired.
     pub woken: bool,
     pub updates: Vec<Update<T>>,
@@ -34,7 +36,7 @@ impl<T> Default for Requests<T> {
     fn default() -> Self {
         Requests {
             input: None, follow_pointer: None, placement: None, display: None, request_keys: false, refollow: false, visible: None, edge: None,
-            margin: None, align: None, size: None, fade: None, macos_level: None, exclude_from_capture: None, xwayland_input: None, woken: false, updates: Vec::new(),
+            margin: None, align: None, size: None, fade: None, macos_level: None, exclude_from_capture: None, xwayland_input: None, activatable: None, woken: false, updates: Vec::new(),
         }
     }
 }
@@ -51,5 +53,14 @@ impl<T: 'static> Overlay<T> {
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let support: Option<crate::OverlaySupport> = None;
         if let Some(support) = support { self.shared.native.lock().unwrap().1.capture_exclusion = support; }
+    }
+
+    /// Windows only: whether a click on an input region activates the overlay
+    /// (so a focused text field receives keys). Other platforms use
+    /// `OverlayHandle::request_keys` / `KeyPolicy::OnDemand` instead.
+    pub(super) fn set_activatable(&mut self, active: bool) {
+        self.options.activatable = active;
+        #[cfg(target_os = "windows")]
+        if let Some(native) = &mut self.native { native.set_activatable(active); }
     }
 }

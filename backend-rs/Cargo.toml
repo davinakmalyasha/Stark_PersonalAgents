@@ -57,3 +57,8 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 [patch.crates-io]
 portable-pty = { path = "vendor/portable-pty" }
+# Hex's pinned transcribe.cpp: the Parakeet buffered-stream padding fix and
+# vocabulary rescoring are not in a released crate yet. Keep this rev in step
+# with Hex's `Cargo.toml`.
+transcribe-cpp = { git = "https://github.com/anomalyco/transcribe.cpp", rev = "60bed89dab84f7c1fddc3a17ad7fa8a27ddfba19" }
+transcribe-cpp-sys = { git = "https://github.com/anomalyco/transcribe.cpp", rev = "60bed89dab84f7c1fddc3a17ad7fa8a27ddfba19" }

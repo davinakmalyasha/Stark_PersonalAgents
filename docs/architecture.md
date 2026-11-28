@@ -35,6 +35,72 @@ keeps the symbols readable on the dark fill. Canvas cards are small chat
 surfaces with their own drafts and sends. Overlays mount at the shell or modal
 root so they escape clipping.
 
+### Desktop presence
+
+The native app is also a background desktop surface:
+
+- **Stark Island** (`island.rs`) is a Rune overlay at the top-center of the
+  primary display. It is transparent, topmost and skipped from the taskbar;
+  only the notch itself is an input region, so the rest of its 620×560 window
+  is click-through. The island exists only in live mode, and arming alone
+  raises it: the prompt-dock mic warms the speech models and shows the idle
+  island (104×24 mark + status dot, white hairline, no glow), while only the
+  island's mic — or `Ctrl+Space` while armed — starts capture.
+  Hover opens the **Overview / Work** shell on the active thread. Overview is
+  the default and replaces the old status line with a two-seat mode rail:
+  - **Overview** is a glanceable dashboard: running agents and their current
+    activity, active run time, items waiting on the user, and the last three
+    finished/stopped/failed runs. The top-right chevron opens Work and the
+    adjacent close button collapses the island. There is no live status strip
+    and no count in the rail.
+  - **Work** is the activity shelf: running chats, active group projects and
+    cloud runs, three rows at a time with the rest scrolling. The top-right
+    add control fans into Chat / Group / Cloud; each offers a new item or picks
+    an existing one. Choosing a chat opens one pinned in-overlay chat at a time
+    (no tab strip), backed by the same markdown renderer as the main
+    transcript. The chat surface captures the whole overlay so a click can
+    never leak through.
+  The chat prompt dock is one inline row: text field, Live split control and
+  send. The Live control's left side starts/stops capture; its chevron opens
+  the anchored settings menu. Per-chat settings are **Dictate** (STT turns
+  speech into an editable draft), **Live** (STT auto-sends and the final reply
+  is spoken through the backend TTS), **Off**, and an independent **Share
+  screen** toggle. The screen worker captures the selected display, uploads
+  frames to `/api/vision/frame`, and attaches the latest frame to the next
+  turn. Only one chat can be live at a time; leaving the chat ends capture,
+  speech and screen sharing. Live chats opt into keyboard activation
+  (`OverlayHandle::set_activatable`) so the dock can take keys; the window
+  style alone never steals focus. A fresh hover starts on Overview again.
+  Turning the dock off disarms every bus, releases the models and hides the
+  island. A hidden island releases its GPU surface after 20s.
+- **Background lifetime** (`presence.rs`, `shell.rs`) uses `keep_running`:
+  closing the main window hides it and stops capture but keeps live mode
+  armed — agents, the tray and the idle island stay alive. `--background`
+  starts windowless (tray only) and
+  the launcher forwards `STARK_BACKGROUND` across update restarts.
+- **Speech models are live-mode owned.** The backend loads Parakeet Unified
+  English (0.6B Q8_0) lazily on first live use (`session.start`, file
+  transcription) and `POST /api/voice/release_asr` drops it; TTS warms when
+  the first bus arms or a chat selects Live (`POST /api/voice/warm_tts`) and
+  releases only once no bus is armed, no chat is live and no reply is speaking
+  (`POST /api/voice/release_tts`). The app captures PCM only; there is no
+  on-device STT engine. Stopping capture drops back to armed-idle. An idle,
+  disarmed app holds no STT memory; the ~500 MB UI baseline is the
+  Rune/GPU/fonts working set, not speech.
+- **Tray** (`tray.rs`) owns a native status icon and menu: Open Stark, Listen,
+  Show/Hide island, Auto-send voice, Start with Windows and Quit. A second
+  launch signals the running UI through `Local\StarkRuneOpen` instead of
+  showing an "already running" dialog.
+- **Shortcuts** are OS-global: `Ctrl+Space` arms live mode, then toggles
+  listening while armed, and `Ctrl+Alt+S`
+  opens Stark. Voice finals either stage a reviewable composer draft or send
+  immediately, depending on the local **Auto-send voice** preference.
+- **Preferences** (`prefs.rs`) live in `.deep_agents/desktop.json`: island
+  visibility, auto-send, capture exclusion and Start with Windows. The file is
+  local and is not part of chat exports.
+- The browser build keeps the in-page voice dialog; native-only overlays, tray
+  and global shortcuts are compiled out on wasm.
+
 State is plain Rust. Host traits (`TranscriptHost`, `CanvasHost`,
 `ProjectsHost`, `SettingsHost`, and related traits) let shared views resolve the
 active thread or panel without borrowing the whole app. Handlers capture stable

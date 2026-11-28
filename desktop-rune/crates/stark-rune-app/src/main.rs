@@ -44,6 +44,9 @@ mod icons;
 #[cfg(feature = "rune-real")]
 #[path = "image_cache.rs"]
 mod image_cache;
+#[cfg(all(feature = "rune-real", not(target_arch = "wasm32")))]
+#[path = "island.rs"]
+mod island;
 #[cfg(feature = "rune-real")]
 mod keys;
 #[cfg(feature = "rune-real")]
@@ -51,7 +54,18 @@ mod motion;
 #[cfg(feature = "rune-real")]
 mod notes;
 #[cfg(feature = "rune-real")]
+#[path = "prefs.rs"]
+mod prefs;
+#[cfg(all(feature = "rune-real", not(target_arch = "wasm32")))]
+#[path = "presence.rs"]
+mod presence;
+#[cfg(all(feature = "rune-real", target_arch = "wasm32"))]
+#[path = "presence_web.rs"]
+mod presence;
+#[cfg(feature = "rune-real")]
 mod projects;
+#[cfg(feature = "rune-real")]
+mod provider_keys;
 #[cfg(feature = "rune-real")]
 mod rooms;
 #[cfg(feature = "rune-real")]
@@ -59,9 +73,13 @@ mod rune_canvas;
 #[cfg(feature = "rune-real")]
 mod rune_transcript;
 #[cfg(feature = "rune-real")]
+mod screen;
+#[cfg(feature = "rune-real")]
 mod settings;
 #[cfg(feature = "rune-real")]
 mod shell;
+#[cfg(feature = "rune-real")]
+mod startup;
 #[cfg(feature = "rune-real")]
 mod stream;
 #[cfg(feature = "rune-real")]
@@ -69,17 +87,22 @@ mod stream_accum;
 #[cfg(feature = "rune-real")]
 mod stream_presentation;
 #[cfg(feature = "rune-real")]
-mod stt;
-#[cfg(feature = "rune-real")]
 mod token_stats;
 #[cfg(feature = "rune-real")]
 mod tool_labels;
 #[cfg(feature = "rune-real")]
 mod transport;
+#[cfg(all(feature = "rune-real", not(target_arch = "wasm32")))]
+#[path = "tray.rs"]
+mod tray;
+#[cfg(feature = "rune-real")]
+mod tts;
 #[cfg(feature = "rune-real")]
 mod updater;
 #[cfg(feature = "rune-real")]
 mod voice;
+#[cfg(feature = "rune-real")]
+mod voice_audio;
 #[cfg(feature = "rune-real")]
 mod voice_ws;
 
@@ -662,6 +685,7 @@ fn print_usage() {
     eprintln!("stark-rune --rune-shell-snap <png> [--rune-route <home|stream|trace|cloud|memory|attachments|attachments-lightbox|ask|voice|group|group-loading|settings>]  (single-page shell PNG; all scenes land on the one page)");
     eprintln!("stark-rune --replay-sse <file> [--prompt <text>]  (replay recorded SSE into transcript rows)");
     eprintln!("stark-rune --api-get <path> [--api-port <n>]  (live GET against stark-server)");
+    eprintln!("stark-rune --background  (start in the system tray with only the Stark Island)");
     eprintln!("stark-rune --version  (app version + pinned Rune revision)");
 }
 
@@ -892,6 +916,23 @@ fn run_cli() {
             return;
         }
     }
+    // Start hidden with only the island + tray. The launcher passes this
+    // through `STARK_BACKGROUND` on update restarts; direct launches use the
+    // flag so a Start-with-Windows shortcut can opt in without a wrapper.
+    if args.iter().any(|arg| arg == "--background") {
+        #[cfg(feature = "rune-real")]
+        {
+            std::env::set_var("STARK_BACKGROUND", "1");
+            shell::run_shell_headless(vec![]);
+            return;
+        }
+        #[cfg(not(feature = "rune-real"))]
+        {
+            eprintln!("--background needs --features rune-real.");
+            std::process::exit(2);
+        }
+    }
+
     // Double-click / plain invocation: open the native shell directly, the
     // same entry the browser build uses. A recognized CLI flag still runs
     // its command; unknown arguments fall through to the usage text.

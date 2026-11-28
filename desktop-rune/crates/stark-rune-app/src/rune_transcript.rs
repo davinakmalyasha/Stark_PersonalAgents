@@ -152,7 +152,7 @@ impl UsageTotals {
 /// Live provider label (`fetchProvider` → `ProviderInfo`): `OpenCode Go`
 /// when the gateway is opencode, else `provider_label || provider`. `warn`
 /// mirrors the trigger's `is-warning` (no key or a provider health error).
-/// The agent-config modal it opens is unported, so the pill is a display.
+/// The pill opens the provider/key panel.
 #[derive(Debug)]
 pub struct ProviderState {
     pub label: String,
@@ -312,6 +312,17 @@ pub fn poll_models_state(s: &mut RuneTranscriptState, clock: f64) -> bool {
 /// Failures keep the last label (the effect swallows errors).
 pub fn poll_provider_state(s: &mut RuneTranscriptState, clock: f64) -> bool {
     let mut changed = false;
+    if s.provider_keys.dirty {
+        s.provider_keys.dirty = false;
+        s.provider.warn = !s.provider_keys.has_key;
+        if !s.provider_keys.label.is_empty() {
+            s.provider.label = s.provider_keys.label.clone();
+        }
+        // Re-read `/api/provider` on the next frame instead of waiting for
+        // the 30s cache to expire.
+        s.provider.last_try = f64::NEG_INFINITY;
+        changed = true;
+    }
     let (msgs, _) = crate::rooms::drain_results(&mut s.provider.inbox);
     for msg in msgs {
         if let Ok(next) = msg {
@@ -736,8 +747,12 @@ pub struct RuneTranscriptState {
     /// changes where the NEXT prompt is marked to go — the transfer itself
     /// lands next, same as the reference UI, so sends behave identically either way.
     pub run_target: String,
-    /// Usage totals for the orb + popover (`combinedTokenUsage`).
+    /// Usage totals for the orb + popover (`combinedTokenUsage`). Live runs
+    /// accumulate from `delta kind:"usage"`; loaded history rebuilds from the
+    /// rows' persisted `metadata.usage` (see `sync_usage_from_rows`).
     pub usage: UsageTotals,
+    /// Hovered user-turn tick in the conversation rail.
+    pub rail_hover: Option<usize>,
     /// Usage popover open (tap the orb; the reference UI hovers — tap is the honest
     /// native equivalent, no hover targeting headlessly).
     pub usage_open: bool,
@@ -746,6 +761,8 @@ pub struct RuneTranscriptState {
     /// Agents & providers modal state (per thread — the pill lives in every
     /// dock, so every thread owns its modal).
     pub agent_config: crate::agent_config::AgentConfigState,
+    /// Provider panel: masked OpenCode Go keys + the active key's allowance.
+    pub provider_keys: crate::provider_keys::ProviderKeysState,
     /// Model options (`GET /api/models` → `{models:[{id,name}]}`), fetched
     /// once per thread lifetime (the reference UI fetches on mount; 60s retry keeps a
     /// cold start honest).
@@ -894,9 +911,11 @@ impl Clone for RuneTranscriptState {
             ask: self.ask.clone(),
             run_target: self.run_target.clone(),
             usage: self.usage.clone(),
+            rail_hover: self.rail_hover,
             usage_open: self.usage_open,
             stats_open: self.stats_open,
             agent_config: self.agent_config.clone(),
+            provider_keys: self.provider_keys.clone(),
             models: self.models.clone(),
             models_loading: self.models_loading,
             models_ok: self.models_ok,
@@ -1005,9 +1024,11 @@ impl RuneTranscriptState {
             ask: crate::ask::AskState::default(),
             run_target: "local".to_string(),
             usage: UsageTotals::default(),
+            rail_hover: None,
             usage_open: false,
             stats_open: false,
             agent_config: crate::agent_config::AgentConfigState::default(),
+            provider_keys: crate::provider_keys::ProviderKeysState::default(),
             models: Vec::new(),
             models_loading: false,
             models_ok: false,
@@ -1088,9 +1109,11 @@ impl RuneTranscriptState {
             ask: crate::ask::AskState::default(),
             run_target: "local".to_string(),
             usage: UsageTotals::default(),
+            rail_hover: None,
             usage_open: false,
             stats_open: false,
             agent_config: crate::agent_config::AgentConfigState::default(),
+            provider_keys: crate::provider_keys::ProviderKeysState::default(),
             models: Vec::new(),
             models_loading: false,
             models_ok: false,
@@ -1329,10 +1352,10 @@ pub const MAX_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
 /// Attachments count as content, so an attachment-only send is allowed; the
 /// text is only cleared once staging succeeded (the reference UI's guard keeps a live
 /// run's draft in place).
-pub fn stage_send(s: &mut RuneTranscriptState) {
+pub fn stage_send(s: &mut RuneTranscriptState) -> bool {
     let prompt = s.edit.text.trim().to_string();
     if (prompt.is_empty() && s.draft_attachments.is_empty()) || s.live || s.aborting {
-        return;
+        return false;
     }
     let attachments = s.draft_attachments.clone();
     if stage_send_prompt_with_attachments(s, prompt, attachments) {
@@ -1342,6 +1365,9 @@ pub fn stage_send(s: &mut RuneTranscriptState) {
         // The reference UI's PromptDock clears both dock lists after `handleSend`.
         s.draft_attachments.clear();
         s.attachments_error = None;
+        true
+    } else {
+        false
     }
 }
 
@@ -1498,6 +1524,42 @@ fn chat_title(prompt: &str) -> String {
 }
 
 impl RuneTranscriptState {
+    /// Rebuild the thread's usage totals from the loaded rows.
+    ///
+    /// Live runs already accumulate from `delta kind:"usage"` frames; a chat
+    /// restored from history has no frames to replay, so the orb/popover read
+    /// zero until this runs. Each agent row carries its persisted
+    /// `metadata.usage`, which is also where retries and restored runs live.
+    pub fn sync_usage_from_rows(&mut self) {
+        let mut totals = UsageTotals::default();
+        for row in &self.rows {
+            if !row.has_usage {
+                continue;
+            }
+            let (input, output, hits, cost) = match &row.run_usage {
+                Some(u) => (u.input, u.output, u.cache_hit, u.cost),
+                None => (row.tokens_in, row.tokens_out, 0, 0.0),
+            };
+            totals.input = totals.input.saturating_add(input);
+            totals.output = totals.output.saturating_add(output);
+            totals.cache_hit = totals.cache_hit.saturating_add(hits);
+            totals.cost += cost;
+            // The last usage-bearing call is the current context size.
+            totals.active = input;
+            totals.calls.push(UsageCall {
+                agent: "chat".to_string(),
+                model: self.model.clone(),
+                input,
+                output,
+                hits,
+                misses: input.saturating_sub(hits),
+                cost,
+                at: row.at.clone(),
+            });
+        }
+        self.usage = totals;
+    }
+
     /// `workspaceKind` sent with the chat run command (deterministic routing).
     pub fn workspace_kind(&self) -> String {
         match self.workspace_id.as_str() {
@@ -2376,7 +2438,19 @@ pub fn transcript_view_body<S: TranscriptHost + crate::settings::SettingsHost + 
     s: &RuneTranscriptState,
     which: Thread,
 ) -> El {
-    transcript_body_with::<S>(s, which, true, false, true, 0.0, 0.0, false)
+    let mut root = transcript_body_with::<S>(s, which, true, false, true, 0.0, 0.0, false);
+    // The app docks this beside the chat; the standalone transcript overlays
+    // it on the right edge so the drill still has a home outside the shell.
+    if let Some(panel) = subagent_panel::<S>(s, which, None, 420.0) {
+        root = root.child(
+            col()
+                .key("subagent-panel-overlay")
+                .pin(None, Some(0.0), Some(0.0), Some(0.0))
+                .h_full()
+                .child(panel),
+        );
+    }
+    root
 }
 
 /// Deduped home transcript state (`MessageStream`): agent rows that merely
@@ -2981,24 +3055,22 @@ pub fn attachment_lightbox<S: 'static>(
         .child(content)
 }
 
-/// `MessageBubble.copyMessage`: write the row's raw text and, for user and
-/// error rows only, hold the reference UI's 1.5s Check state. Agent copy has no feedback.
+/// `MessageBubble.copyMessage`: write the row's raw text and hold the
+/// reference UI's 1.5s Check state. Every role gets the same confirmation —
+/// user, error and agent copy feel identical.
 fn copy_message<S: TranscriptHost + 'static>(
     s: &mut S,
     which: Thread,
     key: &str,
     text: String,
-    feedback: bool,
     tx: &mut rune::Tx,
 ) {
     tx.copy(text);
-    if feedback {
-        s.thread_mut(which)
-            .copied_messages
-            .insert(key.to_string(), crate::clock::now_millis());
-        // Poll again when the 1.5s window ends even if nothing else moves.
-        tx.wake_after(std::time::Duration::from_millis(50));
-    }
+    s.thread_mut(which)
+        .copied_messages
+        .insert(key.to_string(), crate::clock::now_millis());
+    // Poll again when the 1.5s window ends even if nothing else moves.
+    tx.wake_after(std::time::Duration::from_millis(50));
 }
 
 /// First press arms the row; the 3.2s poll timeout disarms it. The reference UI keeps
@@ -3128,6 +3200,7 @@ fn apply_rewind(s: &mut RuneTranscriptState, result: RewindOk) {
         .iter()
         .map(crate::rune_canvas::row_from_chat)
         .collect();
+    s.sync_usage_from_rows();
     // A rewound row is gone for good; if it ever comes back it is a fresh
     // mount and should animate again.
     let live: std::collections::HashSet<String> =
@@ -3551,6 +3624,8 @@ fn home_user_row<S: TranscriptHost + 'static>(s: &S, which: Thread, r: &RowData,
     if let Some(attachments) = home_message_attachments::<S>(s, which, r) {
         bubble = bubble.child(attachments);
     }
+    // Copy and rewind belong to user turns only; the whole message band is
+    // the hover trigger, so the strip appears without aiming at the bubble.
     let mut actions = row()
         .key(format!("{}-actions", r.key))
         .w_full()
@@ -3558,7 +3633,8 @@ fn home_user_row<S: TranscriptHost + 'static>(s: &S, which: Thread, r: &RowData,
         .items_center()
         .gap(4.0)
         .mt(4.0)
-        .pr(2.0);
+        .pr(2.0)
+        .group_opacity(0.0, 1.0);
     if !stamp.is_empty() {
         actions = actions.child(
             text(stamp)
@@ -3586,7 +3662,7 @@ fn home_user_row<S: TranscriptHost + 'static>(s: &S, which: Thread, r: &RowData,
             .hover(home_rgba(255.0, 255.0, 255.0, 0.07))
             .hover_group()
             .on_press_tx_enter(move |s: &mut S, tx: &mut rune::Tx| {
-                copy_message(s, which, &copy_key, copy_text.clone(), true, tx);
+                copy_message(s, which, &copy_key, copy_text.clone(), tx);
             })
             .child(if copied {
                 rune::el()
@@ -3668,6 +3744,7 @@ fn home_user_row<S: TranscriptHost + 'static>(s: &S, which: Thread, r: &RowData,
         .key(format!("{}-group", r.key))
         .w_full()
         .mb(24.0)
+        .hover_group()
         .child(row().w_full().justify_end().child(bubble))
         .child(actions)
 }
@@ -3677,7 +3754,7 @@ fn home_agent_row<S: TranscriptHost + 'static>(
     which: Thread,
     r: &RowData,
     live: bool,
-    retry_prompt: &str,
+    _retry_prompt: &str,
 ) -> El {
     let streaming = r.is_streaming || (live && r.accum.is_some());
     let presentation = if let Some(acc) = &r.accum {
@@ -3780,7 +3857,7 @@ fn home_agent_row<S: TranscriptHost + 'static>(
                 text("▍".to_string())
                     .key(format!("{}-caret", r.key))
                     .font(home_body_style())
-                    .color(home_ink("#a78bfa"))
+                    .color(home_ink("#a1a1aa"))
                     .ml(1.0)
                     .looping(rune::LoopSpec::cycle(crate::motion::CARET)),
             );
@@ -3822,49 +3899,51 @@ fn home_agent_row<S: TranscriptHost + 'static>(
         group = group.child(dots);
     }
 
-    if r.has_usage && !streaming {
+    if !streaming {
         let mono = {
             let mut style = rune::tok::TextStyle::new(10.5, 400.0).mono();
             // `.agent-message-footer`: text-[10.5px] at leading 1.5.
             style.line_height = 15.75;
             style
         };
+        // Tokens, time and copy share one left-aligned strip. It stays
+        // invisible at rest (but occupies its line) and fades in with the
+        // row's hover; agents offer copy only.
         let mut footer = row()
             .key(format!("{}-footer", r.key))
+            .w_full()
             .items_center()
-            .gap(12.0)
+            .gap(10.0)
             .mt(8.0)
-            .child(
-                text(format!("↑{}", thousands(r.tokens_in)))
-                    .key(format!("{}-in", r.key))
-                    .font(mono)
-                    .color(home_ink("#52525b")),
-            )
-            .child(
-                text(format!("↓{}", thousands(r.tokens_out)))
-                    .key(format!("{}-out", r.key))
-                    .font(mono)
-                    .color(home_ink("#52525b")),
-            );
-        let stamp = clock(&r.at);
-        if !stamp.is_empty() {
-            footer = footer.child(
-                text(stamp)
-                    .key(format!("{}-time", r.key))
-                    .font(mono)
-                    .color(home_ink("#52525b")),
-            );
+            .group_opacity(0.0, 1.0);
+        if r.has_usage {
+            footer = footer
+                .child(
+                    text(format!("↑{}", thousands(r.tokens_in)))
+                        .key(format!("{}-in", r.key))
+                        .font(mono)
+                        .color(home_ink("#52525b")),
+                )
+                .child(
+                    text(format!("↓{}", thousands(r.tokens_out)))
+                        .key(format!("{}-out", r.key))
+                        .font(mono)
+                        .color(home_ink("#52525b")),
+                );
+            let stamp = clock(&r.at);
+            if !stamp.is_empty() {
+                footer = footer.child(
+                    text(stamp)
+                        .key(format!("{}-time", r.key))
+                        .font(mono)
+                        .color(home_ink("#52525b")),
+                );
+            }
         }
+        footer = footer.child(agent_copy_action::<S>(s, which, r, &final_text));
         group = group.child(footer);
     }
-    group.child(home_agent_actions(
-        s,
-        which,
-        r,
-        &final_text,
-        streaming,
-        retry_prompt,
-    ))
+    group
 }
 
 /// Undo pill state per artifact row is `ArtifactUndo` (`idle` = absent).
@@ -3998,7 +4077,7 @@ fn artifact_status_icon(status: crate::chats::ArtifactStatus, size: f32) -> El {
         crate::chats::ArtifactStatus::Modified => rune::el()
             .size(size, size)
             .inert()
-            .shape(crate::icons::pencil(size, home_ink("#c4ad78"))),
+            .shape(crate::icons::pencil(size, home_ink("#a1a1aa"))),
     }
 }
 
@@ -4588,75 +4667,53 @@ fn thousands(n: u64) -> String {
     out
 }
 
-/// Hover-revealed agent actions (the reference UI reserves the 25pt row at rest).
-/// Retry hides while the answer streams; copy always stays. Agent copy has
-/// no Check feedback (the reference UI writes to the clipboard only).
-fn home_agent_actions<S: TranscriptHost + 'static>(
-    _s: &S,
+/// Agent copy action, placed in the footer beside the token/time strip.
+/// Agents never offer rewind or retry here; their turn is already complete.
+fn agent_copy_action<S: TranscriptHost + 'static>(
+    s: &S,
     which: Thread,
     r: &RowData,
     response: &str,
-    streaming: bool,
-    retry_prompt: &str,
 ) -> El {
-    let mut actions = row()
-        .key(format!("{}-actions", r.key))
-        .w_full()
-        .h(25.0)
-        .justify_end()
-        .items_center()
-        .gap(2.0)
-        .mt(8.0)
-        .group_opacity(0.0, 1.0);
-    if !streaming {
-        let prompt = retry_prompt.to_string();
-        actions = actions.child(
-            rune::el()
-                .key(format!("{}-retry", r.key))
-                .role("button")
-                .focusable(true)
-                .label("Retry — re-run the last request")
-                .size(25.0, 25.0)
-                .radius(6.0)
-                .center()
-                .hover(home_ink("#27272a"))
-                .hover_group()
-                .on_press_tx_enter(move |s: &mut S, _tx: &mut rune::Tx| {
-                    stage_send_prompt(s.thread_mut(which), prompt.clone());
-                })
-                // `.pressable:active { transform: scale(.96) }`; after the
-                // press handler, which is when `press_scale` takes.
-                .press_scale(0.96)
-                .child(crate::motion::hover_icon(
-                    12.0,
-                    home_icon_rotate(12.0, home_ink("#71717a")),
-                    home_icon_rotate(12.0, home_ink("#d4d4d8")),
-                )),
-        );
-    }
+    let copied = s.thread(which).copied_messages.contains_key(&r.key);
     let copy_text = response.to_string();
     let copy_key = r.key.clone();
-    actions.child(
-        rune::el()
-            .key(format!("{}-copy", r.key))
-            .role("button")
-            .focusable(true)
-            .label("Copy to clipboard")
-            .size(25.0, 25.0)
-            .radius(6.0)
-            .center()
-            .hover(home_ink("#27272a"))
-            .hover_group()
-            .on_press_tx_enter(move |s: &mut S, tx: &mut rune::Tx| {
-                copy_message(s, which, &copy_key, copy_text.clone(), false, tx);
-            })
-            .press_scale(0.96)
-            .child(crate::motion::hover_icon(
+    rune::el()
+        .key(format!("{}-copy", r.key))
+        .role("button")
+        .focusable(true)
+        .label(if copied {
+            "Copied"
+        } else {
+            "Copy to clipboard"
+        })
+        .help(if copied {
+            "Copied"
+        } else {
+            "Copy to clipboard"
+        })
+        .size(25.0, 25.0)
+        .radius(6.0)
+        .center()
+        .hover(home_ink("#27272a"))
+        .hover_group()
+        .on_press_tx_enter(move |s: &mut S, tx: &mut rune::Tx| {
+            copy_message(s, which, &copy_key, copy_text.clone(), tx);
+        })
+        .press_scale(0.96)
+        .child(if copied {
+            rune::el()
+                .key(format!("{}-copy-check", r.key))
+                .size(12.0, 12.0)
+                .inert()
+                .shape(crate::lucide_check(12.0, 2.0, home_ink("#34d399")))
+        } else {
+            crate::motion::hover_icon(
                 12.0,
                 home_icon_copy(12.0, home_ink("#71717a")),
                 home_icon_copy(12.0, home_ink("#d4d4d8")),
-            )),
-    )
+            )
+        })
 }
 
 /// `MessageBubble` system note (`.system-message-note`).
@@ -4757,7 +4814,7 @@ fn home_error_row<S: TranscriptHost + 'static>(
         .radius(6.0)
         .hover(home_rgba(255.0, 255.0, 255.0, 0.06))
         .on_press_tx_enter(move |s: &mut S, tx: &mut rune::Tx| {
-            copy_message(s, which, &copy_key, copy_text.clone(), true, tx);
+            copy_message(s, which, &copy_key, copy_text.clone(), tx);
         })
         .child(rune::el().size(10.0, 10.0).inert().shape(if copied {
             crate::lucide_check(10.0, 2.0, home_ink("#34d399"))
@@ -4861,7 +4918,7 @@ fn home_session_event<S: TranscriptHost + 'static>(
         )
     };
     let icon = if aborted {
-        home_icon_square(10.0, home_ink("#fcd34d"))
+        home_icon_square(10.0, home_ink("#a1a1aa"))
     } else {
         home_icon_archive(11.0, home_ink("#8b8b94"))
     };
@@ -5075,80 +5132,141 @@ fn home_row<S: TranscriptHost + 'static>(
     root.child(group)
 }
 
-/// `ConversationRail`: up to six 7×2 turn dashes centered in a 24pt column
-/// at the scroll area's left edge (the reference UI hides it below two turns).
-fn conversation_rail(rows: &[RowData]) -> Option<El> {
-    let mut turns: Vec<Vec<&RowData>> = Vec::new();
-    let mut current: Vec<&RowData> = Vec::new();
-    for r in rows.iter().filter(|r| !raw_of(r).trim().is_empty()) {
-        if r.role == "user" && !current.is_empty() {
-            turns.push(std::mem::take(&mut current));
+/// One-line preview for the rail card: collapse whitespace and clip.
+fn user_preview(body: &str) -> String {
+    let flat: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= 180 {
+        return flat;
+    }
+    let cut: String = flat.chars().take(177).collect();
+    format!("{cut}â€¦")
+}
+
+/// `ConversationRail`: one tick per user message at the scroll area's left
+/// edge. Hovering a tick widens it (and eases its neighbours), then shows a
+/// small preview card with that message; the rail stays out of the way at
+/// rest. Up to twelve newest messages stay direct; older ones fold into one
+/// quiet dash.
+fn conversation_rail<S: TranscriptHost + 'static>(
+    s: &RuneTranscriptState,
+    which: Thread,
+) -> Option<El> {
+    let mut marks: Vec<usize> = Vec::new();
+    for (index, row) in s.rows.iter().enumerate() {
+        if row.role == "user" && !raw_of(row).trim().is_empty() {
+            marks.push(index);
         }
-        current.push(r);
     }
-    if !current.is_empty() {
-        turns.push(current);
-    }
-    if turns.len() < 2 {
+    if marks.is_empty() {
         return None;
     }
-    let role_of = |turn: &[&RowData]| {
-        if turn.iter().any(|r| r.role == "user") {
-            "user"
-        } else if turn.iter().any(|r| r.role == "error") {
-            "error"
-        } else {
-            "agent"
-        }
-    };
-    let mut markers: Vec<(&str, String)> = turns
-        .iter()
-        .enumerate()
-        .map(|(i, turn)| (role_of(turn), format!("mark-{i}")))
-        .collect();
-    if markers.len() > 6 {
-        // Fold everything older than the newest five into one quiet dash.
-        let earlier = markers.len() - 5;
-        let mut folded = vec![("system", "mark-earlier".to_string())];
-        folded.extend(markers.drain(earlier..));
-        markers = folded;
-    }
+    // Six ticks at most: the rail stays a glance, not a second scrollbar.
+    let start = marks.len().saturating_sub(6);
+    let marks = &marks[start..];
+
     let mut rail = col()
         .key("conversation-rail")
         .w(24.0)
         .pin(Some(4.0), Some(16.0), None, Some(16.0))
         .justify_center()
-        .inert();
-    for (role, id) in markers {
-        let color = match role {
-            "user" => rune::Color {
-                r: 1.0,
-                g: 1.0,
-                b: 1.0,
-                a: 0.46,
-            },
-            "error" => home_rgba(251.0, 113.0, 133.0, 0.72),
-            "system" => rune::Color {
-                r: 1.0,
-                g: 1.0,
-                b: 1.0,
-                a: 0.18,
-            },
-            _ => rune::Color {
-                r: 1.0,
-                g: 1.0,
-                b: 1.0,
-                a: 0.28,
-            },
+        .gap(2.0);
+
+    for (slot, row_index) in marks.iter().enumerate() {
+        let msg = &s.rows[*row_index];
+        let hovered = s.rail_hover == Some(slot);
+        let near = s.rail_hover.is_some_and(|h| h.abs_diff(slot) == 1);
+        // Hovered tick grows most; its direct neighbours grow a little.
+        let width = if hovered {
+            15.0
+        } else if near {
+            10.0
+        } else {
+            7.0
         };
-        rail = rail.child(
-            row()
-                .key(format!("conversation-{id}"))
-                .w(24.0)
-                .h(14.0)
-                .items_center()
-                .child(rune::el().size(7.0, 2.0).radius(1.0).fill(color)),
-        );
+        let alpha = if hovered {
+            0.92
+        } else if near {
+            0.55
+        } else {
+            0.28
+        };
+        let jump_key = msg.key.clone();
+        let mut tick = row()
+            .key(format!("conversation-mark-{slot}"))
+            .w(24.0)
+            .h(14.0)
+            .items_center()
+            .role("button")
+            .focusable(true)
+            .label("Jump to this message")
+            .on_press_tx_enter(move |_s: &mut S, tx: &mut rune::Tx| {
+                tx.scroll_into_view(jump_key.clone());
+            })
+            .on_hover_change(move |s: &mut S, inside, _tx| {
+                let thread = s.thread_mut(which);
+                if inside {
+                    thread.rail_hover = Some(slot);
+                } else if thread.rail_hover == Some(slot) {
+                    thread.rail_hover = None;
+                }
+            })
+            .child(
+                rune::el()
+                    .size(width, 2.0)
+                    .radius(1.0)
+                    .fill(home_rgba(255.0, 255.0, 255.0, alpha)),
+            );
+        if hovered {
+            let preview = user_preview(&msg.body);
+            let stamp = clock(&msg.at);
+            tick = tick.child(
+                col()
+                    .key("conversation-preview")
+                    .absolute(26.0, -8.0)
+                    .w(252.0)
+                    .gap(4.0)
+                    .px(11.0)
+                    .py(9.0)
+                    .radius(10.0)
+                    .fill(home_ink("#16161a"))
+                    .border(1.0, home_rgba(255.0, 255.0, 255.0, 0.12))
+                    .border_layout()
+                    .box_shadow(rune::Shadow {
+                        x: 0.0,
+                        y: 10.0,
+                        blur: 28.0,
+                        spread: -6.0,
+                        color: home_rgba(0.0, 0.0, 0.0, 0.6),
+                        inset: false,
+                    })
+                    .inert()
+                    .child(
+                        row()
+                            .w_full()
+                            .items_center()
+                            .gap(6.0)
+                            .child(
+                                text("You".to_string())
+                                    .font(rune::tok::TextStyle::new(10.0, 650.0))
+                                    .color(home_ink("#e4e4e7")),
+                            )
+                            .child(rune::el().grow(1.0))
+                            .child(
+                                text(stamp)
+                                    .font(rune::tok::TextStyle::new(9.0, 400.0))
+                                    .color(home_ink("#52525b")),
+                            ),
+                    )
+                    .child(
+                        text(preview)
+                            .w_full()
+                            .wrap()
+                            .font(rune::tok::TextStyle::new(11.0, 400.0))
+                            .color(home_ink("#a1a1aa")),
+                    ),
+            );
+        }
+        rail = rail.child(tick);
     }
     Some(rail)
 }
@@ -5181,15 +5299,115 @@ fn drill_back_icon(size: f32, color: rune::Color) -> rune::Shape {
         .view_box(24.0, 24.0)
 }
 
+/// Compact prompt dock for the docked child session. It reuses the child
+/// thread's draft/live state (so sends stream into the panel) with its own
+/// keys, since the main composer is mounted at the same time.
+fn subagent_composer<S: TranscriptHost + 'static>(s: &RuneTranscriptState, chat: Thread) -> El {
+    let t = s.thread(chat);
+    let running = t.live;
+    let has_text = !t.edit.text.trim().is_empty();
+    let send_label = if running && !has_text {
+        "Stop"
+    } else {
+        "Send to subagent"
+    };
+    let glyph = if running && !has_text {
+        crate::icons::lucide(&["M6 6h12v12H6z"], 12.0, 2.0, home_ink("#0a0a0a"))
+    } else {
+        crate::icons::lucide(
+            &["M12 19V5", "m5 12 7-7 7 7"],
+            13.0,
+            2.0,
+            home_ink("#0a0a0a"),
+        )
+    };
+    col().key("subagent-composer").w_full().child(
+        row()
+            .key("subagent-composer-wrap")
+            .w_full()
+            .items_end()
+            .gap(6.0)
+            .px(9.0)
+            .py(7.0)
+            .radius(12.0)
+            .fill(home_ink("#111114"))
+            .border(1.0, home_rgba(255.0, 255.0, 255.0, 0.12))
+            .border_layout()
+            .child(
+                rune::text_input(&t.edit, rune::tok::TextStyle::new(12.5, 400.0))
+                    .key("subagent-composer-input")
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .single_line()
+                    .px(4.0)
+                    .py(4.0)
+                    .placeholder("Message this subagent…", home_ink("#5e626b"))
+                    .caret(home_ink("#f2f2f4"), crate::motion::TEXT_SELECTION)
+                    .on_edit(move |s: &mut S| &mut s.thread_mut(chat).edit)
+                    .on_submit(move |s: &mut S, _tx: &mut rune::Tx| {
+                        stage_send(s.thread_mut(chat));
+                    }),
+            )
+            .child(
+                rune::el()
+                    .key("subagent-composer-send")
+                    .role("button")
+                    .focusable(true)
+                    .label(send_label)
+                    .size(28.0, 28.0)
+                    .radius(14.0)
+                    .center()
+                    .fill(home_ink(if running && !has_text {
+                        "#e4e4e7"
+                    } else if has_text || running {
+                        "#f4f4f5"
+                    } else {
+                        "#2b2b32"
+                    }))
+                    .hover(home_ink("#ffffff"))
+                    .on_press_enter(move |s: &mut S| {
+                        let thread = s.thread_mut(chat);
+                        if thread.live && thread.edit.text.trim().is_empty() {
+                            stage_abort(thread);
+                        } else {
+                            stage_send(thread);
+                        }
+                    })
+                    .child(rune::el().size(13.0, 13.0).inert().shape(glyph)),
+            ),
+    )
+}
+
+/// Rows shown in a drill: the live child card thread wins (it streams and
+/// accepts sends), falling back to the fetched child history.
+fn drill_rows<S: TranscriptHost + 'static>(
+    s: &S,
+    which: Thread,
+    chat: Option<Thread>,
+) -> Option<&[RowData]> {
+    if let Some(chat) = chat {
+        let rows = &s.thread(chat).rows;
+        if !rows.is_empty() {
+            return Some(rows);
+        }
+    }
+    s.thread(which)
+        .active_subagent
+        .as_ref()
+        .map(|drill| drill.rows.as_slice())
+}
+
 /// Session-keyed drill view (`SubagentSessionView`): header with back +
 /// breadcrumb + running status, body with the child history, read-only dock
 /// notice. Stark visuals (same bubbles as the parent); Rune builds it like
 /// `collapsible`/`dialog` conditional content — open state mounts the layer,
 /// no height animation.
-fn subagent_drill_view<S: TranscriptHost + 'static>(
+fn subagent_drill_view<S: TranscriptHost + crate::settings::SettingsHost + 'static>(
     s: &RuneTranscriptState,
     which: Thread,
+    chat: Option<Thread>,
     max_w: f32,
+    panel: bool,
 ) -> El {
     let Some(drill) = s.active_subagent.as_ref() else {
         return col().key("subagent-view-empty");
@@ -5204,7 +5422,7 @@ fn subagent_drill_view<S: TranscriptHost + 'static>(
     let retry_label = drill.label.clone();
     let retry_ws = drill.workspace_id.clone();
     let loading = drill.loading;
-    let row_count = drill.rows.len();
+    let row_count = drill_rows::<RuneTranscriptState>(s, which, chat).map_or(0, <[RowData]>::len);
     let has_error = drill.error.is_some();
     // Header (`.subagent-session-view-header`): 52pt, 14px sides, hairline.
     let mut header = row()
@@ -5216,8 +5434,9 @@ fn subagent_drill_view<S: TranscriptHost + 'static>(
         .px(14.0)
         .border_sides([0.0, 0.0, 1.0, 0.0], home_rgba(255.0, 255.0, 255.0, 0.075))
         .border_layout()
-        .fill(home_ink("#0b0b0b"))
-        .child(
+        .fill(home_ink("#0b0b0b"));
+    if !panel {
+        header = header.child(
             rune::el()
                 .key("subagent-view-back")
                 .role("button")
@@ -5234,41 +5453,61 @@ fn subagent_drill_view<S: TranscriptHost + 'static>(
                         .inert()
                         .shape(drill_back_icon(15.0, home_ink("#8e9098"))),
                 ),
-        )
-        .child(
-            row()
-                .key("subagent-view-crumb")
-                .grow(1.0)
-                .min_w(0.0)
-                .items_center()
-                .gap(7.0)
-                .child(
-                    text(parent_title)
-                        .key("subagent-view-parent")
-                        .role("button")
-                        .focusable(true)
-                        .label("Back to main session")
-                        .font(rune::tok::TextStyle::new(12.0, 400.0))
-                        .color(home_ink("#777982"))
-                        .truncate()
-                        .max_w(132.0)
-                        .on_press_enter(move |s: &mut S| close_subagent(s.thread_mut(which))),
-                )
-                .child(
-                    text("/".to_string())
-                        .font(rune::tok::TextStyle::new(12.0, 400.0))
-                        .color(home_ink("#62646d")),
-                )
-                .child(
-                    text(child_label)
-                        .key("subagent-view-child")
-                        .grow(1.0)
-                        .min_w(0.0)
-                        .truncate()
-                        .font(rune::tok::TextStyle::new(12.5, 600.0))
-                        .color(home_ink("#e1e1e5")),
-                ),
         );
+    }
+    header = header.child(
+        row()
+            .key("subagent-view-crumb")
+            .grow(1.0)
+            .min_w(0.0)
+            .items_center()
+            .gap(7.0)
+            .child(
+                text(parent_title)
+                    .key("subagent-view-parent")
+                    .role("button")
+                    .focusable(true)
+                    .label("Back to main session")
+                    .font(rune::tok::TextStyle::new(12.0, 400.0))
+                    .color(home_ink("#777982"))
+                    .truncate()
+                    .max_w(132.0)
+                    .on_press_enter(move |s: &mut S| close_subagent(s.thread_mut(which))),
+            )
+            .child(
+                text("/".to_string())
+                    .font(rune::tok::TextStyle::new(12.0, 400.0))
+                    .color(home_ink("#62646d")),
+            )
+            .child(
+                text(child_label)
+                    .key("subagent-view-child")
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .truncate()
+                    .font(rune::tok::TextStyle::new(12.5, 600.0))
+                    .color(home_ink("#e1e1e5")),
+            ),
+    );
+    if panel {
+        header = header.child(
+            rune::el()
+                .key("subagent-panel-close")
+                .role("button")
+                .focusable(true)
+                .label("Close subagent panel")
+                .size(26.0, 26.0)
+                .radius(7.0)
+                .center()
+                .hover(home_rgba(255.0, 255.0, 255.0, 0.08))
+                .on_press_enter(move |s: &mut S| close_subagent(s.thread_mut(which)))
+                .child(rune::el().size(14.0, 14.0).inert().shape(crate::lucide_x(
+                    14.0,
+                    2.0,
+                    home_ink("#8e9098"),
+                ))),
+        );
+    }
     if loading {
         header = header.child(
             row()
@@ -5375,7 +5614,7 @@ fn subagent_drill_view<S: TranscriptHost + 'static>(
         col()
             .key("subagent-view-rows")
             .w_full()
-            .pl(32.0)
+            .pl(if panel { 16.0 } else { 32.0 })
             .pr(16.0)
             .pt(12.0)
             .pb(12.0)
@@ -5385,21 +5624,15 @@ fn subagent_drill_view<S: TranscriptHost + 'static>(
                 row_count,
                 ESTIMATED_ROW_H,
                 move |s: &S, i| {
-                    let key = s
-                        .thread(which)
-                        .active_subagent
-                        .as_ref()
-                        .and_then(|d| d.rows.get(i))
+                    let key = drill_rows::<S>(s, which, chat)
+                        .and_then(|rows| rows.get(i))
                         .map(|r| r.key.clone())
                         .unwrap_or_default();
                     Cow::Owned(key)
                 },
                 move |s: &S, i| {
-                    let t = s.thread(which);
-                    let Some(drill) = t.active_subagent.as_ref() else {
-                        return col().key(format!("subagent-row-missing-{i}"));
-                    };
-                    let Some(r) = drill.rows.get(i) else {
+                    let Some(r) = drill_rows::<S>(s, which, chat).and_then(|rows| rows.get(i))
+                    else {
                         return col().key(format!("subagent-row-missing-{i}"));
                     };
                     // Same builders as the parent body (Stark bubbles); drill
@@ -5421,22 +5654,40 @@ fn subagent_drill_view<S: TranscriptHost + 'static>(
                 },
             )
     };
-    let dock = col()
-        .key("subagent-view-dock")
-        .w_full()
-        .border_sides([1.0, 0.0, 0.0, 0.0], home_rgba(255.0, 255.0, 255.0, 0.07))
-        .border_layout()
-        .fill(home_ink("#0b0b0b"))
-        .child(
-            text("This child session is read-only in the native view.".to_string())
-                .key("subagent-view-readonly")
-                .px(16.0)
-                .py(12.0)
-                .font(rune::tok::TextStyle::new(11.0, 400.0))
-                .color(home_ink("#777982")),
-        );
+    // Child prompt dock: the same composer as the main chat, bound to the
+    // child's card thread so sends stream into this panel.
+    let dock = match chat {
+        Some(chat) => col()
+            .key("subagent-view-dock")
+            .w_full()
+            .border_sides([0.0, 1.0, 0.0, 0.0], home_rgba(255.0, 255.0, 255.0, 0.07))
+            .border_layout()
+            .fill(home_ink("#0b0b0b"))
+            .px(12.0)
+            .pt(8.0)
+            .pb(10.0)
+            .child(subagent_composer::<S>(s, chat)),
+        None => col()
+            .key("subagent-view-dock")
+            .w_full()
+            .border_sides([0.0, 1.0, 0.0, 0.0], home_rgba(255.0, 255.0, 255.0, 0.07))
+            .border_layout()
+            .fill(home_ink("#0b0b0b"))
+            .child(
+                text("This child session cannot be messaged from here.".to_string())
+                    .key("subagent-view-nodock")
+                    .px(16.0)
+                    .py(12.0)
+                    .font(rune::tok::TextStyle::new(11.0, 400.0))
+                    .color(home_ink("#777982")),
+            ),
+    };
     col()
-        .key("subagent-view")
+        .key(if panel {
+            "subagent-panel-surface"
+        } else {
+            "subagent-view"
+        })
         .w_full()
         .grow(1.0)
         .min_h(0.0)
@@ -5454,6 +5705,140 @@ fn subagent_drill_view<S: TranscriptHost + 'static>(
         .child(dock)
 }
 
+/// Right-hand subagent session panel (`SubagentSessionView` docked like the
+/// reference split view): the main chat stays visible and the child session
+/// slides in beside it. Desktop only; phones keep the full-width drill.
+pub fn subagent_panel<S: TranscriptHost + crate::settings::SettingsHost + 'static>(
+    s: &RuneTranscriptState,
+    which: Thread,
+    chat: Option<Thread>,
+    width: f32,
+) -> Option<El> {
+    s.active_subagent.as_ref()?;
+    let inner_w = (width - 32.0).max(200.0);
+    Some(
+        col()
+            .key("subagent-panel")
+            .w(width)
+            .h_full()
+            .min_h(0.0)
+            .fill(home_ink("#0b0b0b"))
+            .border_sides([1.0, 0.0, 0.0, 0.0], home_rgba(255.0, 255.0, 255.0, 0.10))
+            .border_layout()
+            .child(subagent_drill_view::<S>(
+                s,
+                which,
+                chat,
+                inner_w * 0.85,
+                true,
+            )),
+    )
+}
+
+/// Prompt dock for one thread. Shared by the home card and the docked
+/// subagent session so the child gets the same composer (send/stop, provider,
+/// usage, attachments) as the main chat.
+fn thread_composer<S: TranscriptHost + crate::settings::SettingsHost + 'static>(
+    s: &RuneTranscriptState,
+    which: Thread,
+    dock_compact: bool,
+) -> El {
+    let t = s.thread(which);
+    super::composer::composer_card(
+        &t.edit,
+        std::rc::Rc::new(move |s: &mut S| &mut s.thread_mut(which).edit),
+        t.voice.meter(),
+        t.live,
+        super::composer::ComposerMeta {
+            target: &t.run_target,
+            usage: &t.usage,
+            usage_open: t.usage_open,
+            provider_label: &t.provider.label,
+            provider_warn: t.provider.warn,
+            model: &t.model,
+            // HouseChat's PromptDock never passes `onModelChange`, so the
+            // home card has no model dropup (the reference UI renders provider only).
+            models: if dock_compact { &[] } else { &t.models },
+            model_open: t.model_open,
+            attachments: &t.draft_attachments,
+            attachments_error: t.attachments_error.as_deref(),
+            attachments_dragging: t.attachments_dragging,
+            workspace_id: &t.workspace_id,
+            chat_id: &t.chat_id,
+            hover: &t.hover,
+        },
+        super::composer::ComposerButtons {
+            voice: std::rc::Rc::new(move |s: &mut S| {
+                // The dock only arms live mode (warms models, shows the
+                // island idle). Capture starts from the island's mic, or
+                // from Ctrl+Space while armed — never here. Web has no
+                // island, so its dock keeps the direct capture toggle.
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let bus = &mut s.thread_mut(which).voice;
+                    if bus.live {
+                        bus.stop_capture();
+                    } else {
+                        bus.start_capture();
+                    }
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let bus = &mut s.thread_mut(which).voice;
+                    bus.set_armed(!bus.armed && !bus.live);
+                }
+            }),
+            cancel: std::rc::Rc::new(move |s: &mut S| stage_abort(s.thread_mut(which))),
+            local: std::rc::Rc::new(move |s: &mut S| {
+                s.thread_mut(which).run_target = "local".to_string();
+            }),
+            cloud: std::rc::Rc::new(move |s: &mut S| {
+                s.thread_mut(which).run_target = "cloud".to_string();
+            }),
+            usage: std::rc::Rc::new(move |s: &mut S| {
+                let open = s.thread_mut(which).usage_open;
+                s.thread_mut(which).usage_open = !open;
+            }),
+            send: std::rc::Rc::new(move |s: &mut S| {
+                stage_send(s.thread_mut(which));
+            }),
+            model_menu: std::rc::Rc::new(move |s: &mut S| {
+                let open = s.thread_mut(which).model_open;
+                s.thread_mut(which).model_open = !open;
+            }),
+            model_pick: std::rc::Rc::new(move |s: &mut S, id: String| {
+                s.thread_mut(which).model = id;
+                s.thread_mut(which).model_open = false;
+            }),
+            stats: std::rc::Rc::new(move |s: &mut S| {
+                s.thread_mut(which).stats_open = true;
+                s.thread_mut(which).usage_open = false;
+            }),
+            config: std::rc::Rc::new(move |s: &mut S| {
+                let (host, port) = {
+                    let thread = s.thread(which);
+                    (thread.api_host.clone(), thread.api_port)
+                };
+                let thread = s.thread_mut(which);
+                thread.agent_config.open = false;
+                crate::provider_keys::open_provider_keys(&mut thread.provider_keys, host, port);
+            }),
+            attach: std::rc::Rc::new(move |s: &mut S, tx: &mut rune::Tx| {
+                open_attachment_picker(s, which, tx);
+            }),
+            remove_attachment: std::rc::Rc::new(move |s: &mut S, target: String| {
+                remove_draft_attachment(s.thread_mut(which), &target);
+            }),
+            drop_files: std::rc::Rc::new(move |s: &mut S, files: &[std::path::PathBuf]| {
+                drop_attachment_files(s.thread_mut(which), files);
+            }),
+            drop_hover: std::rc::Rc::new(move |s: &mut S, over: bool| {
+                s.thread_mut(which).attachments_dragging = over;
+            }),
+        },
+    )
+}
+
 // Layout flags stay explicit: head, dock, sheets, home width, window height, fold.
 #[allow(clippy::too_many_arguments)]
 fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'static>(
@@ -5466,12 +5851,6 @@ fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'sta
     window_h: f32,
     folded: bool,
 ) -> El {
-    // Session-keyed drill (`SubagentSessionView`): conditional content replaces
-    // The body, Rune `collapsible` style — no height animation, just open content.
-    // A folded home card skips the drill with the rest of the message area.
-    if s.active_subagent.is_some() && !folded {
-        return subagent_drill_view::<S>(s, which, home_max_w);
-    }
     // Index-built rows: layout builds only the mounted window (viewport + up to
     // two viewports either side), so a 10k transcript commits in window time.
     // Handlers must find items by key, never by index (see `RowSource` docs).
@@ -5794,7 +6173,7 @@ fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'sta
         .grow(1.0)
         .min_h(0.0)
         .child(viewport);
-    if let Some(rail) = conversation_rail(&s.rows) {
+    if let Some(rail) = conversation_rail::<S>(s, which) {
         view = view.child(rail);
     }
     // Jump-to-latest pill (`.scroll-bottom-pill`). Always mounted with a
@@ -5875,75 +6254,7 @@ fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'sta
     let composer_card = if ask_batch.is_some() {
         None
     } else {
-        Some(super::composer::composer_card(
-            &s.edit,
-            std::rc::Rc::new(move |s: &mut S| &mut s.thread_mut(which).edit),
-            s.voice.meter(),
-            s.live,
-            super::composer::ComposerMeta {
-                target: &s.run_target,
-                usage: &s.usage,
-                usage_open: s.usage_open,
-                provider_label: &s.provider.label,
-                provider_warn: s.provider.warn,
-                model: &s.model,
-                // HouseChat's PromptDock never passes `onModelChange`, so the
-                // home card has no model dropup (the reference UI renders provider only).
-                models: if dock_compact { &[] } else { &s.models },
-                model_open: s.model_open,
-                attachments: &s.draft_attachments,
-                attachments_error: s.attachments_error.as_deref(),
-                attachments_dragging: s.attachments_dragging,
-                workspace_id: &s.workspace_id,
-                chat_id: &s.chat_id,
-                hover: &s.hover,
-            },
-            super::composer::ComposerButtons {
-                voice: std::rc::Rc::new(move |s: &mut S| {
-                    let on = !s.thread_mut(which).voice.live;
-                    s.thread_mut(which).voice.set_live(on);
-                }),
-                cancel: std::rc::Rc::new(move |s: &mut S| stage_abort(s.thread_mut(which))),
-                local: std::rc::Rc::new(move |s: &mut S| {
-                    s.thread_mut(which).run_target = "local".to_string();
-                }),
-                cloud: std::rc::Rc::new(move |s: &mut S| {
-                    s.thread_mut(which).run_target = "cloud".to_string();
-                }),
-                usage: std::rc::Rc::new(move |s: &mut S| {
-                    let open = s.thread_mut(which).usage_open;
-                    s.thread_mut(which).usage_open = !open;
-                }),
-                send: std::rc::Rc::new(move |s: &mut S| stage_send(s.thread_mut(which))),
-                model_menu: std::rc::Rc::new(move |s: &mut S| {
-                    let open = s.thread_mut(which).model_open;
-                    s.thread_mut(which).model_open = !open;
-                }),
-                model_pick: std::rc::Rc::new(move |s: &mut S, id: String| {
-                    s.thread_mut(which).model = id;
-                    s.thread_mut(which).model_open = false;
-                }),
-                stats: std::rc::Rc::new(move |s: &mut S| {
-                    s.thread_mut(which).stats_open = true;
-                    s.thread_mut(which).usage_open = false;
-                }),
-                config: std::rc::Rc::new(move |s: &mut S| {
-                    crate::agent_config::open_agent_config(&mut s.thread_mut(which).agent_config);
-                }),
-                attach: std::rc::Rc::new(move |s: &mut S, tx: &mut rune::Tx| {
-                    open_attachment_picker(s, which, tx);
-                }),
-                remove_attachment: std::rc::Rc::new(move |s: &mut S, target: String| {
-                    remove_draft_attachment(s.thread_mut(which), &target);
-                }),
-                drop_files: std::rc::Rc::new(move |s: &mut S, files: &[std::path::PathBuf]| {
-                    drop_attachment_files(s.thread_mut(which), files);
-                }),
-                drop_hover: std::rc::Rc::new(move |s: &mut S, over: bool| {
-                    s.thread_mut(which).attachments_dragging = over;
-                }),
-            },
-        ))
+        Some(thread_composer::<S>(s, which, dock_compact))
     };
     let dock = if dock_compact {
         // Inside the home chat card the outer card owns the 8pt gutter and
@@ -6000,6 +6311,15 @@ fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'sta
                 which,
             ));
         }
+        if s.provider_keys.open {
+            let (w, h) = transcript_window();
+            root = root.child(super::provider_keys::provider_keys_sheet::<S>(
+                &s.provider_keys,
+                which,
+                w,
+                h,
+            ));
+        }
         if let Some(file) = s.attachment_preview.clone() {
             let (w, h) = transcript_window();
             root = root.child(attachment_lightbox::<S>(
@@ -6014,8 +6334,9 @@ fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'sta
             ));
         }
     }
-    // Voice overlay floats above every sheet (own `dialog`-style layer):
-    // live meter while capturing, or the mic note when capture failed.
+    // Native live voice lives in the Stark Island overlay. The browser has
+    // no native surface, so it keeps the in-page dialog.
+    #[cfg(target_arch = "wasm32")]
     if s.voice.live || s.voice.note.is_some() {
         root = root.child(voice_overlay::<S>(s, which));
     }
@@ -6081,6 +6402,7 @@ fn voice_live_bubble<S: TranscriptHost + 'static>(
 /// centered panel, backdrop/Esc dismiss via `modal`, no height animation.
 /// The card carries the live meter (5 bars from `lit_bars`), the interim
 /// words or the note, and Stop/Close.
+#[cfg(any(target_arch = "wasm32", test))]
 pub fn voice_overlay<S: TranscriptHost + 'static>(s: &RuneTranscriptState, which: Thread) -> El {
     let ink = |hex: &'static str| rune::color::hex(hex).unwrap_or(rune::Color::BLACK);
     let live = s.voice.live;
@@ -6100,7 +6422,7 @@ pub fn voice_overlay<S: TranscriptHost + 'static>(s: &RuneTranscriptState, which
                 .h(if on { 26.0 } else { 10.0 })
                 .radius(3.0)
                 .fill(if on {
-                    ink("#aa8dff")
+                    ink("#e4e4e7")
                 } else {
                     home_rgba(255.0, 255.0, 255.0, 0.10)
                 }),
@@ -6129,7 +6451,7 @@ pub fn voice_overlay<S: TranscriptHost + 'static>(s: &RuneTranscriptState, which
         .center()
         .modal(true, move |s: &mut S| {
             let t = s.thread_mut(which);
-            t.voice.set_live(false);
+            t.voice.stop_capture();
             t.voice.note = None;
         })
         .child(
@@ -6169,7 +6491,7 @@ pub fn voice_overlay<S: TranscriptHost + 'static>(s: &RuneTranscriptState, which
                                 .shape(crate::lucide_x(16.0, 2.0, ink("#8a8a93")))
                                 .on_press_enter(move |s: &mut S| {
                                     let t = s.thread_mut(which);
-                                    t.voice.set_live(false);
+                                    t.voice.stop_capture();
                                     t.voice.note = None;
                                 }),
                         ),
@@ -6180,7 +6502,7 @@ pub fn voice_overlay<S: TranscriptHost + 'static>(s: &RuneTranscriptState, which
                         .key("voice-text")
                         .w_full()
                         .font(rune::tok::TextStyle::new(12.5, 400.0))
-                        .color(if live { ink("#e4e4e7") } else { ink("#d39ba4") }),
+                        .color(if live { ink("#e4e4e7") } else { ink("#a1a1aa") }),
                 )
                 .child(
                     text(if live {
@@ -6205,7 +6527,7 @@ pub fn voice_overlay<S: TranscriptHost + 'static>(s: &RuneTranscriptState, which
                     .fill(ink("#ffffff"))
                     .on_press_enter(move |s: &mut S| {
                         let t = s.thread_mut(which);
-                        t.voice.set_live(false);
+                        t.voice.stop_capture();
                         t.voice.note = None;
                     }),
                 ),
@@ -6556,6 +6878,154 @@ pub fn run_headless_or_windowed(extra_args: Vec<String>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn usage_totals_rebuild_from_history_rows() {
+        use super::*;
+        let mut thread = RuneTranscriptState::screenshot();
+        thread.model = "deepseek-v4.1-flash".to_string();
+        thread.rows[1].has_usage = true;
+        thread.rows[1].tokens_in = 1_240;
+        thread.rows[1].tokens_out = 86;
+        thread.rows[1].run_usage = Some(RunUsage {
+            input: 1_240,
+            output: 86,
+            cache_hit: 1_000,
+            cost: 0.012,
+        });
+        thread.sync_usage_from_rows();
+        assert_eq!(thread.usage.input, 1_240);
+        assert_eq!(thread.usage.output, 86);
+        assert_eq!(thread.usage.cache_hit, 1_000);
+        assert!((thread.usage.cost - 0.012).abs() < 1e-9);
+        // Context is the last usage-bearing call.
+        assert_eq!(thread.usage.active, 1_240);
+        assert_eq!(thread.usage.calls.len(), 1);
+    }
+
+    #[test]
+    fn agent_footer_is_copy_only_and_user_keeps_rewind() {
+        use super::*;
+        use rune::{Env, Runtime};
+        let mut init = RuneTranscriptState::screenshot();
+        init.live = false;
+        // A short pair keeps both footers inside the virtual window.
+        init.rows = vec![
+            RowData {
+                key: "short-user".to_string(),
+                role: "user",
+                body: "hello".to_string(),
+                at: "2026-11-24T10:00:00Z".to_string(),
+                ..RowData::default()
+            },
+            RowData {
+                key: "short-agent".to_string(),
+                role: "agent",
+                body: "Hi.".to_string(),
+                final_text: "Hi.".to_string(),
+                at: "2026-11-24T10:00:02Z".to_string(),
+                has_usage: true,
+                tokens_in: 12,
+                tokens_out: 3,
+                run_usage: Some(RunUsage {
+                    input: 12,
+                    output: 3,
+                    ..RunUsage::default()
+                }),
+                ..RowData::default()
+            },
+        ];
+        // The home card is the flat transcript (the sheet uses the canvas
+        // bubble renderer), so render that variant.
+        fn home_view(s: &RuneTranscriptState, _cx: &mut Cx<RuneTranscriptState>) -> El {
+            home_transcript_body::<RuneTranscriptState>(s, Thread::Main, 468.0, 720.0, false)
+        }
+        let mut rt = Runtime::new(init, home_view, (900.0, 700.0), Env::new(true, 1.0));
+        rt.frame(0.0);
+        // Agents: copy only, no retry/rewind in the completed footer.
+        assert!(rt.find("short-agent-copy").is_some(), "agent copy");
+        assert!(rt.find("short-agent-retry").is_none(), "no agent retry");
+        assert!(rt.find("short-agent-rewind").is_none(), "no agent rewind");
+        // Users keep copy and rewind.
+        assert!(rt.find("short-user-copy").is_some(), "user copy");
+        assert!(rt.find("short-user-rewind").is_some(), "user rewind");
+
+        // Agent copy gets the same 1.5s check confirmation as user copy.
+        let (x, y) = rt.find("short-agent-copy").expect("agent copy placed");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.0);
+        assert!(
+            rt.state.copied_messages.contains_key("short-agent"),
+            "agent copy records feedback"
+        );
+        assert!(
+            rt.find("short-agent-copy-check").is_some(),
+            "agent copy shows the check"
+        );
+    }
+
+    #[test]
+    fn rail_keeps_six_newest_user_messages() {
+        use super::*;
+        use rune::{Env, Runtime};
+        let mut init = RuneTranscriptState::screenshot();
+        init.live = false;
+        init.rows = (0..8)
+            .map(|i| RowData {
+                key: format!("u{i}"),
+                role: "user",
+                body: format!("message {i}"),
+                at: "2026-11-24T10:00:00Z".to_string(),
+                ..RowData::default()
+            })
+            .collect();
+        fn home_view(s: &RuneTranscriptState, _cx: &mut Cx<RuneTranscriptState>) -> El {
+            home_transcript_body::<RuneTranscriptState>(s, Thread::Main, 468.0, 720.0, false)
+        }
+        let mut rt = Runtime::new(init, home_view, (900.0, 700.0), Env::new(true, 1.0));
+        rt.frame(0.0);
+        let marks = [
+            "conversation-mark-0",
+            "conversation-mark-1",
+            "conversation-mark-2",
+            "conversation-mark-3",
+            "conversation-mark-4",
+            "conversation-mark-5",
+        ];
+        for key in marks {
+            assert!(rt.find(key).is_some(), "{key} mounted");
+        }
+        assert!(
+            rt.find("conversation-mark-6").is_none(),
+            "only the newest six ticks mount"
+        );
+    }
+
+    #[test]
+    fn rail_tick_hover_shows_the_message_preview() {
+        use super::*;
+        use rune::{Env, Runtime};
+        let mut init = RuneTranscriptState::screenshot();
+        init.live = false;
+        let mut rt = Runtime::new(init, transcript_view, (900.0, 700.0), Env::new(true, 1.0));
+        rt.frame(0.0);
+        assert!(rt.find("conversation-rail").is_some());
+        assert!(
+            rt.find("conversation-preview").is_none(),
+            "preview rests hidden"
+        );
+        let (x, y) = rt.find("conversation-mark-0").expect("user tick");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..6 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(
+            rt.find("conversation-preview").is_some(),
+            "hover reveals the preview"
+        );
+    }
+
     use super::*;
     use rune::{Env, Runtime};
 
@@ -6961,7 +7431,7 @@ mod tests {
     }
 
     #[test]
-    fn voice_toggle_flips_live_dot() {
+    fn voice_toggle_arms_without_capturing() {
         let env = Env::new(true, 2.0);
         let mut rt = Runtime::new(
             RuneTranscriptState::screenshot(),
@@ -6971,25 +7441,43 @@ mod tests {
         );
         rt.frame(0.0);
         assert!(!rt.state.voice.live);
+        assert!(!rt.state.voice.armed);
         let (x, y) = rt.find("composer-voice").unwrap();
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
         rt.frame(0.0);
-        // Outcome depends on hardware (mic vs none), so assert the invariant:
-        // either live capture staged, or an honest note explains why not.
-        // (No poll in `Runtime::new`, so nothing races the assertion.)
+        // The dock arms live mode deterministically on any hardware: models
+        // warm and the orbit renders, but the mic never opens here.
+        assert!(rt.state.voice.armed, "voice state: {:?}", rt.state.voice);
         assert!(
-            rt.state.voice.live || rt.state.voice.note.is_some(),
-            "voice state: {:?}",
+            !rt.state.voice.live,
+            "arming never captures: {:?}",
             rt.state.voice
         );
-        assert!(rt.find("composer-voice-dot").is_some());
-        let (x, y) = rt.find("composer-voice").unwrap();
-        rt.pointer_down(x, y);
-        rt.pointer_up(x, y);
-        rt.frame(0.0);
+        assert!(
+            rt.find("composer-voice-bars").is_some(),
+            "armed bars render"
+        );
+        assert!(
+            rt.find("composer-voice-border").is_some(),
+            "armed border orbit renders"
+        );
+        let (x2, y2) = rt.find("composer-voice").unwrap();
+        rt.pointer_down(x2, y2);
+        rt.pointer_up(x2, y2);
+        for _ in 0..5 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(!rt.state.voice.armed);
         assert!(!rt.state.voice.live);
-        assert!(rt.state.voice.stop.is_none());
+        assert!(
+            rt.find("composer-voice-bars").is_none(),
+            "armed bars leave with live mode"
+        );
+        assert!(
+            rt.find("composer-voice-border").is_none(),
+            "border orbit leaves with live mode"
+        );
     }
 
     #[test]
@@ -7516,7 +8004,19 @@ mod tests {
     fn tapping_delegation_card_opens_drill() {
         use crate::stream_accum::{ChildRef, LiveToolEvent, StreamSegment, ToolStatus};
         fn home_view(s: &RuneTranscriptState, _cx: &mut Cx<RuneTranscriptState>) -> El {
-            home_transcript_body::<RuneTranscriptState>(s, Thread::Main, 468.0, 720.0, false)
+            let mut root = col().key("test-home").w_full().h_full();
+            root = root.child(home_transcript_body::<RuneTranscriptState>(
+                s,
+                Thread::Main,
+                468.0,
+                720.0,
+                false,
+            ));
+            if let Some(panel) = subagent_panel::<RuneTranscriptState>(s, Thread::Main, None, 420.0)
+            {
+                root = root.child(panel);
+            }
+            root
         }
         let mut s = RuneTranscriptState::screenshot();
         s.workspace_id = "_general".to_string();
@@ -7564,7 +8064,10 @@ mod tests {
         assert_eq!(drill.child_id, "child-9");
         assert_eq!(drill.workspace_id, "_general", "hint falls back");
         rt.frame(1.0 / 60.0);
-        assert!(rt.find("subagent-view").is_some(), "drill mounted");
+        assert!(
+            rt.find("subagent-panel-surface").is_some(),
+            "drill panel mounted"
+        );
     }
 
     #[test]
@@ -7586,35 +8089,61 @@ mod tests {
         let env = Env::new(true, 2.0);
         let mut rt = Runtime::new(s, transcript_view, (468.0, 720.0), env);
         rt.frame(0.0);
-        assert!(rt.find("subagent-view").is_some(), "drill mounted");
-        assert!(rt.find("subagent-view-back").is_some(), "back button");
+        assert!(rt.find("subagent-panel").is_some(), "drill mounted");
+        assert!(rt.find("subagent-panel-surface").is_some(), "panel surface");
+        assert!(
+            rt.find("subagent-panel-close").is_some(),
+            "panel close button"
+        );
         assert!(
             rt.find("subagent-view-parent").is_some(),
             "breadcrumb parent"
         );
         assert!(rt.find("subagent-view-child").is_some(), "breadcrumb child");
         assert!(
-            rt.find("subagent-view-readonly").is_some(),
-            "read-only dock"
+            rt.find("subagent-view-nodock").is_some(),
+            "no child thread to message"
         );
-        // Back closes the drill.
-        let (bx, by) = rt.find("subagent-view-back").expect("back placed");
+        // Close dismisses the docked panel.
+        let (bx, by) = rt.find("subagent-panel-close").expect("close placed");
         rt.pointer_down(bx, by);
         rt.pointer_up(bx, by);
         rt.frame(1.0 / 60.0);
         assert!(
             rt.state.active_subagent.is_none(),
-            "back closes drill, like SubagentSessionView onBack"
+            "close dismisses the drill"
         );
     }
 
+    fn overlay_view(s: &RuneTranscriptState, _cx: &mut rune::Cx<RuneTranscriptState>) -> El {
+        if s.voice.live || s.voice.note.is_some() {
+            voice_overlay::<RuneTranscriptState>(s, Thread::Main)
+        } else {
+            rune::el().key("voice-overlay-gone")
+        }
+    }
+
     #[test]
-    fn voice_overlay_stops_capture() {
+    fn native_voice_has_no_in_app_modal() {
         let mut s = RuneTranscriptState::screenshot();
         s.voice.live = true;
         s.voice.level = 0.6;
         let env = Env::new(true, 2.0);
         let mut rt = Runtime::new(s, transcript_view, (468.0, 720.0), env);
+        rt.frame(0.0);
+        assert!(
+            rt.find("voice-overlay").is_none(),
+            "native live voice belongs to the Stark Island"
+        );
+    }
+
+    #[test]
+    fn browser_voice_overlay_stops_capture() {
+        let mut s = RuneTranscriptState::screenshot();
+        s.voice.live = true;
+        s.voice.level = 0.6;
+        let env = Env::new(true, 2.0);
+        let mut rt = Runtime::new(s, overlay_view, (468.0, 720.0), env);
         rt.frame(0.0);
         assert!(rt.find("voice-overlay").is_some(), "overlay mounted");
         assert!(rt.find("voice-bars").is_some(), "meter renders");
@@ -7622,24 +8151,28 @@ mod tests {
         let (x, y) = rt.find("voice-stop").expect("stop placed");
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
-        rt.frame(1.0 / 60.0);
+        for _ in 0..30 {
+            rt.frame(1.0 / 60.0);
+        }
         assert!(!rt.state.voice.live, "stop ends capture");
         assert!(rt.find("voice-overlay").is_none(), "overlay leaves");
     }
 
     #[test]
-    fn voice_note_overlay_closes_and_clears() {
+    fn browser_voice_note_overlay_closes_and_clears() {
         let mut s = RuneTranscriptState::screenshot();
         s.voice.note = Some("no microphone found".to_string());
         let env = Env::new(true, 2.0);
-        let mut rt = Runtime::new(s, transcript_view, (468.0, 720.0), env);
+        let mut rt = Runtime::new(s, overlay_view, (468.0, 720.0), env);
         rt.frame(0.0);
         assert!(rt.find("voice-overlay").is_some(), "note surfaces");
         assert!(rt.find("voice-text").is_some(), "note copy placed");
         let (x, y) = rt.find("voice-stop").expect("close placed");
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
-        rt.frame(1.0 / 60.0);
+        for _ in 0..30 {
+            rt.frame(1.0 / 60.0);
+        }
         assert!(rt.state.voice.note.is_none(), "close clears note");
         assert!(rt.find("voice-overlay").is_none(), "overlay leaves");
     }
@@ -7693,6 +8226,11 @@ mod tests {
             "settings-backdrop",
             "settings-title",
             "settings-close",
+            "settings-section-live",
+            "settings-island-toggle",
+            "settings-auto-send",
+            "settings-capture-exclusion",
+            "settings-start-with-windows",
             "settings-section-updates",
             "settings-section-backup",
             "settings-section-migration",

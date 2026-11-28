@@ -101,71 +101,79 @@ fn chevron(size: f32, down: bool, color: rune::Color) -> rune::Shape {
 }
 
 fn tool_icon(kind: tool_labels::IconKind, size: f32, color: rune::Color) -> rune::Shape {
-    match kind {
-        tool_labels::IconKind::Terminal => {
-            let p = rune::Path::new()
-                .move_to([4.0, 17.0])
-                .line_to([10.0, 11.0])
-                .line_to([4.0, 5.0])
-                .move_to([12.0, 19.0])
-                .line_to([20.0, 19.0]);
-            rune::Shape::new()
-                .stroke_path(&p, crate::lucide_stroke(size), rune::LineCap::Round, color)
-                .view_box(24.0, 24.0)
-        }
-        tool_labels::IconKind::Search => {
-            const K: f32 = 4.14;
-            let p = rune::Path::new()
-                .move_to([11.0, 3.0])
-                .cubic_to([11.0 + K, 3.0], [19.0, 11.0 - K], [19.0, 11.0])
-                .cubic_to([19.0, 11.0 + K], [11.0 + K, 19.0], [11.0, 19.0])
-                .cubic_to([11.0 - K, 19.0], [3.0, 11.0 + K], [3.0, 11.0])
-                .cubic_to([3.0, 11.0 - K], [11.0 - K, 3.0], [11.0, 3.0])
-                .close()
-                .move_to([21.0, 21.0])
-                .line_to([16.65, 16.65]);
-            rune::Shape::new()
-                .stroke_path(&p, crate::lucide_stroke(size), rune::LineCap::Round, color)
-                .view_box(24.0, 24.0)
-        }
-        tool_labels::IconKind::File => {
-            let p = rune::Path::new()
-                .move_to([14.0, 2.0])
-                .line_to([6.0, 2.0])
-                .cubic_to([4.9, 2.0], [4.0, 2.9], [4.0, 4.0])
-                .line_to([4.0, 20.0])
-                .cubic_to([4.0, 21.1], [4.9, 22.0], [6.0, 22.0])
-                .line_to([18.0, 22.0])
-                .cubic_to([19.1, 22.0], [20.0, 21.1], [20.0, 20.0])
-                .line_to([20.0, 8.0])
-                .close()
-                .move_to([14.0, 2.0])
-                .line_to([14.0, 8.0])
-                .line_to([20.0, 8.0])
-                .move_to([16.0, 13.0])
-                .line_to([8.0, 13.0])
-                .move_to([16.0, 17.0])
-                .line_to([8.0, 17.0]);
-            rune::Shape::new()
-                .stroke_path(&p, crate::lucide_stroke(size), rune::LineCap::Round, color)
-                .view_box(24.0, 24.0)
-        }
-        tool_labels::IconKind::Wrench => {
-            let p = rune::Path::new()
-                .move_to([14.7, 6.3])
-                .cubic_to([14.0, 5.6], [14.0, 4.4], [14.7, 3.7])
-                .line_to([17.0, 1.4])
-                .cubic_to([18.9, 2.3], [20.2, 4.0], [20.8, 6.0])
-                .cubic_to([21.5, 8.0], [21.1, 10.0], [19.9, 11.6])
-                .line_to([13.0, 18.5])
-                .cubic_to([11.6, 19.9], [9.4, 19.9], [8.0, 18.5])
-                .cubic_to([6.6, 17.1], [6.6, 14.9], [8.0, 13.5])
-                .line_to([14.9, 6.6]);
-            rune::Shape::new()
-                .stroke_path(&p, crate::lucide_stroke(size), rune::LineCap::Round, color)
-                .view_box(24.0, 24.0)
-        }
-    }
+    // Lucide geometry per tool family, so the trace reads like the action
+    // instead of a generic wrench for everything.
+    let paths: &[&str] = match kind {
+        tool_labels::IconKind::Terminal => &["m4 17 6-6-6-6", "M12 19h8"],
+        tool_labels::IconKind::Search => &[
+            "m21 21-4.34-4.34",
+            "M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16z",
+        ],
+        tool_labels::IconKind::Folder => &[
+            "M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z",
+        ],
+        tool_labels::IconKind::File => &[
+            "M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z",
+            "M14 2v4a2 2 0 0 0 2 2h4",
+            "M16 13H8",
+            "M16 17H8",
+        ],
+        tool_labels::IconKind::FileEdit => &[
+            "M12.5 22H18a2 2 0 0 0 2-2v-7",
+            "M18.4 2.6a2.1 2.1 0 0 1 3 3L9 17l-4 1 1-4Z",
+        ],
+        tool_labels::IconKind::Globe => &[
+            "M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20z",
+            "M2 12h20",
+            "M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z",
+        ],
+        tool_labels::IconKind::Bot => &[
+            "M12 8V4H8",
+            "M4 8h16a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2Z",
+            "M2 14h2",
+            "M20 14h2",
+            "M15 13v2",
+            "M9 13v2",
+        ],
+        tool_labels::IconKind::Database => &[
+            "M12 8c-4.97 0-9-1.34-9-3s4.03-3 9-3 9 1.34 9 3-4.03 3-9 3Z",
+            "M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5",
+            "M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3",
+        ],
+        tool_labels::IconKind::Clock => &[
+            "M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20z",
+            "M12 6v6l4 2",
+        ],
+        tool_labels::IconKind::Checklist => &[
+            "m3 17 2 2 4-4",
+            "m3 7 2 2 4-4",
+            "M13 6h8",
+            "M13 12h8",
+            "M13 18h8",
+        ],
+        tool_labels::IconKind::GitBranch => &[
+            "M6 3v12",
+            "M18 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6z",
+            "M6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6z",
+            "M18 9a9 9 0 0 1-9 9",
+        ],
+        tool_labels::IconKind::House => &[
+            "M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8",
+            "M3 10a2 2 0 0 1 .709-1.528l7-5.999a2 2 0 0 1 2.582 0l7 5.999A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z",
+        ],
+        tool_labels::IconKind::Message => &[
+            "M7.9 20A9 9 0 1 0 4 16.1L2 22Z",
+            "M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3",
+            "M12 17h.01",
+        ],
+        tool_labels::IconKind::Sparkles => &[
+            "m12 3-1.9 5.8a2 2 0 0 1-1.287 1.288L3 12l5.8 1.9a2 2 0 0 1 1.288 1.287L12 21l1.9-5.8a2 2 0 0 1 1.287-1.288L21 12l-5.8-1.9a2 2 0 0 1-1.288-1.287Z",
+        ],
+        tool_labels::IconKind::Wrench => &[
+            "M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z",
+        ],
+    };
+    crate::icons::lucide(paths, size, 2.0, color)
 }
 
 fn bot(size: f32, color: rune::Color) -> rune::Shape {
@@ -333,9 +341,7 @@ pub(super) fn activity_timeline<S: TranscriptHost + 'static>(
                         .mb(5.0)
                         .ml(13.0)
                         .pl(14.0)
-                        .py(2.0)
-                        .border_sides([1.0, 0.0, 0.0, 0.0], home_rgba(255.0, 255.0, 255.0, 0.11))
-                        .border_layout();
+                        .py(2.0);
                     for event in events {
                         body = body.child(tool_event_detail::<S>(
                             s,
@@ -359,8 +365,6 @@ pub(super) fn activity_timeline<S: TranscriptHost + 'static>(
                         .transition(crate::motion::fade_in(crate::motion::FADE))
                         .py(5.0)
                         .pl(13.0)
-                        .border_sides([1.0, 0.0, 0.0, 0.0], home_rgba(171.0, 159.0, 206.0, 0.5))
-                        .border_layout()
                         .child(md_render::render_body_compact::<S>(
                             s,
                             which,
@@ -488,7 +492,7 @@ fn tool_event_detail<S: TranscriptHost + 'static>(
     let status_icon = if event.status.is_running() {
         icon_box(13.0, loader(13.0, home_ink("#b8bdc4"))).looping(rune::LoopSpec::rotation(1.0))
     } else if event.ok == Some(false) {
-        icon_box(13.0, crate::lucide_x(13.0, 2.0, home_ink("#d39ba4")))
+        icon_box(13.0, crate::lucide_x(13.0, 2.0, home_ink("#a1a1aa")))
     } else {
         icon_box(13.0, check_circle(13.0, home_ink("#b8bdc4")))
     };
@@ -691,7 +695,7 @@ fn tool_panel<S: TranscriptHost + 'static>(
                     st
                 })
                 .color(if event.ok == Some(false) {
-                    home_ink("#d39ba4")
+                    home_ink("#a1a1aa")
                 } else {
                     home_ink("#898d96")
                 }),
@@ -839,8 +843,6 @@ fn tool_panel<S: TranscriptHost + 'static>(
         );
         body = body.child(
             col()
-                .border_sides([1.0, 0.0, 0.0, 0.0], home_rgba(255.0, 255.0, 255.0, 0.055))
-                .border_layout()
                 .child(
                     text(if path.is_empty() {
                         "Output".to_string()
@@ -976,13 +978,13 @@ fn delegation_card<S: TranscriptHost + 'static>(
     status_row = status_row.child(if running {
         spinner(12.0, home_ink("#989da5"), 1.6)
     } else if failed {
-        icon_box(12.0, crate::lucide_x(12.0, 2.0, home_ink("#d39ba4")))
+        icon_box(12.0, crate::lucide_x(12.0, 2.0, home_ink("#a1a1aa")))
     } else {
         icon_box(12.0, check_circle(12.0, home_ink("#989da5")))
     });
     status_row = status_row.child(text(status.to_string()).font(style(10.0, 400.0)).color(
         if failed {
-            home_ink("#d39ba4")
+            home_ink("#a1a1aa")
         } else {
             home_ink("#989da5")
         },

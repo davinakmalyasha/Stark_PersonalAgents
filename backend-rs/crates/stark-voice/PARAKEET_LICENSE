@@ -1,0 +1,9 @@
+Parakeet Unified English 0.6B
+Model: nvidia/parakeet-unified-en-0.6b
+GGUF conversion: handy-computer/parakeet-unified-en-0.6b-gguf
+License: NVIDIA Open Model License Agreement
+
+https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/
+
+The model is provided by NVIDIA and is used under the NVIDIA Open Model
+License. The transcribe.cpp inference engine is MIT-licensed.

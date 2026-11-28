@@ -466,6 +466,9 @@ pub struct CanvasState {
     /// Tabs whose history the shell still has to fetch (boot fallback +
     /// auto-opened project chats).
     pub pending_chat_fetches: Vec<(String, String)>,
+    /// Chats whose history already landed on the map, so spawned child cards
+    /// fetch once instead of on every snapshot.
+    pub hydrated_chats: std::collections::HashSet<String>,
     /// The chat with a live backend run (`workspace:chat`, the reference UI
     /// `runningTabId`); drives the dot on sidebar rows and tabs.
     pub running_tab: Option<String>,
@@ -526,6 +529,7 @@ impl Clone for CanvasState {
             active_tab: self.active_tab.clone(),
             known_chats: self.known_chats.clone(),
             pending_chat_fetches: self.pending_chat_fetches.clone(),
+            hydrated_chats: self.hydrated_chats.clone(),
             running_tab: self.running_tab.clone(),
             real: self.real,
             manual_cards: self.manual_cards.clone(),
@@ -633,6 +637,7 @@ impl CanvasState {
             active_tab: String::new(),
             known_chats: std::collections::HashSet::new(),
             pending_chat_fetches: Vec::new(),
+            hydrated_chats: std::collections::HashSet::new(),
             running_tab: None,
             real: false,
             manual_cards: std::collections::HashSet::new(),
@@ -758,6 +763,24 @@ impl CanvasState {
         self.layout_meta = layout_meta;
         self.edges = edges;
         self.sessions.order = self.cards.iter().map(|c| c.id.clone()).collect();
+        // Spawned child cards are on the map without being tabs, so the boot
+        // hydrate never touches them. Fetch each real chat's history once.
+        let mut fetches = std::mem::take(&mut self.pending_chat_fetches);
+        for card in &self.cards {
+            let Some(key) = card.id.strip_prefix("chat:") else {
+                continue;
+            };
+            if key.starts_with("local:") || self.hydrated_chats.contains(key) {
+                continue;
+            }
+            let Some(pair) = split_chat_key(key) else {
+                continue;
+            };
+            if !fetches.contains(&pair) {
+                fetches.push(pair);
+            }
+        }
+        self.pending_chat_fetches = fetches;
     }
 
     /// Adopt the boot snapshot: server layout wins once (open tabs, active
@@ -785,6 +808,7 @@ impl CanvasState {
             self.card_attachment_errors.clear();
             self.card_drop = None;
             self.known_chats.clear();
+            self.hydrated_chats.clear();
             self.running_tab = None;
             return;
         }
@@ -955,6 +979,7 @@ impl CanvasState {
             if !thread.live && !thread.aborting {
                 if let Some(rows) = snapshot.messages.get(&key) {
                     thread.rows = rows.iter().map(row_from_chat).collect();
+                    thread.sync_usage_from_rows();
                 }
             }
         }
@@ -1036,6 +1061,15 @@ impl CanvasState {
     /// Fill one card's transcript from a per-chat history fetch.
     pub fn apply_chat_messages(&mut self, key: &str, rows: &[crate::chats::ChatMsgRow]) -> bool {
         let card_id = format!("chat:{key}");
+        if !self.sessions.threads.contains_key(&card_id) {
+            // Spawned child cards have no tab and no thread until they render;
+            // create it here so their fetched history has somewhere to land.
+            if self.card(&card_id).is_none() {
+                return false;
+            }
+            self.thread_mut(&card_id);
+        }
+        self.hydrated_chats.insert(key.to_string());
         let Some(thread) = self.sessions.threads.get_mut(&card_id) else {
             return false;
         };
@@ -1046,6 +1080,7 @@ impl CanvasState {
             rows.iter().map(|row| row.key.clone()).collect();
         thread.seen_rows.retain(|key| live.contains(key));
         thread.rows = rows.iter().map(row_from_chat).collect();
+        thread.sync_usage_from_rows();
         thread.live = false;
         thread.aborting = false;
         if let Some((ws, chat)) = key.split_once(':') {
@@ -1956,7 +1991,7 @@ fn project_card_view<S: CanvasHost + 'static>(card: &MapCard, active: bool) -> E
         ink("#ffffff4d")
     } else if waiting {
         // `.canvas-card.is-waiting`: amber border.
-        ink("#fcd34d42")
+        ink("#a1a1aa42")
     } else {
         ink("#ffffff16")
     };
@@ -2117,7 +2152,7 @@ fn project_card_view<S: CanvasHost + 'static>(card: &MapCard, active: bool) -> E
             .key(format!("{id}-waiting"))
             .px(14.0)
             .font(rune::tok::TextStyle::new(10.0, 600.0))
-            .color(ink("#fcd34d")),
+            .color(ink("#a1a1aa")),
         )
         .child(
             rune::el()
@@ -2261,16 +2296,16 @@ fn mini_bubble<S: CanvasHost + 'static>(
         .py(10.0)
         .max_w(390.0)
         .child(head)
-        .child(
-            text(r.body.clone())
-                .font({
-                    let mut style = rune::tok::TextStyle::new(12.5, 400.0);
-                    style.line_height = 12.5 * 1.55;
-                    style
-                })
-                .wrap()
-                .color(ink(body_ink)),
-        );
+        .child(crate::rune_transcript::render_markdown_standalone(
+            &format!("{id}-mini-{}-md", r.key),
+            &r.body,
+            body_ink,
+            {
+                let mut style = rune::tok::TextStyle::new(12.5, 400.0);
+                style.line_height = 12.5 * 1.55;
+                style
+            },
+        ));
     if live_row {
         let mut dots = row().items_center().gap(3.0).pt(4.0);
         for (n, delay) in [0.0, 0.14, 0.28].into_iter().enumerate() {
@@ -3671,6 +3706,8 @@ pub fn canvas_body<S: CanvasHost + crate::rune_transcript::TranscriptHost + 'sta
                 .radius(7.0)
                 .fill(ink("#0f0f12b8"))
                 .border(1.0, ink("#ffffff14"))
+                .hover(ink("#1d1d22"))
+                .hover_group()
                 .pl(7.0)
                 .pr(9.0)
                 .backdrop_blur(12.0)
@@ -3708,7 +3745,8 @@ pub fn canvas_body<S: CanvasHost + crate::rune_transcript::TranscriptHost + 'sta
                 .child(
                     text("Add".to_string())
                         .font(rune::tok::TextStyle::new(9.5, 600.0))
-                        .color(ink("#a9abb3")),
+                        .color(ink("#a9abb3"))
+                        .group_color(ink("#f4f4f5")),
                 ),
         );
     }
@@ -3748,6 +3786,8 @@ pub fn canvas_body<S: CanvasHost + crate::rune_transcript::TranscriptHost + 'sta
             .size(28.0, 28.0)
             .radius(8.0)
             .center()
+            .hover(ink("#ffffff0a"))
+            .hover_group()
             .child(
                 rune::el()
                     .key(format!("cam-{key}-icon"))
@@ -3756,67 +3796,57 @@ pub fn canvas_body<S: CanvasHost + crate::rune_transcript::TranscriptHost + 'sta
                     .shape(icon),
             )
     };
-    canvas =
-        canvas
+    canvas = canvas.child(
+        row()
+            .key("cam-hud")
+            .absolute(vw - 127.0, 10.0)
+            .items_center()
+            .gap(1.0)
             .child(
-                row()
-                    .key("cam-hud")
-                    .absolute(vw - 127.0, 10.0)
-                    .items_center()
-                    .gap(1.0)
-                    .child(
-                        hud_icon("zoom-out", "Zoom out", icon_minus(ink("#81848d")))
-                            .on_press_tx_enter(move |s: &mut S, tx| {
-                                let c = s.canvas_mut();
-                                c.cam_auto = false;
-                                c.cam.zoom_by(0.86);
-                                c.sync_cam_live();
-                                // The world scales at draw time; no view run.
-                                tx.live_only();
-                            }),
-                    )
-                    .child(
-                        hud_icon("zoom-in", "Zoom in", icon_plus(ink("#81848d")))
-                            .on_press_tx_enter(move |s: &mut S, tx| {
-                                let c = s.canvas_mut();
-                                c.cam_auto = false;
-                                c.cam.zoom_by(1.16);
-                                c.sync_cam_live();
-                                tx.live_only();
-                            }),
-                    )
-                    .child(
-                        hud_icon("fit", "Fit to view", icon_scan(ink("#81848d")))
-                            .on_press_tx_enter(move |s: &mut S, tx| {
-                                let c = s.canvas_mut();
-                                let cards = c.cards.clone();
-                                let (vw, vh) = (c.view_w, c.view_h);
-                                c.cam.fit_in(&cards, vw, vh);
-                                c.sync_cam_live();
-                                c.cam_auto = true;
-                                tx.live_only();
-                            }),
-                    )
-                    .child(
-                        hud_icon("reset", "Reset layout", icon_reset(ink("#81848d")))
-                            .on_press_enter(move |s: &mut S| {
-                                // `relayout`: tidy-tree slots again plus a fresh fit.
-                                s.canvas_mut().relayout();
-                            }),
-                    ),
+                hud_icon("zoom-out", "Zoom out", icon_minus(ink("#81848d"))).on_press_tx_enter(
+                    move |s: &mut S, tx| {
+                        let c = s.canvas_mut();
+                        c.cam_auto = false;
+                        c.cam.zoom_by(0.86);
+                        c.sync_cam_live();
+                        // The world scales at draw time; no view run.
+                        tx.live_only();
+                    },
+                ),
             )
-            .child(if !s.cards.is_empty() {
-                // `.canvas-map-hint`: bottom-left, 9pt dim copy (hidden behind the
-                // home chat card when it is open, and absent when the canvas is
-                // empty, exactly like the reference UI).
-                text("Drag to pan · scroll to zoom · drag cards to arrange".to_string())
-                    .key("cam-hint")
-                    .absolute(18.0, vh - 26.0)
-                    .font(rune::tok::TextStyle::new(9.0, 400.0))
-                    .color(ink("#4f525a"))
-            } else {
-                rune::el().key("cam-hint-empty").size(0.0, 0.0).inert()
-            });
+            .child(
+                hud_icon("zoom-in", "Zoom in", icon_plus(ink("#81848d"))).on_press_tx_enter(
+                    move |s: &mut S, tx| {
+                        let c = s.canvas_mut();
+                        c.cam_auto = false;
+                        c.cam.zoom_by(1.16);
+                        c.sync_cam_live();
+                        tx.live_only();
+                    },
+                ),
+            )
+            .child(
+                hud_icon("fit", "Fit to view", icon_scan(ink("#81848d"))).on_press_tx_enter(
+                    move |s: &mut S, tx| {
+                        let c = s.canvas_mut();
+                        let cards = c.cards.clone();
+                        let (vw, vh) = (c.view_w, c.view_h);
+                        c.cam.fit_in(&cards, vw, vh);
+                        c.sync_cam_live();
+                        c.cam_auto = true;
+                        tx.live_only();
+                    },
+                ),
+            )
+            .child(
+                hud_icon("reset", "Reset layout", icon_reset(ink("#81848d"))).on_press_enter(
+                    move |s: &mut S| {
+                        // `relayout`: tidy-tree slots again plus a fresh fit.
+                        s.canvas_mut().relayout();
+                    },
+                ),
+            ),
+    );
     // Sidebar rows mirror the cards: the active chat carries the white-9%
     // wash (`.house-sidebar-row.is-active`); a press switches selection.
     // Rows key off card ids so the board and the list can never disagree.
@@ -4231,7 +4261,7 @@ fn sidebar_actions<S: CanvasHost + 'static>(
     let mut cloud_icon = action_icon(
         12.0,
         if running {
-            crate::icons::cloud(12.0, ink("#7dd3fc"))
+            crate::icons::cloud(12.0, ink("#e4e4e7"))
         } else {
             crate::icons::cloud_off(12.0, ink("#71717a"))
         },
@@ -4608,7 +4638,7 @@ fn sidebar_thread<S: CanvasHost + 'static>(
                     .size(12.0, 12.0)
                     .inert()
                     .shape(if spawned {
-                        bot_icon(12.0, ink("#c4b5fd"))
+                        bot_icon(12.0, ink("#a1a1aa"))
                     } else if chat.workspace_kind == "general" {
                         chat_row_icon(12.0, ink("#52525b"))
                     } else {
@@ -5564,6 +5594,32 @@ pub fn run_canvas_headless(extra_args: Vec<String>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn spawned_card_history_lands_before_it_renders() {
+        use super::*;
+        let mut canvas = CanvasState::map();
+        // A non-tab card: spawned children are on the map without a thread.
+        let card_id = "chat:ws-general:chat-2".to_string();
+        assert!(canvas.card(&card_id).is_some());
+        canvas.sessions.threads.remove(&card_id);
+        let rows = vec![crate::chats::ChatMsgRow {
+            key: "m1".to_string(),
+            role: "agent".to_string(),
+            body: "child reply".to_string(),
+            raw_body: "child reply".to_string(),
+            ..crate::chats::ChatMsgRow::default()
+        }];
+        assert!(canvas.apply_chat_messages("ws-general:chat-2", &rows));
+        let thread = canvas
+            .sessions
+            .threads
+            .get(&card_id)
+            .expect("thread created for the card");
+        assert_eq!(thread.rows.len(), 1);
+        assert_eq!(thread.rows[0].body, "child reply");
+        assert!(canvas.hydrated_chats.contains("ws-general:chat-2"));
+    }
+
     use super::*;
     use rune::{Env, Runtime};
 

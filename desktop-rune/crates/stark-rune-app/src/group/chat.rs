@@ -226,7 +226,7 @@ fn approval_card<S: ProjectsHost + 'static>(item: &GroupItem, busy: bool) -> El 
                 .fill(rgba(251.0, 191.0, 36.0, 0.12))
                 .child(icon(
                     15.0,
-                    crate::icons::triangle_alert(15.0, ink("#fcd34d")),
+                    crate::icons::triangle_alert(15.0, ink("#a1a1aa")),
                 )),
         )
         .child(
@@ -600,14 +600,14 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
                                 .fill(rgba(251.0, 191.0, 36.0, 0.12))
                                 .child(icon(
                                     11.0,
-                                    crate::icons::triangle_alert(11.0, ink("#fcd34d")),
+                                    crate::icons::triangle_alert(11.0, ink("#a1a1aa")),
                                 ))
                                 .child(
                                     text(format!("{} waiting", waiting.len()))
                                         .font(crate::motion::tabular(rune::tok::TextStyle::new(
                                             9.5, 650.0,
                                         )))
-                                        .color(ink("#fcd34d")),
+                                        .color(ink("#a1a1aa")),
                                 )
                         })
                         .child(live_chip(&status)),

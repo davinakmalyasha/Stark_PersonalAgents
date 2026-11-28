@@ -18,18 +18,16 @@ The release bundle contains or links the following components. Keep this file, t
   `7efa26973f81bba42cf2ace8da2c1eb9b605d54d`
 - Distributed under the upstream repository's license.
 
-## Moonshine Voice / moonshine-rs
+## transcribe.cpp / Parakeet Unified English
 
-- Source: https://github.com/moonshine-ai/moonshine and
-  https://github.com/ghchinoy/moonshine-rs
-- License: MIT (Moonshine models and the Rust wrapper)
-- Model: medium-streaming English, quantized (245M, 6.65% OpenASR avg)
-
-## ONNX Runtime
-
-- Source: https://github.com/microsoft/onnxruntime
-- License: MIT
-- Windows runtime DLL version 1.26.x is bundled next to `stark-server.exe`.
+- Engine: https://github.com/handy-computer/transcribe.cpp
+  (Anomaly's pinned fork `60bed89dab84f7c1fddc3a17ad7fa8a27ddfba19`)
+- Engine license: MIT
+- Model: NVIDIA `parakeet-unified-en-0.6b`, Q8_0 GGUF conversion by
+  handy-computer, 731,357,568 bytes
+- Model license: NVIDIA Open Model License
+  https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/
+- SHA-256: `4b50b6dd862bf6e346929aaf4f5eaacec003bfa3f56462d6c874b41ef2f38795`
 
 ## JARVIS voice
 

@@ -242,55 +242,74 @@ fn voice_icon(color: rune::Color) -> rune::Shape {
         .view_box(24.0, 24.0)
 }
 
-/// Voice toggle button. `S` is the owning view's state type.
+/// Live-mode toggle. The dock only arms: white disc + black equalizer bars
+/// while armed, calm grey while off. Capture itself starts only from the
+/// island's mic (or Ctrl+Space while armed). `S` is the owning view's state
+/// type.
+///
+/// While armed, one dash of an inner border ring orbits the button and the
+/// bars shimmer. Both are paint-only loops: no shell wake, no rebuild. The
+/// ring follows the button's rounded square, not a separate circle.
 fn voice_button<S: 'static>(
-    voice: &crate::voice::VoiceMeter<'_>,
+    voice: &crate::voice::VoiceMeter,
     on_voice: impl Fn(&mut S) + 'static,
 ) -> El {
-    let live = voice.live;
+    let active = voice.armed || voice.live;
     let mut button = rune::el()
         .key("composer-voice")
         .role("button")
         .focusable(true)
-        .label(if live {
-            "Stop voice input"
+        .label(if active {
+            "Live mode on — press to turn off"
         } else {
-            "Start voice input"
+            "Turn live mode on"
         })
         .size(32.0, 32.0)
         .radius(11.0)
         .center()
-        .on_press_enter(on_voice);
-    if live {
-        // `.voice-live-dot`: a 5 pt white dot with a 2 pt `#8a6fe9` ring,
-        // top-right. `voice-breathe` scales and fades both over 1.2 s; the
-        // shell publishes the two Live tracks from the keyframe clock.
-        let scale = voice.breathe_scale;
-        let opacity = voice.breathe_opacity;
-        button = button
-            .linear_gradient(
-                135.0 * std::f32::consts::PI / 180.0,
-                [(0.0, ink("#7860d9")), (1.0, ink("#aa8dff"))],
-            )
-            .child(
+        .on_press_enter(on_voice)
+        .press_scale(0.96);
+    if active {
+        // Five bars on staggered opacity loops, so the mark itself reads as
+        // live audio instead of a static glyph.
+        let mut bars = rune::row()
+            .key("composer-voice-bars")
+            .h(16.0)
+            .items_center()
+            .justify_center()
+            .gap(2.0)
+            .inert();
+        const BAR_H: [f32; 5] = [6.0, 11.0, 16.0, 9.0, 13.0];
+        for (i, h) in BAR_H.iter().enumerate() {
+            bars = bars.child(
                 rune::el()
-                    .key("composer-voice-dot")
-                    .pin(None, Some(2.0), Some(2.0), None)
-                    .size(9.0, 9.0)
-                    .radius(4.5)
-                    .fill(ink("#8a6fe9"))
-                    .live_scale(scale)
-                    .live_opacity(opacity)
-                    .center()
-                    .inert()
-                    .child(
-                        rune::el()
-                            .size(5.0, 5.0)
-                            .radius(2.5)
-                            .fill(ink("#ffffff"))
-                            .inert(),
-                    ),
+                    .key(format!("composer-voice-bar-{i}"))
+                    .w(2.0)
+                    .h(*h)
+                    .radius(1.0)
+                    .fill(ink("#111113"))
+                    .looping(rune::LoopSpec::opacity(1.2, i as f64 * 0.13, 0.35, 1.0))
+                    .inert(),
             );
+        }
+        // One long dash on a ring just inside the disc, fully over the white
+        // fill (an element's own border draws at the outer edge and half of
+        // it would blend into the dark dock). The gaps show white, so the
+        // visible line is a border segment travelling around the rounded
+        // square rather than a separate ring or dots.
+        let orbit = rune::el()
+            .key("composer-voice-border")
+            .absolute(1.0, 1.0)
+            .size(30.0, 30.0)
+            .radius(10.0)
+            .border(1.6, ink("#111113"))
+            .border_layout()
+            // One dash plus its gap is about the ring's perimeter (≈103 pt),
+            // so the loop wraps without a visible jump.
+            .border_dash(32.0, 71.0)
+            .looping(rune::LoopSpec::border_sweep(1.6))
+            .inert();
+        button = button.fill(ink("#ffffff")).child(bars).child(orbit);
     } else {
         button = button
             .fill(ink("#303035"))
@@ -370,7 +389,7 @@ fn target_toggle<S: 'static>(
         .inert()
         .shape(cloud_icon(
             !cloud_active,
-            ink(if cloud_active { "#7dd3fc" } else { "#71717a" }),
+            ink(if cloud_active { "#e4e4e7" } else { "#71717a" }),
         ));
     if cloud_active {
         // The reference UI pulses the cloud icon (`animate-pulse`); same rhythm here.
@@ -414,7 +433,7 @@ fn target_toggle<S: 'static>(
                 .py(6.0)
                 .radius(6.0)
                 .fill(ink(if cloud_active {
-                    "#0c4a6e66"
+                    "#a1a1aa66"
                 } else {
                     "#00000000"
                 }))
@@ -428,7 +447,7 @@ fn target_toggle<S: 'static>(
                             style.line_height = 16.5;
                             style
                         })
-                        .color(ink(if cloud_active { "#7dd3fc" } else { "#71717a" }));
+                        .color(ink(if cloud_active { "#e4e4e7" } else { "#71717a" }));
                     if !cloud_active {
                         label = label.group_color(ink("#d4d4d8"));
                     }
@@ -489,14 +508,14 @@ fn usage_orb<S: 'static>(
     let ring_ink = if pct >= 95.0 {
         "#f87171"
     } else if pct >= 85.0 {
-        "#fbbf24"
+        "#a1a1aa"
     } else {
         "#e5e5e8"
     };
     let number_ink = if pct >= 95.0 {
         "#f87171"
     } else if pct >= 85.0 {
-        "#fbbf24"
+        "#a1a1aa"
     } else {
         "#dadade"
     };
@@ -712,7 +731,7 @@ fn provider_pill<S: 'static>(
                 style.line_height = 11.0;
                 style
             })
-            .color(ink(if warn { "#fbbf24" } else { "#c9c9d1" }))
+            .color(ink(if warn { "#a1a1aa" } else { "#c9c9d1" }))
             .group_color(ink("#ededf1")),
         )
 }
@@ -859,7 +878,7 @@ fn model_row<S: 'static>(id: &str, name: &str, selected: bool, pick: Pick<S>) ->
         .py(6.0)
         .radius(6.0)
         .fill(if selected {
-            ink("#9577ff24")
+            ink("#a1a1aa24")
         } else {
             ink("#00000000")
         })
@@ -869,22 +888,22 @@ fn model_row<S: 'static>(id: &str, name: &str, selected: bool, pick: Pick<S>) ->
         .focus_selected(selected)
         // `.model-menu button:hover` is the same violet wash as `.selected`;
         // one highlight serves pointer and arrow keys, as NSMenu does.
-        .focus_highlight(ink("#9577ff24"));
+        .focus_highlight(ink("#a1a1aa24"));
     if !selected {
-        el = el.hover(ink("#9577ff24")).hover_group();
+        el = el.hover(ink("#a1a1aa24")).hover_group();
     }
     el.on_press(move |s: &mut S| pick(s, target.clone()))
         .child(
             text(name.to_string())
                 .grow(1.0)
                 .font(rune::tok::TextStyle::new(11.0, 400.0))
-                .color(ink(if selected { "#e5ddff" } else { "#d4d4d8" }))
-                .group_color(ink("#e5ddff")),
+                .color(ink(if selected { "#f4f4f5" } else { "#d4d4d8" }))
+                .group_color(ink("#f4f4f5")),
         )
         .child(
             text(if selected { "✓" } else { "" }.to_string())
                 .font(rune::tok::TextStyle::new(11.0, 600.0))
-                .color(ink("#e5ddff")),
+                .color(ink("#f4f4f5")),
         )
 }
 
@@ -906,7 +925,7 @@ pub struct ComposerButtons<S: 'static> {
     pub model_pick: Pick<S>,
     /// Usage popover "View details" → stats modal.
     pub stats: Press<S>,
-    /// Provider pill → agents & providers modal.
+    /// Provider pill → provider keys and OpenCode Go allowance.
     pub config: Press<S>,
     /// Attach control (opens the native file dialog).
     pub attach: PressTx<S>,
@@ -921,12 +940,13 @@ pub struct ComposerButtons<S: 'static> {
 pub fn composer_card<S: 'static>(
     edit: &TextEdit,
     edit_of: std::rc::Rc<dyn for<'a> Fn(&'a mut S) -> &'a mut TextEdit>,
-    voice: crate::voice::VoiceMeter<'_>,
+    voice: crate::voice::VoiceMeter,
     running: bool,
     meta: ComposerMeta<'_>,
     buttons: ComposerButtons<S>,
 ) -> El {
     let voice_live = voice.live;
+    let voice_armed = voice.armed;
     let submit = {
         let on_send = buttons.send.clone();
         move |s: &mut S, _tx: &mut Tx| on_send(s)
@@ -946,6 +966,8 @@ pub fn composer_card<S: 'static>(
     .placeholder(
         if voice_live {
             "Listening…"
+        } else if voice_armed {
+            "Live mode on — talk from the island"
         } else if !meta.attachments.is_empty() {
             // PromptDock's deck note; the deck clears it after send.
             "Add a note about these files…"
@@ -1050,7 +1072,7 @@ pub fn composer_card<S: 'static>(
         }
     } else if voice_live {
         // `.premium-surface.is-listening`: violet .58 wins over hover.
-        ink("#977fff94")
+        ink("#a1a1aa94")
     } else {
         // `.premium-surface` rests at white .08; hover lifts to .14.
         rune::Color {
@@ -1110,7 +1132,7 @@ pub fn composer_card<S: 'static>(
                 y: 0.0,
                 blur: 0.0,
                 spread: 1.0,
-                color: ink("#977fff1f"),
+                color: ink("#a1a1aa1f"),
                 inset: false,
             })
             .box_shadow(rune::Shadow {
@@ -1118,7 +1140,7 @@ pub fn composer_card<S: 'static>(
                 y: 0.0,
                 blur: 34.0,
                 spread: 0.0,
-                color: ink("#7a5cff24"),
+                color: ink("#a1a1aa24"),
                 inset: false,
             })
             .shadow(
@@ -1218,7 +1240,7 @@ pub fn composer_card<S: 'static>(
                 .px(16.0)
                 .pb(8.0)
                 .font(rune::tok::TextStyle::new(11.0, 400.0))
-                .color(ink("#fcd34de6")),
+                .color(ink("#a1a1aae6")),
         );
     }
     card = card.child(

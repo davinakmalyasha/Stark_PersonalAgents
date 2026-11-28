@@ -323,6 +323,7 @@ impl<T: 'static> Overlay<T> {
         if let Some(input) = requests.input { self.pending_input = Some(input); }
         self.apply_input();
         if let Some(exclude) = requests.exclude_from_capture { self.set_capture_exclusion(exclude); }
+        if let Some(active) = requests.activatable { self.set_activatable(active); }
         if let Some(allow) = requests.xwayland_input { self.options.xwayland_input = allow; }
         if let Some(follow) = requests.follow_pointer {
             self.options.follow_pointer = follow;

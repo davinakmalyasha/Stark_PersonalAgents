@@ -1,9 +1,8 @@
 //! Mic capture + level metering behind the voice toggle. Dictation prefers
 //! The backend bridge ([`crate::voice_ws`]): captured 16 kHz mono PCM is
 //! streamed to `stark-server`, whose VAD/STT answers with
-//! [`VoiceMsg::Transcript`]. When no server is reachable the on-device
-//! producer (`stt`, MSVC builds) takes over, else capture degrades to
-//! meter-only levels with an honest note.
+//! [`VoiceMsg::Transcript`]. When no server is reachable capture degrades to
+//! meter-only levels with an honest note; there is no on-device model.
 //!
 //! Native: cpal default input streams RMS blocks into an `mpsc` channel the
 //! poll hook drains into `voice_level`. Web: `getUserMedia` binds later —
@@ -26,8 +25,7 @@ pub enum VoiceMsg {
     /// Interim (`is_final: false`) or final (`true`) dictation text from the
     /// speech thread. The reference UI's overlay protocol is the reference: `transcript`
     /// events refresh the live bubble in place, `pipeline-start` swaps it for
-    /// The single canonical user message. Produced by the `stt` worker on
-    /// MSVC + `voice-stt`; elsewhere the variant is exercised by tests.
+    /// The single canonical user message. Produced by the backend bridge.
     #[allow(dead_code)]
     Transcript {
         text: String,
@@ -42,16 +40,18 @@ pub enum VoiceMsg {
 /// All voice runtime state in one bus so every view (transcript, canvas,
 /// personal) shares toggle/drain logic. `stop`/`rx` reset on clone: a copied
 /// state never inherits a live microphone.
+///
+/// Live mode is armed per thread: the prompt-dock mic arms (warms the speech
+/// models, shows the island idle) but never captures. Only the island's mic
+/// (or Ctrl+Space while armed) starts capture. Stopping capture keeps the
+/// models warm while any bus stays armed; the shell releases them once no
+/// bus is armed or live.
 pub struct VoiceBus {
+    /// Live-mode armed: models warming/warm, island up, mic still off.
+    /// Runtime-only, never persisted; the app always starts disarmed.
+    pub armed: bool,
     pub live: bool,
     pub level: f32,
-    /// `voice-breathe` tracks: scale `.88 -> 1.08` and opacity `.65 -> 1`
-    /// over 1.2 s. Rune has no infinite scale loop, so the shell samples the
-    /// keyframe clock into these `Live` values while the dot is mounted.
-    pub breathe_scale: rune::Live<f32>,
-    pub breathe_opacity: rune::Live<f32>,
-    /// Wall-clock start of the current live session (ms).
-    pub breathe_start_ms: u64,
     pub note: Option<String>,
     /// Latest interim dictation (`transcript` events overwrite it in place,
     /// like the reference UI's `voice-live-input` bubble content).
@@ -59,6 +59,9 @@ pub struct VoiceBus {
     /// A finished utterance waiting for the poll hook to stage it into the
     /// composer draft (`take_final` consumes it once).
     pending_final: Option<String>,
+    /// Monotonic count of finished utterances consumed by the transcript
+    /// poll. The shell watches it to optionally auto-send the staged draft.
+    pub final_seq: u64,
     pub stop: Option<Arc<AtomicBool>>,
     pub rx: Option<std::sync::mpsc::Receiver<VoiceMsg>>,
 }
@@ -67,10 +70,12 @@ impl std::fmt::Debug for VoiceBus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VoiceBus")
             .field("live", &self.live)
+            .field("armed", &self.armed)
             .field("level", &self.level)
             .field("note", &self.note)
             .field("live_text", &self.live_text)
             .field("pending_final", &self.pending_final.is_some())
+            .field("final_seq", &self.final_seq)
             .field("capturing", &self.stop.is_some())
             .finish()
     }
@@ -79,14 +84,13 @@ impl std::fmt::Debug for VoiceBus {
 impl Clone for VoiceBus {
     fn clone(&self) -> Self {
         Self {
+            armed: self.armed,
             live: self.live,
             level: self.level,
-            breathe_scale: self.breathe_scale.clone(),
-            breathe_opacity: self.breathe_opacity.clone(),
-            breathe_start_ms: self.breathe_start_ms,
             note: self.note.clone(),
             live_text: self.live_text.clone(),
             pending_final: self.pending_final.clone(),
+            final_seq: self.final_seq,
             stop: None,
             rx: None,
         }
@@ -96,14 +100,13 @@ impl Clone for VoiceBus {
 impl Default for VoiceBus {
     fn default() -> Self {
         Self {
+            armed: false,
             live: false,
             level: 0.0,
-            breathe_scale: rune::Live::new(1.0),
-            breathe_opacity: rune::Live::new(1.0),
-            breathe_start_ms: 0,
             note: None,
             live_text: String::new(),
             pending_final: None,
+            final_seq: 0,
             stop: None,
             rx: None,
         }
@@ -111,27 +114,28 @@ impl Default for VoiceBus {
 }
 
 impl VoiceBus {
-    /// Toggle capture. Returns true when a capture attempt started.
-    /// Stopping always succeeds. Hardware failures (no device, OS error)
-    /// arrive asynchronously as [`VoiceMsg::Error`] notes via [`VoiceBus::drain`].
-    pub fn set_live(&mut self, on: bool) -> bool {
-        if !on {
-            if let Some(stop) = self.stop.take() {
-                stop.store(true, Ordering::Relaxed);
-            }
-            self.rx = None;
-            self.live = false;
-            self.level = 0.0;
-            self.breathe_scale.set(1.0);
-            self.breathe_opacity.set(1.0);
-            self.live_text.clear();
-            return false;
+    /// Arm or disarm live mode. Arming warms the backend TTS (idempotent,
+    /// best effort) and never touches the microphone; disarming stops a
+    /// running capture but leaves model release to the shell, which releases
+    /// only once no bus is armed or live.
+    pub fn set_armed(&mut self, on: bool) {
+        if on {
+            self.armed = true;
+            self.note = None;
+            Self::ensure_warmed();
+            return;
         }
+        self.stop_capture();
+        self.armed = false;
+    }
+
+    /// Start the microphone. Returns true when a capture attempt started.
+    /// Capture never warms or releases models — arming owns that.
+    /// Hardware failures (no device, OS error) arrive asynchronously as
+    /// [`VoiceMsg::Error`] notes via [`VoiceBus::drain`].
+    pub fn start_capture(&mut self) -> bool {
         self.note = None;
         self.level = 0.0;
-        self.breathe_start_ms = crate::clock::now_millis();
-        self.breathe_scale.set(0.88);
-        self.breathe_opacity.set(0.65);
         self.live_text.clear();
         self.pending_final = None;
         #[cfg(target_arch = "wasm32")]
@@ -155,24 +159,22 @@ impl VoiceBus {
             self.stop = Some(stop);
             self.rx = Some(rx);
             self.live = true;
-            // Dictation prefers the backend bridge: the app streams PCM to
-            // `stark-server` (`/api/voice/ws`), which owns VAD/STT — the
-            // pre-rewrite split, and the only path that needs no speech model
-            // in the app. Without a reachable server it falls back to the
-            // on-device model (MSVC builds only), then to meter-only levels
-            // with an honest note.
-            let (pcm_tx, pcm_rx) = std::sync::mpsc::sync_channel(crate::stt::MAX_AUDIO_QUEUE);
+            // Dictation is backend-owned: the app streams PCM to
+            // `stark-server` (`/api/voice/ws`), which runs Parakeet Unified
+            // English. There is no on-device model and no fallback producer;
+            // without a reachable server capture degrades to meter-only
+            // levels with an honest note.
+            let (pcm_tx, pcm_rx) =
+                std::sync::mpsc::sync_channel(crate::voice_audio::MAX_AUDIO_QUEUE);
             let host = crate::rune_transcript::DEFAULT_API_HOST;
             let port = crate::rune_transcript::api_port();
             let started = match crate::voice_ws::try_open(host, port) {
                 Ok(socket) => crate::voice_ws::spawn_with(socket, pcm_rx, tx.clone(), flag.clone())
-                    .map_err(Some),
-                Err(server) => match crate::stt::spawn_producer(pcm_rx, tx.clone(), flag.clone()) {
-                    Ok(()) => Ok(()),
-                    Err(local) => Err(Some(format!(
-                        "dictation unavailable — server: {server}; local: {local}"
-                    ))),
-                },
+                    .map_err(|error| Some(format!("dictation unavailable: {error}"))),
+                Err(server) => {
+                    drop(pcm_rx);
+                    Err(Some(format!("dictation unavailable - server: {server}")))
+                }
             };
             match started {
                 Ok(()) => {
@@ -189,6 +191,19 @@ impl VoiceBus {
             true
         }
     }
+
+    /// Stop the microphone. Always succeeds; models stay warm while armed.
+    /// Dropping back to armed-idle never releases — only disarming every bus
+    /// (via the shell) releases.
+    pub fn stop_capture(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        self.rx = None;
+        self.live = false;
+        self.level = 0.0;
+        self.live_text.clear();
+    }
     pub fn drain(&mut self, dt: f32) -> bool {
         let mut changed = false;
         while let Some(msg) = self.rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
@@ -201,13 +216,12 @@ impl VoiceBus {
                     if is_final {
                         // Session end (`pipeline-start`): drop the live bubble,
                         // stop capture, and hand the canonical prompt to the
-                        // poll hook for draft staging.
+                        // poll hook for draft staging. Models stay warm: the
+                        // bus is still armed, back to idle.
                         self.pending_final = Some(text);
                         self.live_text.clear();
                         self.live = false;
                         self.level = 0.0;
-                        self.breathe_scale.set(1.0);
-                        self.breathe_opacity.set(1.0);
                         if let Some(stop) = self.stop.take() {
                             stop.store(true, Ordering::Relaxed);
                         }
@@ -223,11 +237,11 @@ impl VoiceBus {
                     changed = true;
                 }
                 VoiceMsg::Error(note) => {
+                    // Capture failed honestly; the bus stays armed so the
+                    // island (and its retry) stay up. Models stay warm.
                     self.note = Some(note);
                     self.live = false;
                     self.level = 0.0;
-                    self.breathe_scale.set(1.0);
-                    self.breathe_opacity.set(1.0);
                     changed = true;
                 }
             }
@@ -246,49 +260,81 @@ impl VoiceBus {
     /// Consume a finished utterance once (the poll hook stages it into the
     /// composer draft, like the reference UI's `voiceInputText` dock effect).
     pub fn take_final(&mut self) -> Option<String> {
-        self.pending_final.take()
+        let final_text = self.pending_final.take();
+        if final_text.is_some() {
+            self.final_seq = self.final_seq.wrapping_add(1);
+        }
+        final_text
     }
 
-    /// Meter plus the live breathing tracks, for the composer's voice dot.
-    pub fn meter(&self) -> VoiceMeter<'_> {
+    /// Arming live mode warms the backend TTS in the background, so the first
+    /// spoken reply does not pay model load. (Parakeet loads on first
+    /// `session.start`, locally on first producer spawn.) Best effort: a
+    /// missing bundle or unreachable server only surfaces when TTS is used.
+    /// Idempotent — arm every bus freely; one warm call is enough but repeats
+    /// are harmless.
+    pub fn ensure_warmed() {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let host = crate::rune_transcript::DEFAULT_API_HOST.to_string();
+            let port = crate::rune_transcript::api_port();
+            std::thread::spawn(move || {
+                let _ = crate::transport::post_json_status(
+                    &host,
+                    port,
+                    "/api/voice/warm_tts",
+                    &serde_json::json!({}),
+                );
+                let _ = crate::transport::post_json_status(
+                    &host,
+                    port,
+                    "/api/voice/warm_stt",
+                    &serde_json::json!({}),
+                );
+            });
+        }
+    }
+
+    /// Disarming the last bus releases the models and asks the backend to
+    /// release TTS/ASR, so an idle app holds no speech memory. The shell calls
+    /// this only once no bus is armed or live. Every call is idempotent and
+    /// best effort; release endpoints never fail.
+    pub fn release_models() {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let host = crate::rune_transcript::DEFAULT_API_HOST.to_string();
+            let port = crate::rune_transcript::api_port();
+            std::thread::spawn(move || {
+                let _ = crate::transport::post_json_status(
+                    &host,
+                    port,
+                    "/api/voice/release_tts",
+                    &serde_json::json!({}),
+                );
+                let _ = crate::transport::post_json_status(
+                    &host,
+                    port,
+                    "/api/voice/release_asr",
+                    &serde_json::json!({}),
+                );
+            });
+        }
+    }
+
+    /// Meter for the composer's live-mode button.
+    pub fn meter(&self) -> VoiceMeter {
         VoiceMeter {
             live: self.live,
-            breathe_scale: &self.breathe_scale,
-            breathe_opacity: &self.breathe_opacity,
+            armed: self.armed,
         }
-    }
-
-    /// Publish one frame of the 1.2 s `voice-breathe` keyframe. The shell
-    /// calls this from its poll, which wakes at ~60 Hz while the mic is live.
-    pub fn tick_breathe(&self, now_ms: u64) -> bool {
-        if !self.live {
-            return false;
-        }
-        let (scale, opacity) = breathe_pose(now_ms.saturating_sub(self.breathe_start_ms));
-        self.breathe_scale.set(scale);
-        self.breathe_opacity.set(opacity);
-        true
     }
 }
 
-/// Read-only composer view of the voice bus.
-pub struct VoiceMeter<'a> {
+/// Read-only composer view of the voice bus. `armed` is live-mode (models
+/// warm, island up, mic off); `live` is an active capture.
+pub struct VoiceMeter {
     pub live: bool,
-    pub breathe_scale: &'a rune::Live<f32>,
-    pub breathe_opacity: &'a rune::Live<f32>,
-}
-
-/// `voice-breathe`: scale `.88 -> 1.08` and opacity `.65 -> 1` over 1.2 s,
-/// `ease-in-out` on each half. The keyframe repeats from the session start.
-pub fn breathe_pose(elapsed_ms: u64) -> (f32, f32) {
-    let phase = (elapsed_ms % 1200) as f32 / 1200.0;
-    let half = if phase < 0.5 {
-        phase * 2.0
-    } else {
-        (1.0 - phase) * 2.0
-    };
-    let eased = rune::Easing::EASE_IN_OUT.eval(half);
-    (0.88 + 0.20 * eased, 0.65 + 0.35 * eased)
+    pub armed: bool,
 }
 
 /// RMS loudness in 0..1 of an f32 sample block.
@@ -310,6 +356,7 @@ pub fn decay_level(current: f32, peak: f32, dt: f32) -> f32 {
 }
 
 /// How many of the 5 meter bars a level lights.
+#[cfg(any(target_arch = "wasm32", test))]
 pub fn lit_bars(level: f32) -> usize {
     if level <= 0.0 {
         return 0;
@@ -330,7 +377,7 @@ pub fn probe_input() -> Option<String> {
 /// 16 kHz capture mode for the STT frontend: the config plus whether the
 /// mono mixdown applies (stereo fallback). Mono F32/I16/U16 first, then
 /// stereo with downmix. When no exact mode exists the caller falls back to
-/// The device default rate and [`LinearResampler`] converts to 16 kHz.
+/// The device default rate and the FFT resampler convert to 16 kHz.
 #[cfg(not(target_arch = "wasm32"))]
 fn prefer_16k(device: &cpal::Device) -> Option<(cpal::SupportedStreamConfig, bool)> {
     let mut best: Option<(u8, cpal::SupportedStreamConfig, bool)> = None;
@@ -342,8 +389,8 @@ fn prefer_16k(device: &cpal::Device) -> Option<(cpal::SupportedStreamConfig, boo
         if channels != 1 && channels != 2 {
             continue;
         }
-        if range.min_sample_rate() > crate::stt::SAMPLE_RATE
-            || range.max_sample_rate() < crate::stt::SAMPLE_RATE
+        if range.min_sample_rate() > crate::voice_audio::SAMPLE_RATE
+            || range.max_sample_rate() < crate::voice_audio::SAMPLE_RATE
         {
             continue;
         }
@@ -362,7 +409,7 @@ fn prefer_16k(device: &cpal::Device) -> Option<(cpal::SupportedStreamConfig, boo
         if better {
             best = Some((
                 rank,
-                range.with_sample_rate(crate::stt::SAMPLE_RATE),
+                range.with_sample_rate(crate::voice_audio::SAMPLE_RATE),
                 channels == 2,
             ));
         }
@@ -370,77 +417,12 @@ fn prefer_16k(device: &cpal::Device) -> Option<(cpal::SupportedStreamConfig, boo
     best.map(|(_, config, stereo)| (config, stereo))
 }
 
-/// Streaming linear resampler: WASAPI shared mode usually exposes only
-/// 48 kHz while the STT frontend expects 16 kHz. Linear interpolation keeps
-/// phase continuity across capture blocks (fractional position + the last
-/// sample of the previous block), so block boundaries never click.
-#[cfg(not(target_arch = "wasm32"))]
-struct LinearResampler {
-    /// Input samples per output sample (`from / to`).
-    step: f64,
-    /// Next output position inside the current block, in input samples.
-    pos: f64,
-    /// Last input sample of the previous block (interpolation carry).
-    prev: f32,
-    primed: bool,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl LinearResampler {
-    fn new(from: u32, to: u32) -> Self {
-        Self {
-            step: from as f64 / to as f64,
-            pos: 0.0,
-            prev: 0.0,
-            primed: false,
-        }
-    }
-
-    fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
-        let n = input.len();
-        if n == 0 {
-            return;
-        }
-        let mut pos = self.pos;
-        while pos < n as f64 {
-            let index = pos.floor() as isize;
-            let frac = (pos - index as f64) as f32;
-            // An interpolating partner lives in the next block, except when
-            // The position lands exactly on the last sample (nothing to
-            // interpolate): keep the fractional position for the next call
-            // so the join is seamless.
-            if frac > 0.0 && index + 1 >= n as isize {
-                break;
-            }
-            let a = if index < 0 {
-                if self.primed {
-                    self.prev
-                } else {
-                    input[0]
-                }
-            } else {
-                input[index as usize]
-            };
-            let b = if index + 1 < n as isize {
-                input[(index + 1) as usize]
-            } else {
-                a
-            };
-            out.push(a + (b - a) * frac);
-            pos += self.step;
-        }
-        self.pos = pos - n as f64;
-        self.prev = input[n - 1];
-        self.primed = true;
-    }
-}
-
-/// One capture block on its way to the STT worker: pass-through when the
-/// device already runs at 16 kHz, resampled otherwise.
+/// One capture block on its way to the server: pass-through when the device
+/// already runs at 16 kHz, FFT-resampled otherwise.
 #[cfg(not(target_arch = "wasm32"))]
 struct PcmForward {
     tx: std::sync::mpsc::SyncSender<Vec<f32>>,
-    resampler: Option<LinearResampler>,
+    resampler: Option<crate::voice_audio::FftResampler>,
     out: Vec<f32>,
 }
 
@@ -449,8 +431,7 @@ impl PcmForward {
     fn new(tx: std::sync::mpsc::SyncSender<Vec<f32>>, rate: u32) -> Self {
         Self {
             tx,
-            resampler: (rate != crate::stt::SAMPLE_RATE)
-                .then(|| LinearResampler::new(rate, crate::stt::SAMPLE_RATE)),
+            resampler: crate::voice_audio::FftResampler::new(rate, crate::voice_audio::SAMPLE_RATE),
             out: Vec::new(),
         }
     }
@@ -472,12 +453,25 @@ impl PcmForward {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for PcmForward {
+    fn drop(&mut self) {
+        if let Some(resampler) = self.resampler.as_mut() {
+            self.out.clear();
+            resampler.flush(&mut self.out);
+            if !self.out.is_empty() {
+                let out = std::mem::take(&mut self.out);
+                let _ = self.tx.try_send(out);
+            }
+        }
+    }
+}
+
 /// When `pcm` is `Some`, every block is downmixed to mono and forwarded to
-/// The STT worker at 16 kHz (dropped on overflow, like the backend): an
-/// exact 16 kHz device mode is used when offered, otherwise the captured
-/// rate is resampled ([`LinearResampler`]) — WASAPI shared mode usually
-/// exposes only 48 kHz. Owns the cpal `Stream` (dropping it stops the
-/// device). Never panics: failures arrive as [`VoiceMsg::Error`].
+/// the server at 16 kHz (dropped on overflow): an exact 16 kHz device mode is
+/// used when offered, otherwise the captured rate is FFT-resampled - WASAPI
+/// shared mode usually exposes only 48 kHz. Owns the cpal `Stream` (dropping
+/// it stops the device). Never panics: failures arrive as [`VoiceMsg::Error`].
 #[cfg(not(target_arch = "wasm32"))]
 pub fn capture_loop(
     stop: Arc<AtomicBool>,
@@ -536,7 +530,7 @@ pub fn capture_loop(
                 config.into(),
                 move |data: &[f32], _| {
                     let mono = if stereo {
-                        crate::stt::mono_mix(data, 2)
+                        crate::voice_audio::mono_mix(data, 2)
                     } else {
                         data.to_vec()
                     };
@@ -558,7 +552,7 @@ pub fn capture_loop(
                 config.into(),
                 move |data: &[i16], _| {
                     let mono = if stereo {
-                        crate::stt::mono_mix(
+                        crate::voice_audio::mono_mix(
                             &data
                                 .iter()
                                 .map(|s| *s as f32 / i16::MAX as f32)
@@ -588,7 +582,7 @@ pub fn capture_loop(
                 config.into(),
                 move |data: &[u16], _| {
                     let mono = if stereo {
-                        crate::stt::mono_mix(
+                        crate::voice_audio::mono_mix(
                             &data
                                 .iter()
                                 .map(|s| (*s as f32 / u16::MAX as f32) * 2.0 - 1.0)
@@ -661,52 +655,6 @@ mod tests {
         assert_eq!(lit_bars(2.0), 5);
     }
 
-    /// WASAPI shared mode is usually 48 kHz-only; decimation must keep the
-    /// 3:1 phase across capture blocks (no duplicate or skipped sample).
-    #[cfg(not(target_arch = "wasm32"))]
-    #[test]
-    fn resampler_downsamples_48k_to_16k_across_blocks() {
-        let mut resampler = LinearResampler::new(48_000, 16_000);
-        let mut out = Vec::new();
-        resampler.process(&[0.0, 3.0, 6.0], &mut out);
-        assert_eq!(out, vec![0.0]);
-        out.clear();
-        resampler.process(&[9.0, 12.0, 15.0], &mut out);
-        assert_eq!(out, vec![9.0], "next decimated sample keeps the 3:1 phase");
-    }
-
-    /// Upsampling interpolates across the block boundary instead of
-    /// repeating or dropping the join sample.
-    #[cfg(not(target_arch = "wasm32"))]
-    #[test]
-    fn resampler_upsamples_8k_to_16k_continuously() {
-        let mut resampler = LinearResampler::new(8_000, 16_000);
-        let mut out = Vec::new();
-        resampler.process(&[0.0, 2.0], &mut out);
-        assert_eq!(out, vec![0.0, 1.0, 2.0]);
-        out.clear();
-        resampler.process(&[4.0, 6.0], &mut out);
-        assert_eq!(
-            out,
-            vec![3.0, 4.0, 5.0, 6.0],
-            "carry interpolates 2..4 across the boundary"
-        );
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    #[test]
-    fn forward_passes_16k_through_and_resamples_48k() {
-        let (tx, rx) = std::sync::mpsc::sync_channel(4);
-        let mut direct = PcmForward::new(tx, 16_000);
-        direct.push(vec![0.5, 0.5]);
-        assert_eq!(rx.try_recv().expect("passthrough"), vec![0.5, 0.5]);
-
-        let (tx, rx) = std::sync::mpsc::sync_channel(4);
-        let mut resampled = PcmForward::new(tx, 48_000);
-        resampled.push(vec![0.0, 0.3, 0.6]);
-        assert_eq!(rx.try_recv().expect("resampled").len(), 1);
-    }
-
     #[test]
     fn note_reports_without_killing_live() {
         let mut bus = VoiceBus::default();
@@ -715,13 +663,13 @@ mod tests {
         bus.live = true;
         bus.level = 0.4;
         tx.send(VoiceMsg::Note(
-            "dictation: Moonshine STT is not available in this build".to_string(),
+            "dictation: Parakeet STT is not available in this build".to_string(),
         ))
         .expect("send note");
         assert!(bus.drain(1.0 / 60.0));
         assert_eq!(
             bus.note.as_deref(),
-            Some("dictation: Moonshine STT is not available in this build")
+            Some("dictation: Parakeet STT is not available in this build")
         );
         assert!(bus.live, "advisory only");
         assert!(bus.level > 0.0, "meter keeps running");
@@ -738,29 +686,34 @@ mod tests {
     }
 
     #[test]
-    fn breathe_matches_the_1200ms_keyframe() {
-        let (s0, o0) = breathe_pose(0);
-        assert!((s0 - 0.88).abs() < 1e-6 && (o0 - 0.65).abs() < 1e-6);
-        let (sh, oh) = breathe_pose(300);
-        assert!((sh - 0.98).abs() < 1e-4, "halfway up: {sh}");
-        assert!((oh - 0.825).abs() < 1e-4, "halfway up: {oh}");
-        let (s1, o1) = breathe_pose(600);
-        assert!((s1 - 1.08).abs() < 1e-4 && (o1 - 1.0).abs() < 1e-4);
-        let (sh2, _) = breathe_pose(900);
-        assert!((sh2 - 0.98).abs() < 1e-4, "halfway down: {sh2}");
-        let (s2, o2) = breathe_pose(1200);
-        assert!((s2 - 0.88).abs() < 1e-6 && (o2 - 0.65).abs() < 1e-6);
+    fn arming_warms_without_capturing() {
+        let mut bus = VoiceBus::default();
+        bus.set_armed(true);
+        assert!(bus.armed, "the dock arms live mode");
+        assert!(!bus.live, "arming never opens the mic");
+        assert!(
+            bus.stop.is_none() && bus.rx.is_none(),
+            "no capture thread while idle"
+        );
     }
 
     #[test]
-    fn tick_breathe_publishes_only_while_live() {
+    fn capture_stop_keeps_armed() {
         let mut bus = VoiceBus::default();
-        assert!(!bus.tick_breathe(600), "idle bus does not publish");
+        bus.set_armed(true);
         bus.live = true;
-        bus.breathe_start_ms = 0;
-        assert!(bus.tick_breathe(600));
-        assert!((bus.breathe_scale.get() - 1.08).abs() < 1e-4);
-        assert!((bus.breathe_opacity.get() - 1.0).abs() < 1e-4);
+        bus.stop_capture();
+        assert!(!bus.live);
+        assert!(bus.armed, "dropping back to idle keeps the models warm");
+    }
+
+    #[test]
+    fn disarm_stops_capture_and_clears_armed() {
+        let mut bus = VoiceBus::default();
+        bus.set_armed(true);
+        bus.live = true;
+        bus.set_armed(false);
+        assert!(!bus.live && !bus.armed);
     }
 
     #[test]

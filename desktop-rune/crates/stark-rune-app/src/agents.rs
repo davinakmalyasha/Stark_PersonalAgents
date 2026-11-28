@@ -28,10 +28,10 @@ fn ink(hex: &'static str) -> rune::Color {
 fn status_ink(status: &str) -> &'static str {
     match status {
         "running" => "#34d399",
-        "queued" => "#fbbf24",
+        "queued" => "#a1a1aa",
         "idle" => "#71717a",
-        "interrupted" => "#fb923c",
-        "completed" => "#38bdf8",
+        "interrupted" => "#a1a1aa",
+        "completed" => "#a1a1aa",
         "failed" => "#f87171",
         "cancelled" => "#52525b",
         _ => "#71717a",
@@ -840,8 +840,8 @@ fn agent_rows<S: AgentsHost + 'static>(
                     .px(5.0)
                     .py(1.0)
                     .radius(7.0)
-                    .fill(ink("#fbbf2426"))
-                    .color(ink("#fcd34d")),
+                    .fill(ink("#a1a1aa26"))
+                    .color(ink("#a1a1aa")),
             );
         }
         if agent.status == "running" || agent.status == "queued" {
@@ -1087,8 +1087,8 @@ pub fn agent_sheet<S: AgentsHost + 'static>(s: &AgentsState) -> El {
                     .px(5.0)
                     .py(1.0)
                     .radius(7.0)
-                    .fill(ink("#fbbf2433"))
-                    .color(ink("#fcd34d")),
+                    .fill(ink("#a1a1aa33"))
+                    .color(ink("#a1a1aa")),
             );
         }
     }
@@ -1323,8 +1323,8 @@ fn agent_mailbox<S: AgentsHost + 'static>(
                 .w_full()
                 .gap(2.0)
                 .radius(8.0)
-                .fill(ink("#fbbf240d"))
-                .border(1.0, ink("#fbbf2433"))
+                .fill(ink("#a1a1aa0d"))
+                .border(1.0, ink("#a1a1aa33"))
                 .px(12.0)
                 .py(8.0)
                 .child(
@@ -1335,7 +1335,7 @@ fn agent_mailbox<S: AgentsHost + 'static>(
                         relative_time(&m.created)
                     ))
                     .font(rune::tok::TextStyle::new(9.0, 600.0))
-                    .color(ink("#fcd34d")),
+                    .color(ink("#a1a1aa")),
                 )
                 .child(
                     text(m.body.clone())
@@ -1615,14 +1615,14 @@ fn agent_worktree<S: AgentsHost + 'static>(
                     .w_full()
                     .gap(8.0)
                     .radius(8.0)
-                    .fill(ink("#fbbf240f"))
-                    .border(1.0, ink("#fbbf2440"))
+                    .fill(ink("#a1a1aa0f"))
+                    .border(1.0, ink("#a1a1aa40"))
                     .px(12.0)
                     .py(10.0)
                     .child(
                         text(prompt.to_string())
                             .font(rune::tok::TextStyle::new(11.5, 400.0))
-                            .color(ink("#fde68a")),
+                            .color(ink("#a1a1aa")),
                     )
                     .child(
                         row()

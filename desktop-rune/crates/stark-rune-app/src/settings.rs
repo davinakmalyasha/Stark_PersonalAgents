@@ -234,6 +234,8 @@ pub struct SettingsState {
     pub backup_file: Option<PathBuf>,
     pub backup_root: TextEdit,
     pub update: UpdateState,
+    /// Native Stark Island + voice preferences (local, not server config).
+    pub live: crate::prefs::LivePrefs,
     pub loading: bool,
     generation: u64,
     load_inbox: Option<mpsc::Receiver<LoadResult>>,
@@ -260,6 +262,7 @@ impl Default for SettingsState {
             backup_file: None,
             backup_root: TextEdit::new(""),
             update: UpdateState::default(),
+            live: crate::prefs::LivePrefs::default(),
             loading: false,
             generation: 0,
             load_inbox: None,
@@ -285,6 +288,7 @@ impl Clone for SettingsState {
             backup_file: self.backup_file.clone(),
             backup_root: self.backup_root.clone(),
             update: self.update.clone(),
+            live: self.live.clone(),
             loading: self.loading,
             generation: self.generation,
             load_inbox: None,
@@ -300,6 +304,8 @@ impl std::fmt::Debug for SettingsState {
         f.debug_struct("SettingsState")
             .field("open", &self.open)
             .field("active", &self.active)
+            .field("island", &self.live.island)
+            .field("auto_send_voice", &self.live.auto_send_voice)
             .field("candidates", &self.candidates.len())
             .field("status", &self.status)
             .field("error", &self.error)
@@ -321,6 +327,38 @@ pub trait SettingsHost {
 }
 
 impl SettingsState {
+    /// Toggle the native Stark Island and persist it immediately.
+    pub fn set_live_island(&mut self, on: bool) {
+        self.live.island = on;
+        crate::prefs::save(&self.live);
+    }
+
+    /// Toggle hands-free voice and persist it immediately.
+    pub fn set_auto_send_voice(&mut self, on: bool) {
+        self.live.auto_send_voice = on;
+        crate::prefs::save(&self.live);
+    }
+
+    /// Toggle screen-capture exclusion for the island.
+    pub fn set_island_capture_exclusion(&mut self, on: bool) {
+        self.live.exclude_from_capture = on;
+        crate::prefs::save(&self.live);
+    }
+
+    /// Register/unregister the installed launcher for sign-in. A missing
+    /// launcher is reported in the settings error line instead of writing a
+    /// broken startup command.
+    pub fn set_start_with_windows(&mut self, on: bool) {
+        match crate::startup::set_enabled(on) {
+            Ok(()) => {
+                self.live.start_with_windows = on;
+                self.error = None;
+                crate::prefs::save(&self.live);
+            }
+            Err(error) => self.error = Some(error),
+        }
+    }
+
     /// Open and reload migration status, like `useEffect(() => load(), [isOpen])`.
     pub fn open(&mut self, host: String, port: u16) {
         self.open = true;
@@ -933,6 +971,53 @@ fn pick_import_folder<S: SettingsHost + 'static>(tx: &mut rune::Tx) {
     });
 }
 
+/// A labelled switch row. The whole card is the hit target; the switch is
+/// inert so the card's press owns the toggle.
+fn toggle_row<S: SettingsHost + 'static>(
+    key: &'static str,
+    title: &'static str,
+    detail: &'static str,
+    on: bool,
+    press: impl Fn(&mut S, &mut rune::Tx) + 'static,
+) -> El {
+    let track = if on {
+        ink("#3ddc97").alpha(0.20)
+    } else {
+        rgba(1.0, 1.0, 1.0, 0.09)
+    };
+    let knob = if on { ink("#3ddc97") } else { ink("#8a8a93") };
+    row_card(key)
+        .items_center()
+        .on_press_tx_enter(press)
+        .child(
+            col()
+                .grow(1.0)
+                .min_w(0.0)
+                .child(heading(title))
+                .child(muted(detail)),
+        )
+        .child(
+            rune::el()
+                .key(format!("{key}-switch"))
+                .size(34.0, 20.0)
+                .radius(10.0)
+                .fill(track)
+                .border(1.0, rgba(1.0, 1.0, 1.0, 0.08))
+                .border_layout()
+                .motion(rune::Spring::smooth(0.18, 0.0))
+                .inert()
+                .child(
+                    rune::el()
+                        .size(14.0, 14.0)
+                        .radius(7.0)
+                        .fill(knob)
+                        .offset(if on { 17.0 } else { 3.0 }, 3.0)
+                        .motion(rune::Spring::smooth(0.18, 0.0))
+                        .inert(),
+                ),
+        )
+}
+
 /// Settings sheet. `width`/`height` are the window (or standalone view)
 /// bounds, so the panel uses the reference UI's viewport-relative min() caps.
 pub fn settings_sheet<S: SettingsHost + 'static>(s: &SettingsState, width: f32, height: f32) -> El {
@@ -1023,6 +1108,68 @@ pub fn settings_sheet<S: SettingsHost + 'static>(s: &SettingsState, width: f32, 
                 }),
         );
 
+    // Stark Island + voice. These are local desktop preferences, not server
+    // config, so they persist in `.deep_agents/desktop.json`.
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut live = section("settings-section-live")
+        .child(section_head(
+            "Stark Island",
+            crate::shell::icon_live(13.0, ink("#71717a")),
+        ))
+        .child(paragraph(
+            "Live mode warms the speech models and shows the island. The dock mic arms live mode; the mic in the island (or Ctrl+Space while armed) starts listening. Work chats carry their own Live control: Dictate stages speech as a draft, Live sends and speaks the reply, and Share screen attaches display frames to each turn. Turning the dock off unloads the models and hides the island.",
+        ))
+        .child(toggle_row::<S>(
+            "settings-island-toggle",
+            "Show Stark Island in live mode",
+            "Off keeps the island hidden even while armed.",
+            s.live.island,
+            |s: &mut S, _tx: &mut rune::Tx| {
+                let next = !s.settings().live.island;
+                s.settings_mut().set_live_island(next);
+            },
+        ))
+        .child(toggle_row::<S>(
+            "settings-auto-send",
+            "Auto-send voice",
+            "Send a finished transcript immediately. Off stages it as a draft.",
+            s.live.auto_send_voice,
+            |s: &mut S, _tx: &mut rune::Tx| {
+                let next = !s.settings().live.auto_send_voice;
+                s.settings_mut().set_auto_send_voice(next);
+            },
+        ))
+        .child(toggle_row::<S>(
+            "settings-capture-exclusion",
+            "Hide island from screen capture",
+            "Keep the notch out of recordings and screenshots where Windows allows it.",
+            s.live.exclude_from_capture,
+            |s: &mut S, _tx: &mut rune::Tx| {
+                let next = !s.settings().live.exclude_from_capture;
+                s.settings_mut().set_island_capture_exclusion(next);
+            },
+        ))
+        .child(
+            text("Ctrl+Space arms live mode, then toggles listening. Ctrl+Alt+S opens Stark.".to_string())
+                .w_full()
+                .wrap()
+                .font(text_style(10.5, 400.0))
+                .color(ink("#71717a")),
+        );
+    #[cfg(windows)]
+    {
+        live = live.child(toggle_row::<S>(
+            "settings-start-with-windows",
+            "Start with Windows",
+            "Open the tray and island in the background when you sign in.",
+            s.live.start_with_windows,
+            |s: &mut S, _tx: &mut rune::Tx| {
+                let next = !s.settings().live.start_with_windows;
+                s.settings_mut().set_start_with_windows(next);
+            },
+        ));
+    }
+
     // App updates.
     let updates = section("settings-section-updates")
         .child(section_head(
@@ -1050,7 +1197,7 @@ pub fn settings_sheet<S: SettingsHost + 'static>(s: &SettingsState, width: f32, 
                                         .mt(6.0)
                                         .font(text_style(11.0, 400.0))
                                         .color(ink(if s.update.phase == UpdatePhase::Error {
-                                            "#fcd34d"
+                                            "#f87171"
                                         } else {
                                             "#a1a1aa"
                                         }))
@@ -1306,6 +1453,7 @@ pub fn settings_sheet<S: SettingsHost + 'static>(s: &SettingsState, width: f32, 
         .scroll(rune::ScrollSpec {
             stick_bottom: false,
         })
+        .child(live)
         .child(updates)
         .child(backup)
         .child(migration);

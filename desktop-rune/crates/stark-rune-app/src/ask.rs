@@ -610,7 +610,7 @@ fn option_row<S: TranscriptHost + 'static>(
         .border(
             1.0,
             if selected {
-                ink("#818cf8")
+                ink("#6ee7b7")
             } else {
                 ink("#52525b")
             },
@@ -622,7 +622,7 @@ fn option_row<S: TranscriptHost + 'static>(
             rune::el()
                 .size(10.0, 10.0)
                 .inert()
-                .shape(crate::lucide_check(10.0, 2.0, ink("#a5b4fc"))),
+                .shape(crate::lucide_check(10.0, 2.0, ink("#6ee7b7"))),
         );
     }
 

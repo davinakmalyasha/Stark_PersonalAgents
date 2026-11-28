@@ -205,8 +205,6 @@ async fn voice_ws(state: ServerState, socket: WebSocket) {
     let (outbox_tx, mut outbox_rx) = mpsc::unbounded_channel::<Value>();
     let screen = stark_tools::screen_bridge();
     screen.attach(outbox_tx.clone());
-    let capture = state.voice.as_ref().and_then(|v| v.capture.clone());
-    let stt = state.voice.as_ref().and_then(|v| v.stt.clone());
     let tts = state.voice.as_ref().map(|v| v.tts.clone());
 
     let send_task = tokio::spawn(async move {
@@ -244,12 +242,22 @@ async fn voice_ws(state: ServerState, socket: WebSocket) {
                 };
                 match value.get("type").and_then(Value::as_str).unwrap_or("") {
                     "session.start" => {
-                        let Some(stt) = stt.clone() else {
-                            let _ = outbox_tx.send(json!({
-                                "type": "session.error",
-                                "error": "Moonshine STT is not available in this build",
-                            }));
-                            continue;
+                        // Live mode loads Parakeet on first use, not at
+                        // server startup, so idle servers hold no ASR memory.
+                        let voice = state.voice.clone();
+                        let stt = match tokio::task::spawn_blocking(move || {
+                            voice.and_then(|voice| voice.ensure_stt().ok())
+                        })
+                        .await
+                        {
+                            Ok(Some(stt)) => stt,
+                            _ => {
+                                let _ = outbox_tx.send(json!({
+                                    "type": "session.error",
+                                    "error": "Parakeet STT is not available in this build",
+                                }));
+                                continue;
+                            }
                         };
                         if let Some(mut old) = live_session.take() {
                             old.stop();
@@ -296,26 +304,6 @@ async fn voice_ws(state: ServerState, socket: WebSocket) {
                         if let Some(tts) = &tts {
                             tts.cancel_current();
                         }
-                    }
-                    "send" => {
-                        let Some(capture) = capture.clone() else {
-                            let _ = outbox_tx.send(json!({
-                                "type": "final",
-                                "text": "",
-                                "error": "Moonshine STT is not available in this build",
-                            }));
-                            continue;
-                        };
-                        let text = tokio::task::spawn_blocking(move || capture.flush_round())
-                            .await
-                            .ok()
-                            .and_then(Result::ok)
-                            .unwrap_or_default();
-                        let _ = outbox_tx.send(json!({
-                            "type": "final",
-                            "text": text,
-                            "engine": "moonshine",
-                        }));
                     }
                     "ping" => {
                         let _ = outbox_tx.send(json!({"type": "pong"}));

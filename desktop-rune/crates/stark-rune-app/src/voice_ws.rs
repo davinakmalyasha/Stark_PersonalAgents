@@ -4,7 +4,7 @@
 //! The app streams 16 kHz mono PCM (`i16` little-endian) over the backend's
 //! existing `/api/voice/ws` endpoint (`screen_routes::voice_ws_handler`) and
 //! maps the server's events onto [`VoiceMsg::Transcript`], so the overlay,
-//! live-bubble and draft-staging path is identical to the on-device producer.
+//! live-bubble and draft-staging path is unchanged from the older producer.
 //! The server owns VAD, pre-roll, endpointing and decoding, so no speech
 //! model — and therefore no MSVC prebuilt — is linked into the app. That is
 //! the same split the pre-rewrite shell used (`7b5810b`: browser PCM, server
@@ -159,13 +159,24 @@ fn run_session(
     stop: Arc<AtomicBool>,
 ) {
     let mut ready = false;
+    // The server may still be loading Parakeet when it accepts the socket.
+    // Keep a few seconds of the first utterance instead of dropping it.
+    let mut pending: Vec<Vec<f32>> = Vec::new();
     'session: loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
         match socket.read() {
             Ok(Message::Text(text)) => match parse_event(text.as_str()) {
-                ServerEvent::Ready => ready = true,
+                ServerEvent::Ready => {
+                    ready = true;
+                    for frame in pending.drain(..) {
+                        if let Err(e) = socket.send(Message::binary(pcm16le(&frame))) {
+                            let _ = tx.send(VoiceMsg::Note(format!("voice link lost: {e}")));
+                            break 'session;
+                        }
+                    }
+                }
                 ServerEvent::Partial(text) => {
                     let _ = tx.send(VoiceMsg::Transcript {
                         text,
@@ -173,7 +184,7 @@ fn run_session(
                     });
                 }
                 // Final utterance: the existing bus ends capture and stages
-                // the draft, exactly like the on-device producer's final.
+                // the draft, exactly like the old local final.
                 ServerEvent::Final(text) => {
                     let _ = tx.send(VoiceMsg::Transcript {
                         text,
@@ -182,8 +193,8 @@ fn run_session(
                     break;
                 }
                 ServerEvent::Error(message) => {
-                    // Honest note (e.g. a GNU-built server without Moonshine);
-                    // the meter keeps running, matching on-device failure mode.
+                    // Honest note (e.g. a server built without Parakeet); the
+                    // meter keeps running, matching the capture failure mode.
                     let _ = tx.send(VoiceMsg::Note(format!("dictation: {message}")));
                     break;
                 }
@@ -200,12 +211,16 @@ fn run_session(
                 break;
             }
         }
-        // Drain the bounded capture queue. Frames arriving before
-        // `session.ready` are dropped: the server has no live session yet.
+        // Drain the bounded capture queue. Before `session.ready`, keep a
+        // short pre-roll instead of discarding the first words of a cold
+        // `session.start` (the model load can take seconds).
         loop {
             match pcm_rx.try_recv() {
                 Ok(frame) => {
                     if !ready {
+                        if pending.len() < 3_000 {
+                            pending.push(frame);
+                        }
                         continue;
                     }
                     if let Err(e) = socket.send(Message::binary(pcm16le(&frame))) {
@@ -241,7 +256,7 @@ mod tests {
     #[test]
     fn server_events_map_to_the_voice_protocol() {
         assert_eq!(
-            parse_event(r#"{"type":"session.ready","model":"medium-streaming-en"}"#),
+            parse_event(r#"{"type":"session.ready","model":"parakeet-unified-en-0.6b"}"#),
             ServerEvent::Ready
         );
         assert_eq!(
@@ -253,8 +268,8 @@ mod tests {
             ServerEvent::Final("hello".to_string())
         );
         assert_eq!(
-            parse_event(r#"{"type":"session.error","error":"Moonshine STT is not available"}"#),
-            ServerEvent::Error("Moonshine STT is not available".to_string())
+            parse_event(r#"{"type":"session.error","error":"Parakeet STT is not available"}"#),
+            ServerEvent::Error("Parakeet STT is not available".to_string())
         );
         assert_eq!(
             parse_event(r#"{"type":"session.stopped"}"#),

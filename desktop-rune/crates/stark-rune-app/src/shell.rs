@@ -38,6 +38,8 @@ const TOPBAR_H: f32 = 44.0;
 const TAB_GAP: f32 = 4.0;
 /// Side panel width (`HouseSidebar` w-[248px]).
 const PANEL_W: f32 = 248.0;
+/// Right-hand subagent session panel (reference split view).
+const DRILL_W: f32 = 420.0;
 /// Phone bottom nav (icons + labels), before safe-area padding.
 const MOBILE_NAV_H: f32 = 52.0;
 
@@ -117,29 +119,27 @@ fn icon_home(size: f32, color: rune::Color) -> Shape {
     icon_shape(p, size, color)
 }
 
-fn icon_folder(size: f32, color: rune::Color) -> Shape {
-    // Lucide v1.17 `folder-kanban`: tabbed folder + three kanban ticks.
+pub(crate) fn icon_live(size: f32, color: rune::Color) -> Shape {
+    // Live mark: three voice bars inside a rounded-square notch. One clean,
+    // modern glyph for the rail, the island and settings — no robot faces.
+    // Bars echo the island waveform, so dock → island → rail all rhyme.
     let p = Path::new()
-        .move_to([4.0, 20.0])
-        .line_to([20.0, 20.0])
-        .cubic_to([21.1, 20.0], [22.0, 19.1], [22.0, 18.0])
-        .line_to([22.0, 8.0])
-        .cubic_to([22.0, 6.9], [21.1, 6.0], [20.0, 6.0])
-        .line_to([12.07, 6.0])
-        .cubic_to([11.4, 6.0], [10.78, 5.66], [10.41, 5.1])
-        .line_to([9.59, 3.9])
-        .cubic_to([9.22, 3.34], [8.6, 3.0], [7.93, 3.0])
-        .line_to([4.0, 3.0])
-        .cubic_to([2.9, 3.0], [2.0, 3.9], [2.0, 5.0])
-        .line_to([2.0, 18.0])
-        .cubic_to([2.0, 19.1], [2.9, 20.0], [4.0, 20.0])
+        .move_to([8.0, 3.0])
+        .line_to([16.0, 3.0])
+        .cubic_to([19.3, 3.0], [21.0, 4.7], [21.0, 8.0])
+        .line_to([21.0, 16.0])
+        .cubic_to([21.0, 19.3], [19.3, 21.0], [16.0, 21.0])
+        .line_to([8.0, 21.0])
+        .cubic_to([4.7, 21.0], [3.0, 19.3], [3.0, 16.0])
+        .line_to([3.0, 8.0])
+        .cubic_to([3.0, 4.7], [4.7, 3.0], [8.0, 3.0])
         .close()
-        .move_to([8.0, 10.0])
-        .line_to([8.0, 14.0])
-        .move_to([12.0, 10.0])
-        .line_to([12.0, 12.0])
-        .move_to([16.0, 10.0])
-        .line_to([16.0, 16.0]);
+        .move_to([9.0, 10.0])
+        .line_to([9.0, 14.0])
+        .move_to([12.0, 7.5])
+        .line_to([12.0, 16.5])
+        .move_to([15.0, 10.0])
+        .line_to([15.0, 14.0]);
     icon_shape(p, size, color)
 }
 
@@ -212,7 +212,7 @@ fn icon_settings(size: f32, color: rune::Color) -> Shape {
 fn rail_icon(tab: RailTab, size: f32, color: rune::Color) -> Shape {
     match tab {
         RailTab::Chats => icon_home(size, color),
-        RailTab::Group => icon_folder(size, color),
+        RailTab::Group => icon_live(size, color),
         RailTab::Cloud => icon_cloud(size, color),
         // Not in the reference UI's rail (single-page: chats, projects, cloud only);
         // mapped for completeness if a panel reuses the helper.
@@ -295,9 +295,10 @@ pub struct ShellState {
     /// Phone drawer. Desktop ignores it; below `md` it is closed until the
     /// topbar or bottom nav asks for a panel.
     pub mobile_panel_open: bool,
-    /// Desktop navigation: the icon rail and side panel. The titlebar menu
-    /// hides both so the canvas can use the full width.
-    pub nav_open: bool,
+    /// Desktop chat panel (the chat list / agents / projects board docked
+    /// beside the rail). The rail itself never hides: it owns the toggle and
+    /// every destination, so the panel alone can collapse.
+    pub panel_open: bool,
     /// Home chat card folded to its prompt dock (`HouseChat` minimize). The
     /// card is not keyed by chat, so this persists across chat switches like
     /// The reference UI's local `minimized` state.
@@ -310,6 +311,8 @@ pub struct ShellState {
     pub audio_owner: String,
     /// Last audio-engine revision, so a load failure/end repaints once.
     pub audio_rev: u64,
+    /// Native Stark Island, tray, shortcuts and background presence.
+    pub presence: crate::presence::PresenceState,
 }
 
 impl Default for ShellState {
@@ -333,11 +336,12 @@ impl Default for ShellState {
             settings: crate::settings::SettingsState::default(),
             pairing: PairingState::default(),
             mobile_panel_open: false,
-            nav_open: true,
+            panel_open: true,
             home_minimized: false,
             home_controls: HomeControls(rune::Live::new(0.0)),
             audio_owner: "main".to_string(),
             audio_rev: 0,
+            presence: crate::presence::PresenceState::default(),
         }
     }
 }
@@ -812,6 +816,9 @@ fn rail_button(s: &ShellState, tab: RailTab) -> El {
         .hover_group()
         .on_press_enter(move |s: &mut ShellState| {
             s.canvas.rail = tab;
+            // Picking a destination always brings its panel back into view;
+            // the rail itself never moves.
+            s.panel_open = true;
             if tab == RailTab::Group
                 && !s.canvas.projects.loading
                 && s.canvas.projects.projects.is_empty()
@@ -1017,8 +1024,30 @@ fn home_chat_overlay(s: &ShellState, stage_w: f32, stage_h: f32, window_h: f32) 
 /// Modals owned by the active card thread. They render at the shell root so
 /// The home chat card's clipping never crops them (the reference UI portals its dialogs
 /// over the whole workspace).
+/// Thread whose subagent session is open, if any. Mirrors the home card's
+/// own fallback: with no sheet, a fresh account still owns the main thread.
+fn drill_thread(s: &ShellState) -> Option<&crate::rune_transcript::RuneTranscriptState> {
+    s.canvas.sheet_thread().or({
+        if s.canvas.cards.is_empty() {
+            Some(&s.transcript)
+        } else {
+            None
+        }
+    })
+}
+
 fn active_chat_sheets(s: &ShellState) -> Vec<El> {
-    let Some(t) = s.canvas.sheet_thread() else {
+    // A fresh account has no canvas sheet yet, but the always-mounted home
+    // card still owns the main thread's dock. Its modals must mount at the
+    // shell root too, otherwise the provider/settings pills would be inert
+    // until a chat is opened.
+    let Some(t) = s.canvas.sheet_thread().or({
+        if s.canvas.cards.is_empty() {
+            Some(&s.transcript)
+        } else {
+            None
+        }
+    }) else {
         return Vec::new();
     };
     let mut sheets = Vec::new();
@@ -1043,6 +1072,15 @@ fn active_chat_sheets(s: &ShellState) -> Vec<El> {
             Thread::Open,
         ));
     }
+    if t.provider_keys.open {
+        let (w, h) = unsafe { (WINDOW_W, WINDOW_H) };
+        sheets.push(crate::provider_keys::provider_keys_sheet::<ShellState>(
+            &t.provider_keys,
+            Thread::Open,
+            w,
+            h,
+        ));
+    }
     if let Some(file) = t.attachment_preview.clone() {
         // The card clips its content, so the message lightbox lives at the
         // shell root like the reference UI's fixed overlay.
@@ -1061,103 +1099,16 @@ fn active_chat_sheets(s: &ShellState) -> Vec<El> {
     sheets
 }
 
-/// Lucide `Menu` for the titlebar's navigation toggle.
+/// Lucide `Menu` for the rail's chat-panel toggle.
 fn icon_menu(size: f32, color: rune::Color) -> Shape {
     crate::icons::lucide(&["M4 6h16", "M4 12h16", "M4 18h16"], size, 2.0, color)
 }
 
-/// Lucide `Search` for the titlebar's chat search shortcut.
-fn icon_search(size: f32, color: rune::Color) -> Shape {
-    crate::icons::lucide(
-        &["m21 21-4.34-4.34", "M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16z"],
-        size,
-        2.0,
-        color,
-    )
-}
-
-/// A 30-point ghost control in the titlebar. Its press handler is attached by
-/// the caller so the menu and search buttons keep their own actions.
-fn topbar_control(key: &str, label: &str, glyph: Shape) -> El {
-    rune::el()
-        .key(key)
-        .role("button")
-        .focusable(true)
-        .label(label)
-        .help(label)
-        .size(30.0, 30.0)
-        .radius(8.0)
-        .center()
-        .hover(rgba(1.0, 1.0, 1.0, 0.07))
-        .focus_ring(1.0, 1.0, rgba(1.0, 1.0, 1.0, 0.5))
-        .press_scale(0.94)
-        .child(rune::el().size(15.0, 15.0).inert().shape(glyph))
-}
-
-/// A compact `+` after the last tab. Unlike the old dashed "New session" pill,
-/// this stays a fixed 30×30 target and never stretches with the strip.
-fn new_session_button() -> El {
-    let plus = |color: rune::Color| {
-        Shape::new()
-            .line(
-                [12.0, 5.0],
-                [12.0, 19.0],
-                crate::lucide_stroke(14.0),
-                LineCap::Round,
-                color,
-            )
-            .line(
-                [5.0, 12.0],
-                [19.0, 12.0],
-                crate::lucide_stroke(14.0),
-                LineCap::Round,
-                color,
-            )
-            .view_box(24.0, 24.0)
-    };
-    rune::el()
-        .key("session-new")
-        .role("button")
-        .focusable(true)
-        .label("New session")
-        .help("New session")
-        .size(30.0, 30.0)
-        .radius(8.0)
-        .center()
-        .hover(rgba(1.0, 1.0, 1.0, 0.07))
-        .focus_ring(1.0, 1.0, rgba(1.0, 1.0, 1.0, 0.5))
-        .hover_group()
-        .press_scale(0.94)
-        .on_press_tx_enter(|s: &mut ShellState, tx: &mut rune::Tx| {
-            s.canvas.new_session();
-            if let Some(id) = s.canvas.sessions.order.last() {
-                tx.scroll_into_view(format!("session-{id}"));
-            }
-        })
-        .child(
-            rune::el()
-                .size(14.0, 14.0)
-                .inert()
-                .child(
-                    rune::el()
-                        .size(14.0, 14.0)
-                        .inert()
-                        .shape(plus(ink("#71717a"))),
-                )
-                .child(
-                    rune::el()
-                        .size(14.0, 14.0)
-                        .absolute(0.0, 0.0)
-                        .inert()
-                        .group_opacity(0.0, 1.0)
-                        .shape(plus(ink("#e4e4e7"))),
-                ),
-        )
-}
-
-/// The one app-drawn titlebar: navigation controls, open-session tabs, the
-/// compact new-session action, and Rune's Windows caption buttons over the
-/// trailing edge. The band drags the window; presses on its controls win.
+/// The one app-drawn titlebar: open-session tabs, the compact new-session
+/// action, and Rune's Windows caption buttons over the trailing edge. The
+/// band drags the window; presses on its controls win.
+///
+/// Navigation lives in the rail, not here: the topbar is only the chat strip.
 fn shell_topbar(s: &ShellState, cx: &mut Cx<ShellState>, w: f32) -> El {
     let chrome = cx.chrome_insets();
     cx.caption_color(ink("#d4d4d8"));
@@ -1166,62 +1117,29 @@ fn shell_topbar(s: &ShellState, cx: &mut Cx<ShellState>, w: f32) -> El {
     } else {
         TOPBAR_H
     };
-    let folded = w < PANEL_FOLD_W;
-    let menu_label = if folded {
-        if s.mobile_panel_open {
-            "Close navigation"
-        } else {
-            "Open navigation"
-        }
-    } else if s.nav_open {
-        "Hide sidebar"
-    } else {
-        "Show sidebar"
-    };
-    let menu = topbar_control("topbar-menu", menu_label, icon_menu(15.0, ink("#a1a1aa")))
-        .on_press_enter(move |s: &mut ShellState| {
-            if folded {
-                s.mobile_panel_open = !s.mobile_panel_open;
-            } else {
-                s.nav_open = !s.nav_open;
-            }
-        });
-    let search = topbar_control(
-        "topbar-search",
-        "Search chats",
-        icon_search(15.0, ink("#a1a1aa")),
-    )
-    .on_press_enter(move |s: &mut ShellState| {
-        s.canvas.rail = RailTab::Chats;
-        if folded {
-            s.mobile_panel_open = true;
-        } else {
-            s.nav_open = true;
-        }
-        let caret = s.canvas.sessions.search.text.len();
-        s.canvas.sessions.search.anchor = caret;
-        s.canvas.sessions.search.focus = caret;
-        s.canvas.sessions.search.focused = true;
-    });
 
     // Give tabs equal shares of the visible strip, like the reference UI:
     // 210pt with room, shrinking to 96pt before the strip scrolls.
     let tabs_n = s.canvas.sessions.order.len();
-    // Menu + search + `+`, both outer gutters and the three gaps; the rest is
-    // the tab strip. The caption reservation is part of the trailing gutter.
-    let fixed = 8.0 + 6.0 + chrome.trailing + 30.0 * 3.0 + TAB_GAP * 3.0;
+    // `+`, both outer gutters and the gap; the rest is the tab strip. The
+    // caption reservation is part of the trailing gutter.
+    let fixed = 8.0 + 6.0 + chrome.trailing;
     let strip_w = (w - chrome.leading - fixed).max(120.0);
+    // Each inactive pair carries a hairline divider (1pt + its two gaps).
+    let sep_total = 1.0 + TAB_GAP * 2.0;
+    let separators = tabs_n.saturating_sub(1) as f32;
     let tab_w = if tabs_n == 0 {
         210.0
     } else {
-        ((strip_w - TAB_GAP * tabs_n.saturating_sub(1) as f32) / tabs_n as f32).clamp(96.0, 210.0)
+        ((strip_w - TAB_GAP * separators - sep_total * separators) / tabs_n as f32)
+            .clamp(96.0, 210.0)
     };
     // The strip hugs the tabs, and `+` sits right after it. Beyond the
     // visible width the strip scrolls instead of pushing the button aside.
     let tabs_width = if tabs_n == 0 {
         0.0
     } else {
-        (tab_w * tabs_n as f32 + TAB_GAP * (tabs_n.saturating_sub(1)) as f32).min(strip_w)
+        (tab_w * tabs_n as f32 + TAB_GAP * separators + sep_total * separators).min(strip_w)
     };
     let mut tabs = row()
         .key("shell-tabs")
@@ -1239,8 +1157,23 @@ fn shell_topbar(s: &ShellState, cx: &mut Cx<ShellState>, w: f32) -> El {
         .role("tablist")
         .label("Sessions")
         .focus_group();
-    for id in s.canvas.sessions.order.clone() {
-        tabs = tabs.child(session_tab(s, &id, tab_w));
+    let mut previous_active = false;
+    for (index, id) in s.canvas.sessions.order.clone().iter().enumerate() {
+        let active = s.canvas.active_id == *id;
+        // A divider between two quiet tabs; the active pill separates itself.
+        if index > 0 && !active && !previous_active {
+            tabs = tabs.child(
+                rune::el()
+                    .key(format!("tab-sep-{index}"))
+                    .w(1.0)
+                    .h(14.0)
+                    .radius(0.5)
+                    .fill(ink("#ffffff14"))
+                    .inert(),
+            );
+        }
+        tabs = tabs.child(session_tab(s, id, tab_w));
+        previous_active = active;
     }
 
     row()
@@ -1261,10 +1194,7 @@ fn shell_topbar(s: &ShellState, cx: &mut Cx<ShellState>, w: f32) -> El {
         // springing their positions would briefly overlap hit targets.
         .instant_changes()
         .window_drag()
-        .child(menu)
-        .child(search)
         .child(tabs)
-        .child(new_session_button())
 }
 
 pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
@@ -1298,30 +1228,32 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
         .border_layout()
         .child(
             rune::el()
-                .key("rail-new")
+                .key("rail-menu")
                 .role("button")
                 .focusable(true)
-                .label("New chat")
-                .help("New chat")
+                .label("Toggle chat panel")
+                .help("Toggle chat panel")
                 .size(36.0, 36.0)
                 .radius(12.0)
                 .center()
                 .hover(rgba(1.0, 1.0, 1.0, 0.07))
                 .hover_group()
                 .on_press_enter(move |s: &mut ShellState| {
-                    s.canvas.new_session();
+                    // Only the panel collapses; the rail stays so settings,
+                    // chats, group, and cloud remain reachable.
+                    s.panel_open = !s.panel_open;
                 })
                 .press_scale(0.94)
                 .child(
                     rune::el()
-                        .key("rail-new-icon")
+                        .key("rail-menu-icon")
                         .size(17.0, 17.0)
                         .inert()
                         .child(
                             rune::el()
                                 .size(17.0, 17.0)
                                 .inert()
-                                .shape(icon_new_chat(17.0, ink("#71717a"))),
+                                .shape(icon_menu(17.0, ink("#71717a"))),
                         )
                         .child(
                             rune::el()
@@ -1329,7 +1261,7 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
                                 .absolute(0.0, 0.0)
                                 .inert()
                                 .group_opacity(0.0, 1.0)
-                                .shape(icon_new_chat(17.0, ink("#e4e4e7"))),
+                                .shape(icon_menu(17.0, ink("#e4e4e7"))),
                         ),
                 ),
         )
@@ -1392,10 +1324,35 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
                         ),
                 ),
         );
-    // The titlebar menu folds both desktop columns; phones keep the rail
-    // hidden and open the drawer instead.
-    let nav_open = !folded && s.nav_open;
-    let stage_w = (w - if nav_open { RAIL_W + PANEL_W } else { 0.0 }).max(320.0);
+    // Desktop keeps the rail permanently; only its panel folds. Phones hide
+    // both and open the drawer instead.
+    let rail_visible = !folded;
+    let panel_visible = !folded && s.panel_open;
+    // A subagent session docks to the right of the chat, like the reference
+    // split view, instead of replacing the conversation.
+    let drill_thread = drill_thread(s).filter(|thread| thread.active_subagent.is_some() && !folded);
+    let drill_w = if drill_thread.is_some() { DRILL_W } else { 0.0 };
+    // The child chat already lives as a canvas card; bind the panel's rows and
+    // composer to that thread so sends stream into the dock.
+    let drill_chat = drill_thread.and_then(|thread| {
+        thread.active_subagent.as_ref().and_then(|drill| {
+            let card_id = format!("chat:{}:{}", drill.workspace_id, drill.child_id);
+            if !s.canvas.sessions.threads.contains_key(&card_id) {
+                return None;
+            }
+            s.canvas
+                .sessions
+                .order
+                .iter()
+                .position(|id| id == &card_id)
+                .map(Thread::Card)
+        })
+    });
+    let stage_w = (w
+        - if rail_visible { RAIL_W } else { 0.0 }
+        - if panel_visible { PANEL_W } else { 0.0 }
+        - drill_w)
+        .max(320.0);
     let stage_h = (h
         - TOPBAR_H
         - if folded {
@@ -1417,8 +1374,6 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
                 .w_full()
                 .grow(1.0)
                 .min_h(0.0)
-                .px(20.0)
-                .pt(12.0)
                 .child(canvas_body::<ShellState>(&s.canvas)),
         );
     if let Some(overlay) = home_chat_overlay(s, stage_w, stage_h, h) {
@@ -1430,12 +1385,25 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
         .grow(1.0)
         .min_h(0.0)
         .fill(ink("#0a0a0a"));
-    if nav_open {
+    if rail_visible {
         // Desktop: icon rail + docked panel. Below `md` both disappear and
         // The panel becomes an on-demand drawer (the reference UI `House.tsx`).
-        main = main.child(rail).child(side_panel(s, PANEL_W));
+        main = main.child(rail);
+        if panel_visible {
+            main = main.child(side_panel(s, PANEL_W));
+        }
     }
     main = main.child(stage);
+    if let Some(thread) = drill_thread {
+        if let Some(panel) = crate::rune_transcript::subagent_panel::<ShellState>(
+            thread,
+            Thread::Open,
+            drill_chat,
+            DRILL_W,
+        ) {
+            main = main.child(panel);
+        }
+    }
     let mut root = col()
         .key("stark-shell")
         .w_full()
@@ -1603,6 +1571,17 @@ fn update_restart_safe(s: &ShellState) -> bool {
     if s.transcript.live || s.personal.live {
         return false;
     }
+    if s.transcript.voice.live
+        || s.personal.voice.live
+        || s.canvas.voice.live
+        || s.canvas
+            .sessions
+            .threads
+            .values()
+            .any(|thread| thread.voice.live)
+    {
+        return false;
+    }
     if s.canvas.sessions.threads.values().any(|thread| thread.live) {
         return false;
     }
@@ -1647,7 +1626,7 @@ fn update_toast(s: &ShellState, w: f32, h: f32, bottom_inset: f32) -> Option<El>
         return None;
     }
     let tone = match update.phase {
-        UpdatePhase::Error => "#fcd34d",
+        UpdatePhase::Error => "#f87171",
         UpdatePhase::UpToDate => "#a1a1aa",
         _ => "#e4e4e7",
     };
@@ -1806,22 +1785,17 @@ fn pairing_gate(s: &ShellState, w: f32, h: f32) -> El {
         .size(46.0, 46.0)
         .radius(10.0)
         .center()
-        .fill(if can_submit {
-            ink("#0284c7")
-        } else {
-            ink("#0c4a6e")
-        })
+        // Palette lock: white primary when submittable, dark grey when not.
+        .fill(ink(if can_submit { "#f4f4f5" } else { "#3f3f46" }))
         .opacity(if can_submit { 1.0 } else { 0.45 })
         .disabled(!can_submit)
         .on_press_tx_enter(move |s: &mut ShellState, tx: &mut rune::Tx| {
             submit_pairing(s, tx);
         })
-        .child(
-            rune::el()
-                .size(18.0, 18.0)
-                .inert()
-                .shape(icon_arrow_right(18.0, ink("#ffffff"))),
-        );
+        .child(rune::el().size(18.0, 18.0).inert().shape(icon_arrow_right(
+            18.0,
+            ink(if can_submit { "#09090b" } else { "#a1a1aa" }),
+        )));
     card = card.child(
         row()
             .w_full()
@@ -1927,8 +1901,18 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
     // drives `fitView`). While the camera is auto it refits on resize.
     let (win_w, win_h, safe_bottom) = unsafe { (WINDOW_W, WINDOW_H, WINDOW_SAFE_BOTTOM) };
     let folded = win_w < PANEL_FOLD_W;
-    let nav_open = !folded && s.nav_open;
-    let stage_w = (win_w - if nav_open { RAIL_W + PANEL_W } else { 0.0 } - 40.0).max(320.0);
+    let drill_open =
+        !folded && drill_thread(s).is_some_and(|thread| thread.active_subagent.is_some());
+    let stage_w = (win_w
+        - if folded { 0.0 } else { RAIL_W }
+        - if !folded && s.panel_open {
+            PANEL_W
+        } else {
+            0.0
+        }
+        - if drill_open { DRILL_W } else { 0.0 }
+        - 40.0)
+        .max(320.0);
     let stage_h = (win_h
         - TOPBAR_H
         - 12.0
@@ -1952,6 +1936,8 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
     let services_auto = s.chats.auto;
     changed |= crate::agent_config::poll_agent_config(&mut s.transcript.agent_config);
     changed |= crate::agent_config::poll_agent_config(&mut s.personal.agent_config);
+    changed |= crate::provider_keys::poll_provider_keys(&mut s.transcript.provider_keys);
+    changed |= crate::provider_keys::poll_provider_keys(&mut s.personal.provider_keys);
     // Only the visible card's dock shows provider/models (the reference UI mounts one
     // PromptDock), so poll just that thread — not every open tab.
     if let Some(thread) = s.canvas.sheet_thread_mut() {
@@ -1960,6 +1946,7 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
         }
         changed |= crate::rune_transcript::poll_provider_state(thread, clock);
         changed |= crate::rune_transcript::poll_models_state(thread, clock);
+        changed |= crate::provider_keys::poll_provider_keys(&mut thread.provider_keys);
     }
     // Pending questions poll every 1.5s (`usePendingAsk`) for every open
     // surface. Canvas cards are visible in the map even while another chat is
@@ -1976,6 +1963,7 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
             changed |= drain_run_inbox(thread, clock, tx);
             changed |= crate::notes::poll_notes_state(&mut thread.notes);
             changed |= crate::agent_config::poll_agent_config(&mut thread.agent_config);
+            changed |= crate::provider_keys::poll_provider_keys(&mut thread.provider_keys);
             changed |= poll_thread_ask(thread, clock, tx);
             let live = thread.live;
             if let Some(card) = s.canvas.cards.iter_mut().find(|c| c.id == *id) {
@@ -1998,6 +1986,8 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
         .collect();
     for (id, workspace, chat) in rekeys {
         if s.canvas.rekey_local_chat(&id, &workspace, &chat) {
+            #[cfg(not(target_arch = "wasm32"))]
+            crate::presence::rekey_island_chat(s, &id, &workspace, &chat);
             changed = true;
         } else if let Some(thread) = s.canvas.sessions.threads.get_mut(&id) {
             thread.pending_rekey = None;
@@ -2106,15 +2096,14 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
         };
         tx.wake_after(std::time::Duration::from_millis(wait));
     }
-    if tick_voice_breathe(s) {
-        // `voice-breathe` is a 1.2 s scale/opacity keyframe. Rune has no
-        // infinite scale loop; publish it into the Live tracks at 60 Hz while
-        // a mic is live, then stop waking when the session ends.
-        tx.wake_after(std::time::Duration::from_millis(16));
-    }
     if let Some(at) = s.chats.ui_dirty_at {
         let left = (0.4 - (clock - at)).max(0.01);
         tx.wake_after(std::time::Duration::from_secs_f64(left));
+    }
+    // Native presence publishes the island snapshot only after every inbox
+    // has landed, so a finishing run and its toast land on the same frame.
+    if crate::presence::tick(s, clock, tx) {
+        changed = true;
     }
     changed
 }
@@ -2133,20 +2122,6 @@ fn trace_animating(s: &ShellState) -> bool {
     closing(&s.transcript)
         || closing(&s.personal)
         || s.canvas.sessions.threads.values().any(closing)
-}
-
-/// Publish the `voice-breathe` pose for every live voice bus. Clones share
-/// their `Live` sources, so ticking the transcript, personal, canvas and
-/// card-thread buses is cheap and consistent.
-fn tick_voice_breathe(s: &ShellState) -> bool {
-    let now = crate::clock::now_millis();
-    let mut live = s.transcript.voice.tick_breathe(now);
-    live |= s.personal.voice.tick_breathe(now);
-    live |= s.canvas.voice.tick_breathe(now);
-    for thread in s.canvas.sessions.threads.values() {
-        live |= thread.voice.tick_breathe(now);
-    }
-    live
 }
 
 /// Start uploads for browser-picked files. Fresh cards create their chat
@@ -2407,6 +2382,7 @@ fn poll_chats(s: &mut ShellState, clock: f64) -> bool {
                         if format!("{}:{}", thread.workspace_id, thread.chat_id) == key {
                             thread.rows =
                                 rows.iter().map(crate::rune_canvas::row_from_chat).collect();
+                            thread.sync_usage_from_rows();
                             thread.live = false;
                             thread.aborting = false;
                         }
@@ -2681,6 +2657,11 @@ fn init_shell() -> ShellState {
     // The real app entry (native window and browser) loads live chats; unit
     // tests construct `ShellState::default()` and stay offline.
     let mut shell = ShellState::default();
+    shell.settings.live = crate::prefs::load();
+    #[cfg(windows)]
+    {
+        shell.settings.live.start_with_windows = crate::startup::enabled();
+    }
     shell.canvas.projects.host = crate::rune_transcript::DEFAULT_API_HOST.to_string();
     shell.canvas.projects.port = crate::rune_transcript::api_port();
     shell.canvas.projects.group.host = crate::rune_transcript::DEFAULT_API_HOST.to_string();
@@ -2815,8 +2796,6 @@ fn apply_voice(s: &mut ShellState) {
     let thread = s.canvas.thread_mut(&id);
     thread.voice.live = true;
     thread.voice.level = 0.6;
-    thread.voice.breathe_start_ms = crate::clock::now_millis().saturating_sub(600);
-    let _ = thread.voice.tick_breathe(crate::clock::now_millis());
 }
 
 /// The exact Inter variable face the browser loads from Google Fonts.
@@ -2887,6 +2866,55 @@ pub fn run_shell_headless(extra_args: Vec<String>) {
             _ => rune::FontSmoothing::DirectWrite,
         });
     }
+
+    // Native presence is for the real app, not `--snap`/`--headless` runs:
+    // those need a deterministic tree and must not register a tray icon.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let headless = extra_args
+            .iter()
+            .any(|arg| arg == "--snap" || arg == "--headless");
+        if !headless {
+            let background = std::env::var("STARK_BACKGROUND")
+                .ok()
+                .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+            let prefs = crate::prefs::load();
+            app = app
+                .keep_running()
+                .on_close(crate::presence::on_close)
+                .on_quit(crate::presence::on_quit)
+                .global_shortcut("ctrl+space", crate::presence::shortcut_listen)
+                .global_shortcut("ctrl+alt+s", crate::presence::shortcut_open);
+            if background {
+                // Tray + island only. The first Open creates the main window.
+                app = app.windowless();
+            }
+
+            let app_handle = app.handle();
+            let shared =
+                std::sync::Arc::new(crate::island::IslandShared::new(Some(app_handle.clone())));
+            // No live mode, no island: the overlay starts hidden and only
+            // appears while voice is live or a voice card is up.
+            let handle = app.overlay(
+                crate::island::island_spec(),
+                crate::island::IslandState::new(shared.clone()),
+            );
+            let link = crate::island::IslandLink::new(shared, handle);
+            let link_for_init = link.clone();
+            let handle_for_init = app_handle.clone();
+            let prefs_for_init = prefs.clone();
+            app = app.init(move || {
+                let mut state = init_shell();
+                state.settings.live = prefs_for_init.clone();
+                state.presence.link = Some(link_for_init.clone());
+                state.presence.app = Some(handle_for_init.clone());
+                state
+            });
+            crate::tray::install(app_handle.clone());
+            crate::presence::install_reopen_listener(app_handle);
+        }
+    }
+
     app.args(extra_args).run();
 }
 
@@ -2894,6 +2922,32 @@ pub fn run_shell_headless(extra_args: Vec<String>) {
 mod tests {
     use super::*;
     use rune::{Env, Runtime};
+
+    #[test]
+    fn provider_pill_opens_without_an_open_chat() {
+        let mut state = ShellState::default();
+        state.chats.auto = false;
+        state.canvas.cards.clear();
+        state.canvas.sessions.order.clear();
+        state.canvas.sessions.sheet = None;
+        state.transcript.live = false;
+        let mut rt = Runtime::new(state, shell_view, (1280.0, 900.0), Env::new(true, 1.0));
+        rt.frame(0.0);
+        let (x, y) = rt.find("composer-provider").expect("home provider pill");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..6 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(
+            rt.state.transcript.provider_keys.open,
+            "the home dock provider pill opens the panel"
+        );
+        assert!(
+            rt.find("providerkeys-overlay").is_some(),
+            "the home card mounts the provider sheet at the shell root"
+        );
+    }
 
     #[test]
     fn update_toast_mounts_ready_and_downloading_states() {
@@ -3024,12 +3078,15 @@ mod tests {
         assert!(rt.find("side-panel").is_some(), "chats panel in drawer");
         let (drawer, _) = rt.presented("side-drawer").expect("drawer rect");
         assert!(drawer[1] >= TOPBAR_H, "drawer starts below the titlebar");
-        // The titlebar stays above the drawer, so its menu can close it.
-        let (x, y) = rt.find("topbar-menu").expect("menu above drawer");
-        rt.pointer_down(x, y);
-        rt.pointer_up(x, y);
+        // The titlebar is chat-only now; the backdrop closes the drawer.
+        assert!(rt.find("topbar-menu").is_none(), "no titlebar navigation");
+        let (backdrop, _) = rt.presented("side-backdrop").expect("backdrop");
+        let bx = backdrop[0] + backdrop[2] - 8.0;
+        let by = backdrop[1] + backdrop[3] * 0.5;
+        rt.pointer_down(bx, by);
+        rt.pointer_up(bx, by);
         rt.frame(1.0 / 60.0);
-        assert!(!rt.state.mobile_panel_open, "titlebar menu closes drawer");
+        assert!(!rt.state.mobile_panel_open, "backdrop closes drawer");
         let (x, y) = rt.find("mobile-chats").expect("chats button");
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
@@ -3053,7 +3110,9 @@ mod tests {
         // Session tabs seeded from the scene cards, rail + chats panel up,
         // canvas always mounted — one page, no routes.
         assert!(rt.find("session-chat:ws-general:chat-1").is_some());
-        assert!(rt.find("session-new").is_some());
+        // The titlebar is chat-only; new chats come from the panel header.
+        assert!(rt.find("session-new").is_none());
+        assert!(rt.find("map-new").is_some());
         assert!(rt.find("icon-rail").is_some());
         assert!(rt.find("map-sidebar").is_some());
         assert!(rt.find("canvas-world").is_some());
@@ -3097,8 +3156,8 @@ mod tests {
         let mut rt = Runtime::new(ShellState::default(), shell_view, (1280.0, 900.0), env);
         rt.frame(0.0);
         let n = rt.state.canvas.sessions.order.len();
-        // New session adds a card + tab and selects it.
-        let (x, y) = rt.find("session-new").unwrap();
+        // New session (panel header `+`) adds a card + tab and selects it.
+        let (x, y) = rt.find("map-new").unwrap();
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
         for _ in 0..5 {
@@ -3143,15 +3202,10 @@ mod tests {
         assert!((rect[3] - TOPBAR_H).abs() < 0.5, "one 44pt row");
         assert!(rt.presented("shell-tabs").is_some());
 
-        // New session is a fixed square, never a full-width dashed box.
-        let (plus, _) = rt.presented("session-new").expect("new session");
-        assert!((plus[2] - 30.0).abs() < 0.5, "width {}", plus[2]);
-        assert!((plus[3] - 30.0).abs() < 0.5, "height {}", plus[3]);
-        assert!(
-            rt.find("session-new-label").is_none(),
-            "the visible New session text is gone"
-        );
-        // It follows the last tab and never overlays a tab's close target.
+        // The titlebar carries tabs only: no add/search controls, so the
+        // strip always starts at the leading gutter.
+        assert!(rt.find("session-new").is_none(), "no titlebar add button");
+        assert!(rt.find("topbar-menu").is_none(), "no titlebar menu");
         let last = rt
             .state
             .canvas
@@ -3161,43 +3215,123 @@ mod tests {
             .expect("a tab")
             .clone();
         let (tab, _) = rt.presented(&format!("session-{last}")).expect("last tab");
-        assert!(
-            plus[0] >= tab[0] + tab[2] + TAB_GAP - 0.5,
-            "plus {} overlaps tab right {}",
-            plus[0],
-            tab[0] + tab[2]
-        );
+        assert!(tab[0] >= 0.0, "tab inside the strip");
+
+        // Quiet tabs are separated by a hairline; the active pill is not.
+        let ids = rt.state.canvas.sessions.order.clone();
+        let active = rt.state.canvas.active_id.clone();
+        let mut saw_separator = false;
+        for index in 1..ids.len() {
+            let key = format!("tab-sep-{index}");
+            let adjacent_active = ids[index] == active || ids[index - 1] == active;
+            if rt.find(&key).is_some() {
+                saw_separator = true;
+                assert!(!adjacent_active, "active tab keeps no divider");
+            }
+        }
+        assert!(saw_separator, "open tabs show dividers");
     }
 
     #[test]
-    fn titlebar_menu_folds_navigation_and_search_opens_it() {
+    fn subagent_drill_docks_right_of_the_chat() {
         let env = Env::new(true, 1.0);
-        let mut rt = Runtime::new(ShellState::default(), shell_view, (1280.0, 900.0), env);
+        let mut state = ShellState::default();
+        // Open the drill on the visible card thread (the sheet), which is
+        // the same thread the home card renders.
+        let active = state.canvas.active_id.clone();
+        let thread = state.canvas.thread_mut(&active);
+        // Use a real spawned card so the dock binds its child thread/composer.
+        crate::rune_transcript::open_subagent(thread, "chat-2", "Dev", Some("ws-general"));
+        thread.drill_inbox = None;
+        let drill = thread.active_subagent.as_mut().expect("drill");
+        drill.loading = false;
+        drill.workspace_id = "ws-general".to_string();
+        let mut rt = Runtime::new(state, shell_view, (1280.0, 900.0), env);
         rt.frame(0.0);
-        assert!(rt.find("icon-rail").is_some());
-        assert!(rt.find("map-sidebar").is_some());
-
-        let (x, y) = rt.find("topbar-menu").expect("menu");
+        // The conversation stays mounted; the child session docks to its right.
+        assert!(rt.find("home-chat-card").is_some(), "chat stays mounted");
+        assert!(rt.find("subagent-panel").is_some(), "panel mounted");
+        assert!(rt.find("subagent-panel-surface").is_some(), "panel surface");
+        assert!(
+            rt.find("subagent-panel-close").is_some(),
+            "panel close button"
+        );
+        assert!(
+            rt.find("subagent-composer-input").is_some(),
+            "child prompt dock mounted"
+        );
+        let (card, _) = rt.presented("home-chat-card").expect("card rect");
+        let (panel, _) = rt.presented("subagent-panel").expect("panel rect");
+        assert!(
+            panel[0] >= card[0] + card[2] - 1.0,
+            "panel sits right of the card: panel {} card {}",
+            panel[0],
+            card[0] + card[2]
+        );
+        // Close returns the width to the chat.
+        let (x, y) = rt.find("subagent-panel-close").expect("close placed");
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
         for _ in 0..8 {
             rt.frame(1.0 / 60.0);
         }
-        assert!(!rt.state.nav_open);
-        assert!(rt.find("icon-rail").is_none(), "rail folded");
+        assert!(
+            rt.state
+                .canvas
+                .sheet_thread()
+                .is_none_or(|t| t.active_subagent.is_none()),
+            "drill closed"
+        );
+        assert!(rt.find("subagent-panel").is_none(), "panel closed");
+        assert!(rt.find("home-chat-card").is_some(), "chat still mounted");
+    }
+
+    #[test]
+    fn rail_menu_folds_only_the_panel_and_rail_stays() {
+        let env = Env::new(true, 1.0);
+        let mut rt = Runtime::new(ShellState::default(), shell_view, (1280.0, 900.0), env);
+        rt.frame(0.0);
+        assert!(rt.find("icon-rail").is_some());
+        assert!(rt.find("map-sidebar").is_some());
+        assert!(rt.find("topbar-menu").is_none(), "topbar has no navigation");
+
+        // The rail hamburger folds the chat panel only. Settings, chats,
+        // group, and cloud stay reachable because the rail never hides.
+        let (x, y) = rt.find("rail-menu").expect("rail menu");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..8 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(!rt.state.panel_open);
+        assert!(rt.find("icon-rail").is_some(), "rail stays visible");
         assert!(rt.find("map-sidebar").is_none(), "panel folded");
+        assert!(
+            rt.find("rail-settings").is_some(),
+            "settings stays reachable"
+        );
+        assert!(rt.find("rail-Chats").is_some(), "chats stays reachable");
         assert!(rt.find("shell-titlebar").is_some(), "titlebar stays");
 
-        let (x, y) = rt.find("topbar-search").expect("search");
+        // Pressing the hamburger again restores the same panel.
+        let (x, y) = rt.find("rail-menu").expect("rail menu restores");
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
         for _ in 0..5 {
             rt.frame(1.0 / 60.0);
         }
-        assert!(rt.state.nav_open, "search restores navigation");
-        assert_eq!(rt.state.canvas.rail, RailTab::Chats);
-        assert!(rt.state.canvas.sessions.search.focused);
+        assert!(rt.state.panel_open, "panel restored");
         assert!(rt.find("map-search").is_some());
+
+        // Choosing a rail destination also brings the panel back.
+        let (x, y) = rt.find("rail-Cloud").expect("cloud");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..5 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(rt.state.panel_open, "destination opens its panel");
+        assert!(rt.find("cloud-board").is_some());
     }
 
     #[test]

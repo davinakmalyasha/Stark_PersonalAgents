@@ -276,7 +276,12 @@ mod tests {
     fn allowlist_includes_essentials_not_credentials() {
         let extra = BTreeSet::new();
         assert!(is_allowed_name("PATH", &extra));
+        // The allowlist is platform-specific: Windows needs SystemRoot,
+        // Unix needs TMPDIR.
+        #[cfg(windows)]
         assert!(is_allowed_name("SystemRoot", &extra));
+        #[cfg(unix)]
+        assert!(is_allowed_name("TMPDIR", &extra));
         assert!(is_allowed_name("LC_ALL", &extra));
         assert!(!is_allowed_name("AWS_ACCESS_KEY_ID", &extra));
         assert!(!is_allowed_name("DATABASE_URL", &extra));

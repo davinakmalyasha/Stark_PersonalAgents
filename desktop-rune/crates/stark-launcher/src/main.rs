@@ -4,7 +4,7 @@
 //! ```text
 //! StarkRune.exe
 //! current.json           { version, previous }
-//! app/<version>/         stark-rune.exe, stark-server.exe, onnxruntime.dll
+//! app/<version>/         stark-rune.exe, stark-server.exe
 //! models/                shared voice models
 //! updates/               staged downloads
 //! ```

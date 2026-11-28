@@ -1116,16 +1116,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/tts", post(voice::tts_handler))
         .route("/api/tts/stream", post(voice::tts_stream_handler))
         .route("/api/tts/cancel", post(voice::tts_cancel_handler))
-        .route("/api/voice/start", post(voice::voice_start_handler))
         .route("/api/voice/status", get(voice::voice_status_handler))
-        .route("/api/voice/stop", post(voice::voice_stop_handler))
-        .route("/api/voice/mute", post(voice::voice_mute_handler))
         .route("/api/voice/interrupt", post(voice::voice_interrupt_handler))
-        .route("/api/voice/peek", get(voice::voice_peek_handler))
-        .route("/api/voice/send", post(voice::voice_send_handler))
         .route("/api/voice/warm_tts", post(voice::tts_warm_handler))
         .route("/api/voice/release_tts", post(voice::tts_release_handler))
         .route("/api/voice/release_asr", post(voice::release_asr_handler))
+        .route("/api/voice/warm_stt", post(voice::stt_warm_handler))
         .route("/api/voice/tts_status", get(voice::tts_status_handler))
         .route(
             "/api/transcribe",

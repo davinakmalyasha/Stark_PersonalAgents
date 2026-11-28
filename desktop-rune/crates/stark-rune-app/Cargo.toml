@@ -28,6 +28,8 @@ base64 = "0.22"
 # Backend-assisted dictation: stream captured PCM to `stark-server`'s
 # `/api/voice/ws` (the pre-rewrite split). Pure Rust, works on GNU + MSVC.
 tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
+# Hex's anti-aliased FFT resampler for 48k microphone blocks.
+rubato = "5.0.1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -70,8 +72,6 @@ default = ["native-file-dialog"]
 rune-real = ["dep:rune", "dep:rune-kit"]
 # Weak dependency feature: only reaches Rune when `rune-real` is on.
 native-file-dialog = ["rune?/native-file-dialog"]
-# Streaming speech-to-text (Moonshine ONNX, MSVC-only prebuilt on Windows).
-voice-stt = ["dep:moonshine-rs"]
 
 [dependencies.rune]
 path = "../../vendor/rune/crates/rune"
@@ -89,13 +89,6 @@ path = "../../vendor/rune/crates/rune-kit"
 package = "rune-kit"
 default-features = false
 optional = true
-
-# Streaming speech-to-text over the Moonshine ONNX runtime. The native
-# libmoonshine prebuilt is MSVC-only on Windows (same gate as the backend's
-# stark-voice `stt` feature); other targets keep an honest stub and the
-# feature compiles to meter-only instead of failing on bindgen/link.
-[target.'cfg(target_env = "msvc")'.dependencies]
-moonshine-rs = { version = "0.2.6", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_UI_Shell", "Win32_System_Threading", "Win32_System_Registry"] }

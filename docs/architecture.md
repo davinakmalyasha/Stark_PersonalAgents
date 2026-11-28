@@ -78,16 +78,15 @@ The native app is also a background desktop surface:
   armed — agents, the tray and the idle island stay alive. `--background`
   starts windowless (tray only) and
   the launcher forwards `STARK_BACKGROUND` across update restarts.
-- **Speech models are live-mode owned.** The backend loads Moonshine STT
-  lazily on first live use (`session.start`, file transcription, backend
-  capture) and `POST /api/voice/release_asr` drops it; TTS warms when the
-  first bus arms or a chat selects Live (`POST /api/voice/warm_tts`) and
+- **Speech models are live-mode owned.** The backend loads Parakeet Unified
+  English (0.6B Q8_0) lazily on first live use (`session.start`, file
+  transcription) and `POST /api/voice/release_asr` drops it; TTS warms when
+  the first bus arms or a chat selects Live (`POST /api/voice/warm_tts`) and
   releases only once no bus is armed, no chat is live and no reply is speaking
-  (`POST /api/voice/release_tts`). The UI's on-device engine
-  loads on first local dictation and releases when the models release.
-  Stopping capture drops back to armed-idle — models stay warm. An idle,
-  disarmed app holds no STT memory in either process; the ~500 MB UI baseline
-  is the Rune/GPU/fonts working set, not speech.
+  (`POST /api/voice/release_tts`). The app captures PCM only; there is no
+  on-device STT engine. Stopping capture drops back to armed-idle. An idle,
+  disarmed app holds no STT memory; the ~500 MB UI baseline is the
+  Rune/GPU/fonts working set, not speech.
 - **Tray** (`tray.rs`) owns a native status icon and menu: Open Stark, Listen,
   Show/Hide island, Auto-send voice, Start with Windows and Quit. A second
   launch signals the running UI through `Local\StarkRuneOpen` instead of

@@ -1,6 +1,6 @@
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use axum::Json;
 use axum::extract::{Multipart, State};
@@ -11,7 +11,7 @@ use base64::Engine;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use stark_voice::{CaptureManager, SttService, TtsEvent, TtsService};
+use stark_voice::{SttService, TtsEvent, TtsService};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
@@ -26,44 +26,55 @@ pub struct VoiceRuntime {
     models_dir: PathBuf,
     pub tts: Arc<TtsService>,
     stt: RwLock<Option<Arc<SttService>>>,
-    capture: RwLock<Option<Arc<CaptureManager>>>,
+    stt_lock: Mutex<()>,
 }
 
 impl VoiceRuntime {
     /// Live mode owns the speech models: construct the lazy TTS service and
     /// remember where the models live, but load nothing. The first live-mode
-    /// start (`session.start`, backend capture, file transcription) loads
-    /// Moonshine on demand; live-mode off drops it again via
-    /// [`Self::release_asr`].
+    /// start (`session.start`, file transcription) loads Parakeet on demand;
+    /// live-mode off drops it again via [`Self::release_asr`].
     pub fn new(models_dir: PathBuf) -> Self {
         let tts = Arc::new(TtsService::new(models_dir.clone()));
         Self {
             models_dir,
             tts,
             stt: RwLock::new(None),
-            capture: RwLock::new(None),
+            stt_lock: Mutex::new(()),
         }
     }
 
-    /// Load Moonshine on first live use and hand out the shared service.
+    /// Load Parakeet on first live use and hand out the shared service.
     /// A missing model bundle stays an honest error so the UI can report it
     /// instead of hanging the mic toggle.
     pub fn ensure_stt(&self) -> anyhow::Result<Arc<SttService>> {
         if let Some(stt) = self.stt.read().map(|g| g.clone()).unwrap_or(None) {
             return Ok(stt);
         }
+        let _guard = self
+            .stt_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(stt) = self.stt.read().map(|g| g.clone()).unwrap_or(None) {
+            return Ok(stt);
+        }
         let stt = match SttService::load(&self.models_dir) {
             Ok(stt) => {
-                tracing::info!("Moonshine STT model: {}", stt.model_name());
+                tracing::info!(
+                    "Parakeet STT model: {} (backend={}, device={}, stream={})",
+                    stt.model_name(),
+                    stt.backend_label(),
+                    stt.device(),
+                    stt.can_stream()
+                );
                 Arc::new(stt)
             }
             Err(error) => {
-                tracing::warn!("Moonshine STT unavailable: {error:#}");
+                tracing::warn!("Parakeet STT unavailable: {error:#}");
                 return Err(error);
             }
         };
         *self.stt.write().unwrap() = Some(stt.clone());
-        *self.capture.write().unwrap() = Some(Arc::new(CaptureManager::new(stt.clone())));
         Ok(stt)
     }
 
@@ -71,15 +82,10 @@ impl VoiceRuntime {
         self.stt.read().map(|g| g.clone()).unwrap_or(None)
     }
 
-    pub fn capture(&self) -> Option<Arc<CaptureManager>> {
-        self.capture.read().map(|g| g.clone()).unwrap_or(None)
-    }
-
-    /// Drop the ASR service and its backend capture worker. Returns true when
-    /// something was actually released so live-mode off can stay idempotent.
+    /// Drop the ASR service and its model. Returns true when something was
+    /// actually released so live-mode off can stay idempotent.
     pub fn release_asr(&self) -> bool {
         let had = self.stt.read().map(|g| g.is_some()).unwrap_or(false);
-        *self.capture.write().unwrap() = None;
         *self.stt.write().unwrap() = None;
         had
     }
@@ -329,78 +335,40 @@ pub async fn tts_cancel_handler(State(state): State<ServerState>) -> Json<Value>
     Json(json!({"cancelled": true}))
 }
 
-pub async fn voice_start_handler(State(state): State<ServerState>) -> Response {
-    let Some(voice) = state.voice.as_ref() else {
-        return unavailable("Moonshine STT is not available in this build");
+pub async fn stt_warm_handler(State(state): State<ServerState>) -> Json<Value> {
+    let Some(voice) = state.voice.clone() else {
+        return Json(
+            json!({"stt_loaded": false, "stt_loading": false, "error": "voice models are not installed"}),
+        );
     };
-    if let Err(error) = voice.ensure_stt() {
-        return unavailable(&format!("Moonshine STT unavailable: {error:#}"));
+    if voice.stt().is_some() {
+        return Json(json!({"stt_loaded": true, "stt_loading": false}));
     }
-    let Some(capture) = voice.capture() else {
-        return unavailable("Moonshine STT is not available in this build");
-    };
-    match tokio::task::spawn_blocking(move || capture.start()).await {
-        Ok(Ok(active)) => Json(json!({"active": active})).into_response(),
-        Ok(Err(error)) => unavailable(&format!("Capture unavailable: {error:#}")),
-        Err(error) => unavailable(&format!("Capture task failed: {error}")),
-    }
+    tokio::spawn(async move {
+        let _ = tokio::task::spawn_blocking(move || voice.ensure_stt()).await;
+    });
+    Json(json!({"stt_loaded": false, "stt_loading": true}))
 }
 
 pub async fn voice_status_handler(State(state): State<ServerState>) -> Json<Value> {
-    let active = state
-        .voice
+    let stt = state.voice.as_ref().and_then(|voice| voice.stt());
+    let model = stt
         .as_ref()
-        .and_then(|v| v.capture())
-        .map(|capture| capture.active())
-        .unwrap_or(false);
-    let stt_model = state
-        .voice
-        .as_ref()
-        .and_then(|v| v.stt())
         .map(|stt| stt.model_name())
-        .unwrap_or("unavailable");
-    Json(json!({"active": active, "stt_model": stt_model}))
-}
-
-pub async fn voice_stop_handler(
-    State(state): State<ServerState>,
-    Json(body): Json<Value>,
-) -> Response {
-    let discard = body
-        .get("discard")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let Some(capture) = state.voice.as_ref().and_then(|v| v.capture()) else {
-        return unavailable("Moonshine STT is not available in this build");
-    };
-    match tokio::task::spawn_blocking(move || capture.stop(discard)).await {
-        Ok(Ok(text)) => {
-            if discard {
-                Json(json!({"text": "", "engine": "moonshine", "discarded": true})).into_response()
-            } else if text.is_empty() {
-                error_json(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "Moonshine could not transcribe the audio (empty result)",
-                )
-            } else {
-                Json(json!({"text": text, "engine": "moonshine"})).into_response()
-            }
-        }
-        Ok(Err(error)) => unavailable(&format!("Moonshine ASR unavailable: {error:#}")),
-        Err(error) => unavailable(&format!("Capture task failed: {error}")),
-    }
-}
-
-pub async fn voice_mute_handler(
-    State(state): State<ServerState>,
-    Json(body): Json<Value>,
-) -> Response {
-    let muted = body.get("muted").and_then(Value::as_bool).unwrap_or(false);
-    let Some(capture) = state.voice.as_ref().and_then(|v| v.capture()) else {
-        return unavailable("Moonshine STT is not available in this build");
-    };
-    capture.set_muted(muted);
-    Json(json!({"muted": muted})).into_response()
+        .unwrap_or("unloaded");
+    let backend = stt
+        .as_ref()
+        .map(|stt| stt.backend_label())
+        .unwrap_or("unloaded");
+    let device = stt.as_ref().map(|stt| stt.device()).unwrap_or("unloaded");
+    let loaded = stt.as_ref().is_some_and(|stt| stt.is_loaded());
+    Json(json!({
+        "active": false,
+        "stt_model": model,
+        "stt_backend": backend,
+        "stt_device": device,
+        "stt_loaded": loaded,
+    }))
 }
 
 pub async fn voice_interrupt_handler(
@@ -418,40 +386,13 @@ pub async fn voice_interrupt_handler(
     Json(json!({"interrupted_at_ms": played, "tts_cancelled": true}))
 }
 
-pub async fn voice_peek_handler(State(state): State<ServerState>) -> Json<Value> {
-    let (text, level, active) = state
-        .voice
-        .as_ref()
-        .and_then(|v| v.capture())
-        .map(|capture| (capture.live_text(), capture.live_peak(), capture.active()))
-        .unwrap_or_default();
-    Json(json!({"text": text, "level": level, "active": active}))
-}
-
-pub async fn voice_send_handler(State(state): State<ServerState>) -> Response {
-    let Some(capture) = state.voice.as_ref().and_then(|v| v.capture()) else {
-        return unavailable("Moonshine STT is not available in this build");
-    };
-    match tokio::task::spawn_blocking(move || capture.flush_round()).await {
-        Ok(Ok(text)) if !text.is_empty() => {
-            Json(json!({"text": text, "engine": "moonshine"})).into_response()
-        }
-        Ok(Ok(_)) => error_json(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Moonshine could not transcribe the audio (empty result)",
-        ),
-        Ok(Err(error)) => unavailable(&format!("Moonshine ASR unavailable: {error:#}")),
-        Err(error) => unavailable(&format!("Capture task failed: {error}")),
-    }
-}
-
 pub async fn transcribe_handler(
     State(state): State<ServerState>,
     mut multipart: Multipart,
 ) -> Response {
     let stt = match state.voice.as_ref().map(|v| v.ensure_stt()) {
         Some(Ok(stt)) => stt,
-        _ => return unavailable("Moonshine STT is not available in this build"),
+        _ => return unavailable("Parakeet STT is not available in this build"),
     };
     let mut bytes = Vec::new();
     let mut extension = "wav".to_string();
@@ -492,13 +433,13 @@ pub async fn transcribe_handler(
     let _ = tokio::fs::remove_file(&temp).await;
     match result {
         Ok(Ok(text)) if !text.trim().is_empty() => {
-            Json(json!({"text": text.trim(), "engine": "moonshine"})).into_response()
+            Json(json!({"text": text.trim(), "engine": "parakeet"})).into_response()
         }
         Ok(Ok(_)) => error_json(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "Moonshine could not transcribe the audio (empty result)",
+            "Parakeet could not transcribe the audio (empty result)",
         ),
-        Ok(Err(error)) => unavailable(&format!("Moonshine ASR unavailable: {error:#}")),
+        Ok(Err(error)) => unavailable(&format!("Parakeet ASR unavailable: {error:#}")),
         Err(error) => unavailable(&format!("Transcription task failed: {error}")),
     }
 }
@@ -624,7 +565,6 @@ mod tests {
         let dir = std::env::temp_dir().join("stark-voice-lazy-test");
         let runtime = VoiceRuntime::new(dir);
         assert!(runtime.stt().is_none());
-        assert!(runtime.capture().is_none());
         assert!(!runtime.release_asr());
         // A missing bundle stays an honest error, never a panic.
         assert!(runtime.ensure_stt().is_err());

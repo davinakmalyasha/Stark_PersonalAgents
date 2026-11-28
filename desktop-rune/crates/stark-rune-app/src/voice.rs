@@ -1,9 +1,8 @@
 //! Mic capture + level metering behind the voice toggle. Dictation prefers
 //! The backend bridge ([`crate::voice_ws`]): captured 16 kHz mono PCM is
 //! streamed to `stark-server`, whose VAD/STT answers with
-//! [`VoiceMsg::Transcript`]. When no server is reachable the on-device
-//! producer (`stt`, MSVC builds) takes over, else capture degrades to
-//! meter-only levels with an honest note.
+//! [`VoiceMsg::Transcript`]. When no server is reachable capture degrades to
+//! meter-only levels with an honest note; there is no on-device model.
 //!
 //! Native: cpal default input streams RMS blocks into an `mpsc` channel the
 //! poll hook drains into `voice_level`. Web: `getUserMedia` binds later —
@@ -26,8 +25,7 @@ pub enum VoiceMsg {
     /// Interim (`is_final: false`) or final (`true`) dictation text from the
     /// speech thread. The reference UI's overlay protocol is the reference: `transcript`
     /// events refresh the live bubble in place, `pipeline-start` swaps it for
-    /// The single canonical user message. Produced by the `stt` worker on
-    /// MSVC + `voice-stt`; elsewhere the variant is exercised by tests.
+    /// The single canonical user message. Produced by the backend bridge.
     #[allow(dead_code)]
     Transcript {
         text: String,
@@ -161,24 +159,22 @@ impl VoiceBus {
             self.stop = Some(stop);
             self.rx = Some(rx);
             self.live = true;
-            // Dictation prefers the backend bridge: the app streams PCM to
-            // `stark-server` (`/api/voice/ws`), which owns VAD/STT — the
-            // pre-rewrite split, and the only path that needs no speech model
-            // in the app. Without a reachable server it falls back to the
-            // on-device model (MSVC builds only), then to meter-only levels
-            // with an honest note.
-            let (pcm_tx, pcm_rx) = std::sync::mpsc::sync_channel(crate::stt::MAX_AUDIO_QUEUE);
+            // Dictation is backend-owned: the app streams PCM to
+            // `stark-server` (`/api/voice/ws`), which runs Parakeet Unified
+            // English. There is no on-device model and no fallback producer;
+            // without a reachable server capture degrades to meter-only
+            // levels with an honest note.
+            let (pcm_tx, pcm_rx) =
+                std::sync::mpsc::sync_channel(crate::voice_audio::MAX_AUDIO_QUEUE);
             let host = crate::rune_transcript::DEFAULT_API_HOST;
             let port = crate::rune_transcript::api_port();
             let started = match crate::voice_ws::try_open(host, port) {
                 Ok(socket) => crate::voice_ws::spawn_with(socket, pcm_rx, tx.clone(), flag.clone())
-                    .map_err(Some),
-                Err(server) => match crate::stt::spawn_producer(pcm_rx, tx.clone(), flag.clone()) {
-                    Ok(()) => Ok(()),
-                    Err(local) => Err(Some(format!(
-                        "dictation unavailable — server: {server}; local: {local}"
-                    ))),
-                },
+                    .map_err(|error| Some(format!("dictation unavailable: {error}"))),
+                Err(server) => {
+                    drop(pcm_rx);
+                    Err(Some(format!("dictation unavailable - server: {server}")))
+                }
             };
             match started {
                 Ok(()) => {
@@ -272,7 +268,7 @@ impl VoiceBus {
     }
 
     /// Arming live mode warms the backend TTS in the background, so the first
-    /// spoken reply does not pay model load. (Moonshine loads on first
+    /// spoken reply does not pay model load. (Parakeet loads on first
     /// `session.start`, locally on first producer spawn.) Best effort: a
     /// missing bundle or unreachable server only surfaces when TTS is used.
     /// Idempotent — arm every bus freely; one warm call is enough but repeats
@@ -289,18 +285,23 @@ impl VoiceBus {
                     "/api/voice/warm_tts",
                     &serde_json::json!({}),
                 );
+                let _ = crate::transport::post_json_status(
+                    &host,
+                    port,
+                    "/api/voice/warm_stt",
+                    &serde_json::json!({}),
+                );
             });
         }
     }
 
-    /// Disarming the last bus releases the models: drop the on-device engine
-    /// and ask the backend to release TTS/ASR, so an idle app holds no speech
-    /// memory. The shell calls this only once no bus is armed or live. Every
-    /// call is idempotent and best effort; release endpoints never fail.
+    /// Disarming the last bus releases the models and asks the backend to
+    /// release TTS/ASR, so an idle app holds no speech memory. The shell calls
+    /// this only once no bus is armed or live. Every call is idempotent and
+    /// best effort; release endpoints never fail.
     pub fn release_models() {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            crate::stt::release_engine();
             let host = crate::rune_transcript::DEFAULT_API_HOST.to_string();
             let port = crate::rune_transcript::api_port();
             std::thread::spawn(move || {
@@ -376,7 +377,7 @@ pub fn probe_input() -> Option<String> {
 /// 16 kHz capture mode for the STT frontend: the config plus whether the
 /// mono mixdown applies (stereo fallback). Mono F32/I16/U16 first, then
 /// stereo with downmix. When no exact mode exists the caller falls back to
-/// The device default rate and [`LinearResampler`] converts to 16 kHz.
+/// The device default rate and the FFT resampler convert to 16 kHz.
 #[cfg(not(target_arch = "wasm32"))]
 fn prefer_16k(device: &cpal::Device) -> Option<(cpal::SupportedStreamConfig, bool)> {
     let mut best: Option<(u8, cpal::SupportedStreamConfig, bool)> = None;
@@ -388,8 +389,8 @@ fn prefer_16k(device: &cpal::Device) -> Option<(cpal::SupportedStreamConfig, boo
         if channels != 1 && channels != 2 {
             continue;
         }
-        if range.min_sample_rate() > crate::stt::SAMPLE_RATE
-            || range.max_sample_rate() < crate::stt::SAMPLE_RATE
+        if range.min_sample_rate() > crate::voice_audio::SAMPLE_RATE
+            || range.max_sample_rate() < crate::voice_audio::SAMPLE_RATE
         {
             continue;
         }
@@ -408,7 +409,7 @@ fn prefer_16k(device: &cpal::Device) -> Option<(cpal::SupportedStreamConfig, boo
         if better {
             best = Some((
                 rank,
-                range.with_sample_rate(crate::stt::SAMPLE_RATE),
+                range.with_sample_rate(crate::voice_audio::SAMPLE_RATE),
                 channels == 2,
             ));
         }
@@ -416,77 +417,12 @@ fn prefer_16k(device: &cpal::Device) -> Option<(cpal::SupportedStreamConfig, boo
     best.map(|(_, config, stereo)| (config, stereo))
 }
 
-/// Streaming linear resampler: WASAPI shared mode usually exposes only
-/// 48 kHz while the STT frontend expects 16 kHz. Linear interpolation keeps
-/// phase continuity across capture blocks (fractional position + the last
-/// sample of the previous block), so block boundaries never click.
-#[cfg(not(target_arch = "wasm32"))]
-struct LinearResampler {
-    /// Input samples per output sample (`from / to`).
-    step: f64,
-    /// Next output position inside the current block, in input samples.
-    pos: f64,
-    /// Last input sample of the previous block (interpolation carry).
-    prev: f32,
-    primed: bool,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl LinearResampler {
-    fn new(from: u32, to: u32) -> Self {
-        Self {
-            step: from as f64 / to as f64,
-            pos: 0.0,
-            prev: 0.0,
-            primed: false,
-        }
-    }
-
-    fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
-        let n = input.len();
-        if n == 0 {
-            return;
-        }
-        let mut pos = self.pos;
-        while pos < n as f64 {
-            let index = pos.floor() as isize;
-            let frac = (pos - index as f64) as f32;
-            // An interpolating partner lives in the next block, except when
-            // The position lands exactly on the last sample (nothing to
-            // interpolate): keep the fractional position for the next call
-            // so the join is seamless.
-            if frac > 0.0 && index + 1 >= n as isize {
-                break;
-            }
-            let a = if index < 0 {
-                if self.primed {
-                    self.prev
-                } else {
-                    input[0]
-                }
-            } else {
-                input[index as usize]
-            };
-            let b = if index + 1 < n as isize {
-                input[(index + 1) as usize]
-            } else {
-                a
-            };
-            out.push(a + (b - a) * frac);
-            pos += self.step;
-        }
-        self.pos = pos - n as f64;
-        self.prev = input[n - 1];
-        self.primed = true;
-    }
-}
-
-/// One capture block on its way to the STT worker: pass-through when the
-/// device already runs at 16 kHz, resampled otherwise.
+/// One capture block on its way to the server: pass-through when the device
+/// already runs at 16 kHz, FFT-resampled otherwise.
 #[cfg(not(target_arch = "wasm32"))]
 struct PcmForward {
     tx: std::sync::mpsc::SyncSender<Vec<f32>>,
-    resampler: Option<LinearResampler>,
+    resampler: Option<crate::voice_audio::FftResampler>,
     out: Vec<f32>,
 }
 
@@ -495,8 +431,7 @@ impl PcmForward {
     fn new(tx: std::sync::mpsc::SyncSender<Vec<f32>>, rate: u32) -> Self {
         Self {
             tx,
-            resampler: (rate != crate::stt::SAMPLE_RATE)
-                .then(|| LinearResampler::new(rate, crate::stt::SAMPLE_RATE)),
+            resampler: crate::voice_audio::FftResampler::new(rate, crate::voice_audio::SAMPLE_RATE),
             out: Vec::new(),
         }
     }
@@ -518,12 +453,25 @@ impl PcmForward {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for PcmForward {
+    fn drop(&mut self) {
+        if let Some(resampler) = self.resampler.as_mut() {
+            self.out.clear();
+            resampler.flush(&mut self.out);
+            if !self.out.is_empty() {
+                let out = std::mem::take(&mut self.out);
+                let _ = self.tx.try_send(out);
+            }
+        }
+    }
+}
+
 /// When `pcm` is `Some`, every block is downmixed to mono and forwarded to
-/// The STT worker at 16 kHz (dropped on overflow, like the backend): an
-/// exact 16 kHz device mode is used when offered, otherwise the captured
-/// rate is resampled ([`LinearResampler`]) — WASAPI shared mode usually
-/// exposes only 48 kHz. Owns the cpal `Stream` (dropping it stops the
-/// device). Never panics: failures arrive as [`VoiceMsg::Error`].
+/// the server at 16 kHz (dropped on overflow): an exact 16 kHz device mode is
+/// used when offered, otherwise the captured rate is FFT-resampled - WASAPI
+/// shared mode usually exposes only 48 kHz. Owns the cpal `Stream` (dropping
+/// it stops the device). Never panics: failures arrive as [`VoiceMsg::Error`].
 #[cfg(not(target_arch = "wasm32"))]
 pub fn capture_loop(
     stop: Arc<AtomicBool>,
@@ -582,7 +530,7 @@ pub fn capture_loop(
                 config.into(),
                 move |data: &[f32], _| {
                     let mono = if stereo {
-                        crate::stt::mono_mix(data, 2)
+                        crate::voice_audio::mono_mix(data, 2)
                     } else {
                         data.to_vec()
                     };
@@ -604,7 +552,7 @@ pub fn capture_loop(
                 config.into(),
                 move |data: &[i16], _| {
                     let mono = if stereo {
-                        crate::stt::mono_mix(
+                        crate::voice_audio::mono_mix(
                             &data
                                 .iter()
                                 .map(|s| *s as f32 / i16::MAX as f32)
@@ -634,7 +582,7 @@ pub fn capture_loop(
                 config.into(),
                 move |data: &[u16], _| {
                     let mono = if stereo {
-                        crate::stt::mono_mix(
+                        crate::voice_audio::mono_mix(
                             &data
                                 .iter()
                                 .map(|s| (*s as f32 / u16::MAX as f32) * 2.0 - 1.0)
@@ -707,52 +655,6 @@ mod tests {
         assert_eq!(lit_bars(2.0), 5);
     }
 
-    /// WASAPI shared mode is usually 48 kHz-only; decimation must keep the
-    /// 3:1 phase across capture blocks (no duplicate or skipped sample).
-    #[cfg(not(target_arch = "wasm32"))]
-    #[test]
-    fn resampler_downsamples_48k_to_16k_across_blocks() {
-        let mut resampler = LinearResampler::new(48_000, 16_000);
-        let mut out = Vec::new();
-        resampler.process(&[0.0, 3.0, 6.0], &mut out);
-        assert_eq!(out, vec![0.0]);
-        out.clear();
-        resampler.process(&[9.0, 12.0, 15.0], &mut out);
-        assert_eq!(out, vec![9.0], "next decimated sample keeps the 3:1 phase");
-    }
-
-    /// Upsampling interpolates across the block boundary instead of
-    /// repeating or dropping the join sample.
-    #[cfg(not(target_arch = "wasm32"))]
-    #[test]
-    fn resampler_upsamples_8k_to_16k_continuously() {
-        let mut resampler = LinearResampler::new(8_000, 16_000);
-        let mut out = Vec::new();
-        resampler.process(&[0.0, 2.0], &mut out);
-        assert_eq!(out, vec![0.0, 1.0, 2.0]);
-        out.clear();
-        resampler.process(&[4.0, 6.0], &mut out);
-        assert_eq!(
-            out,
-            vec![3.0, 4.0, 5.0, 6.0],
-            "carry interpolates 2..4 across the boundary"
-        );
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    #[test]
-    fn forward_passes_16k_through_and_resamples_48k() {
-        let (tx, rx) = std::sync::mpsc::sync_channel(4);
-        let mut direct = PcmForward::new(tx, 16_000);
-        direct.push(vec![0.5, 0.5]);
-        assert_eq!(rx.try_recv().expect("passthrough"), vec![0.5, 0.5]);
-
-        let (tx, rx) = std::sync::mpsc::sync_channel(4);
-        let mut resampled = PcmForward::new(tx, 48_000);
-        resampled.push(vec![0.0, 0.3, 0.6]);
-        assert_eq!(rx.try_recv().expect("resampled").len(), 1);
-    }
-
     #[test]
     fn note_reports_without_killing_live() {
         let mut bus = VoiceBus::default();
@@ -761,13 +663,13 @@ mod tests {
         bus.live = true;
         bus.level = 0.4;
         tx.send(VoiceMsg::Note(
-            "dictation: Moonshine STT is not available in this build".to_string(),
+            "dictation: Parakeet STT is not available in this build".to_string(),
         ))
         .expect("send note");
         assert!(bus.drain(1.0 / 60.0));
         assert_eq!(
             bus.note.as_deref(),
-            Some("dictation: Moonshine STT is not available in this build")
+            Some("dictation: Parakeet STT is not available in this build")
         );
         assert!(bus.live, "advisory only");
         assert!(bus.level > 0.0, "meter keeps running");

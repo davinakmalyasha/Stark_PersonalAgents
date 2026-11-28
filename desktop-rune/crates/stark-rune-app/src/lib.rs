@@ -93,9 +93,6 @@ pub mod stream_accum;
 #[path = "stream_presentation.rs"]
 pub mod stream_presentation;
 #[cfg(feature = "rune-real")]
-#[path = "stt.rs"]
-pub mod stt;
-#[cfg(feature = "rune-real")]
 #[path = "token_stats.rs"]
 pub mod token_stats;
 #[cfg(feature = "rune-real")]
@@ -116,6 +113,9 @@ pub mod updater;
 #[cfg(feature = "rune-real")]
 #[path = "voice.rs"]
 pub mod voice;
+#[cfg(feature = "rune-real")]
+#[path = "voice_audio.rs"]
+pub mod voice_audio;
 #[cfg(feature = "rune-real")]
 #[path = "voice_ws.rs"]
 pub mod voice_ws;

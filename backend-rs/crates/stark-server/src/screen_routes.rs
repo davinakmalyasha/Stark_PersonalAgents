@@ -12,7 +12,19 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use stark_voice::{Vocabulary, VocabularyBoost, VocabularyEntry};
+
 use crate::ServerState;
+
+/// The app's `session.start` payload. Unknown fields (the `type` tag and
+/// future additions) are ignored.
+#[derive(Debug, Default, Deserialize)]
+pub struct VoiceSessionStart {
+    #[serde(default)]
+    pub vocabulary: Vec<VocabularyEntry>,
+    #[serde(default)]
+    pub vocabulary_boost: VocabularyBoost,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct VisionFrameRequest {
@@ -242,6 +254,21 @@ async fn voice_ws(state: ServerState, socket: WebSocket) {
                 };
                 match value.get("type").and_then(Value::as_str).unwrap_or("") {
                     "session.start" => {
+                        let start: VoiceSessionStart = match serde_json::from_value(value.clone()) {
+                            Ok(start) => start,
+                            Err(error) => {
+                                let _ = outbox_tx.send(json!({
+                                    "type": "session.error",
+                                    "error": format!("invalid session.start: {error}"),
+                                }));
+                                continue;
+                            }
+                        };
+                        let vocabulary = Vocabulary {
+                            entries: start.vocabulary,
+                            boost: start.vocabulary_boost,
+                        }
+                        .sanitized();
                         // Live mode loads Parakeet on first use, not at
                         // server startup, so idle servers hold no ASR memory.
                         let voice = state.voice.clone();
@@ -262,7 +289,7 @@ async fn voice_ws(state: ServerState, socket: WebSocket) {
                         if let Some(mut old) = live_session.take() {
                             old.stop();
                         }
-                        match stark_voice::LiveSession::start(stt, live_tx.clone()) {
+                        match stark_voice::LiveSession::start(stt, live_tx.clone(), vocabulary) {
                             Ok(session) => {
                                 let _ = outbox_tx.send(json!({
                                     "type": "session.ready",
@@ -349,8 +376,51 @@ fn live_event_json(event: stark_voice::LiveEvent) -> Value {
             "text": text,
             "duration_ms": duration_ms,
         }),
+        stark_voice::LiveEvent::TurnDiscarded { turn_id } => json!({
+            "type": "turn_discarded",
+            "turn_id": turn_id,
+        }),
         stark_voice::LiveEvent::Error { message } => {
             json!({"type": "session.error", "error": message})
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_start_reads_the_vocabulary_like_the_app_sends_it() {
+        let start: VoiceSessionStart = serde_json::from_value(serde_json::json!({
+            "type": "session.start",
+            "vocabulary": [
+                "Stark",
+                {"term": "OpenCode", "sounds_like": ["open code"]}
+            ],
+            "vocabulary_boost": "strong",
+        }))
+        .unwrap();
+        assert_eq!(start.vocabulary.len(), 2);
+        assert_eq!(start.vocabulary[0].term, "Stark");
+        assert_eq!(start.vocabulary[1].sounds_like, ["open code"]);
+        assert_eq!(start.vocabulary_boost, VocabularyBoost::Strong);
+    }
+
+    #[test]
+    fn an_older_session_start_still_loads() {
+        let start: VoiceSessionStart =
+            serde_json::from_value(serde_json::json!({"type": "session.start"})).unwrap();
+        assert!(start.vocabulary.is_empty());
+        assert_eq!(start.vocabulary_boost, VocabularyBoost::Normal);
+    }
+
+    #[test]
+    fn a_discarded_turn_reaches_the_client_as_its_own_event() {
+        let value = live_event_json(stark_voice::LiveEvent::TurnDiscarded {
+            turn_id: "t1".to_string(),
+        });
+        assert_eq!(value["type"], "turn_discarded");
+        assert_eq!(value["turn_id"], "t1");
     }
 }

@@ -2,20 +2,33 @@
 //!
 //! Feature `stt` compiles the real engine. Without it the server still builds
 //! and reports an honest unavailable error; no old STT runtime is linked.
+//! Vocabulary types compile in both builds so the API and app can carry a
+//! list whether or not this binary includes the engine.
 
 #[cfg(feature = "stt")]
 mod decode;
 #[cfg(feature = "stt")]
 mod engine;
+mod silence;
 #[cfg(feature = "stt")]
 mod speech;
+#[cfg(feature = "stt")]
+mod vad;
+pub mod vocabulary;
 
 #[cfg(feature = "stt")]
 pub use engine::{
     MODEL_DIR, MODEL_FILE, MODEL_NAME, SttBackend, SttService, TRAILING_SILENCE_SAMPLES, TurnHandle,
 };
+pub use silence::{LevelGate, level_gate};
 #[cfg(feature = "stt")]
 pub use speech::{FRAME_SAMPLES, SAMPLE_RATE, SpeechFrames};
+#[cfg(feature = "stt")]
+pub use vad::{SpeechDetector, VAD_FILE};
+pub use vocabulary::{
+    BiasParts, MAX_BIASED_TERMS, MAX_ENTRIES, MAX_SOUNDS_LIKE, MAX_TERM_CHARS, Vocabulary,
+    VocabularyBoost, VocabularyEntry,
+};
 
 #[cfg(not(feature = "stt"))]
 mod stub {
@@ -76,6 +89,10 @@ mod stub {
             false
         }
 
+        pub fn vad_installed(&self) -> bool {
+            false
+        }
+
         pub fn is_loaded(&self) -> bool {
             false
         }
@@ -88,11 +105,19 @@ mod stub {
             false
         }
 
-        pub fn transcribe_file(&self, _path: &Path) -> Result<String> {
+        pub fn transcribe_file(
+            &self,
+            _path: &Path,
+            _vocabulary: &super::Vocabulary,
+        ) -> Result<Option<String>> {
             bail!("Parakeet STT is not available in this build")
         }
 
-        pub fn transcribe_pcm(&self, _samples: &[f32]) -> Result<String> {
+        pub fn transcribe_pcm(
+            &self,
+            _samples: &[f32],
+            _vocabulary: &super::Vocabulary,
+        ) -> Result<String> {
             bail!("Parakeet STT is not available in this build")
         }
 
@@ -100,6 +125,7 @@ mod stub {
             self: &Arc<Self>,
             _events: UnboundedSender<LiveEvent>,
             _turn_id: String,
+            _vocabulary: super::Vocabulary,
         ) -> Result<TurnHandle> {
             bail!("Parakeet STT is not available in this build")
         }

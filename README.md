@@ -44,3 +44,21 @@ it never touches the installed app's data. The installed app lives in
 
 The VPS deploys the same master commit through `build-linux` and `deploy-vps`;
 its `/api/health` response reports the deployed revision in `build`.
+
+## Speech models
+
+Dictation uses Hex's exact Parakeet Unified English 0.6B stack through
+`transcribe.cpp`, plus Silero VAD v6.2 to reject noise-only turns. Install both
+into the shared models directory (the server loads them lazily and unloads
+them when live mode releases the microphone):
+
+```powershell
+.\scripts\install-parakeet.ps1
+# or just the 1.2 MB speech detector
+.\scripts\install-silero-vad.ps1 -ModelsDir D:\Stark\resources\models
+```
+
+The Settings › Stark Island sheet edits the shared vocabulary Parakeet biases
+toward (one term per line; `Term | misheard spelling, another` adds "sounds
+like" forms) and its Off/Light/Normal/Strong boost. The list is sent with each
+dictation, so an edit applies to the next one.

@@ -16,14 +16,18 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use tokio::sync::mpsc::UnboundedSender;
 use transcribe_cpp::{
-    Backend, DeviceType, Model, ModelOptions, ParakeetBufferedStreamOptions, RunOptions,
-    StreamExtension, StreamOptions, Task, TimestampKind,
+    Backend, DeviceType, Model, ModelOptions, ParakeetBufferedStreamOptions,
+    ParakeetVocabularyOptions, RunExtension, RunOptions, StreamExtension, StreamOptions, Task,
+    TimestampKind,
 };
 
 use crate::LiveEvent;
 
 use super::decode::load_audio_16k;
+use super::silence::{SAMPLE_RATE as GATE_SAMPLE_RATE, level_gate};
 use super::speech::{PauseCap, UNIFIED_TRAILING_SILENCE, check_closing_mark, pad_clip};
+use super::vad::SpeechDetector;
+use super::vocabulary::Vocabulary;
 
 pub const MODEL_DIR: &str = "parakeet-unified-en-0.6b";
 pub const MODEL_FILE: &str = "parakeet-unified-en-0.6b-Q8_0.gguf";
@@ -57,6 +61,9 @@ pub struct SttService {
     backend: SttBackend,
     device: String,
     can_stream: bool,
+    /// Optional Silero VAD, loaded on its first clip and dropped with this
+    /// service so an idle server holds no speech weights.
+    vad: SpeechDetector,
 }
 
 impl SttService {
@@ -64,6 +71,13 @@ impl SttService {
     /// mode needs ASR, so an idle server holds no speech weights.
     pub fn load(models_dir: &Path) -> Result<Self> {
         let path = model_path(models_dir)?;
+        let vad = SpeechDetector::new(models_dir);
+        if !vad.is_installed() {
+            log::warn!(
+                "Silero VAD model missing under {}; dictation uses the level gate only",
+                models_dir.display()
+            );
+        }
         let model = load_model(&path)?;
         let capabilities = model.capabilities().context("Parakeet capabilities")?;
         let device = model.device().ok();
@@ -92,6 +106,7 @@ impl SttService {
             backend,
             device,
             can_stream,
+            vad,
         })
     }
 
@@ -113,6 +128,12 @@ impl SttService {
 
     pub fn can_stream(&self) -> bool {
         self.can_stream
+    }
+
+    /// Whether the Silero detector is installed; without it the level gate
+    /// still rejects near-silent clips.
+    pub fn vad_installed(&self) -> bool {
+        self.vad.is_installed()
     }
 
     /// Load the model if `release` dropped it.
@@ -162,7 +183,7 @@ impl SttService {
         if self.can_stream {
             let mut session = model.session()?;
             let options = stream_options();
-            if let Ok(mut stream) = session.stream(&run_options(), &options) {
+            if let Ok(mut stream) = session.stream(&run_options(&Vocabulary::default()), &options) {
                 let _ = stream.feed(&vec![0.0; 1_600]);
                 let _ = stream.finalize();
             }
@@ -170,17 +191,54 @@ impl SttService {
         Ok(())
     }
 
-    pub fn transcribe_file(&self, path: &Path) -> Result<String> {
-        let samples = load_audio_16k(path)?;
-        self.transcribe_pcm(&samples)
+    /// Whether a whole capture is worth transcribing: Hex's level gate first,
+    /// then Silero when it is installed. A missing detector keeps the
+    /// level-only decision; a detector that says "no speech" drops the clip
+    /// even when its level passed (a click, a fan, music).
+    pub fn accepts_speech(&self, samples: &[f32]) -> bool {
+        let gate = level_gate(samples);
+        if !gate.passes() {
+            log::info!(
+                "discarded {:.0} ms of near-silent audio (level {:.1} dBFS, floor {}, sustained {} ms)",
+                samples.len() as f64 * 1_000.0 / GATE_SAMPLE_RATE as f64,
+                gate.loudest_dbfs(),
+                gate.noise_floor_dbfs()
+                    .map(|floor| format!("{floor:.1} dBFS"))
+                    .unwrap_or_else(|| "none".to_string()),
+                gate.sustained_ms()
+            );
+            return false;
+        }
+        match self.vad.contains_speech(samples) {
+            Some(false) => {
+                log::info!(
+                    "discarded {:.0} ms without detected speech (level {:.1} dBFS)",
+                    samples.len() as f64 * 1_000.0 / GATE_SAMPLE_RATE as f64,
+                    gate.loudest_dbfs()
+                );
+                false
+            }
+            Some(true) | None => true,
+        }
     }
 
-    pub fn transcribe_pcm(&self, samples: &[f32]) -> Result<String> {
+    /// Decode and transcribe a file. `Ok(None)` means the gate found no
+    /// speech, which the API reports as an expected empty clip rather than a
+    /// model failure.
+    pub fn transcribe_file(&self, path: &Path, vocabulary: &Vocabulary) -> Result<Option<String>> {
+        let samples = load_audio_16k(path)?;
+        if !self.accepts_speech(&samples) {
+            return Ok(None);
+        }
+        self.transcribe_pcm(&samples, vocabulary).map(Some)
+    }
+
+    pub fn transcribe_pcm(&self, samples: &[f32], vocabulary: &Vocabulary) -> Result<String> {
         let model = self.ensure_model()?;
         let mut session = model.session().context("Parakeet session")?;
         let clip = pad_clip(samples.to_vec());
         let transcript = session
-            .run(&clip, &run_options())
+            .run(&clip, &run_options(vocabulary))
             .context("Parakeet transcription")?;
         Ok(transcript.text.trim().to_string())
     }
@@ -192,13 +250,14 @@ impl SttService {
         self: &Arc<Self>,
         events: UnboundedSender<LiveEvent>,
         turn_id: String,
+        vocabulary: Vocabulary,
     ) -> Result<TurnHandle> {
         let (tx, rx) = mpsc::sync_channel(4_000);
         let stt = self.clone();
         let thread_id = turn_id.clone();
         let thread = thread::Builder::new()
             .name("stark-parakeet-turn".to_string())
-            .spawn(move || run_turn(stt, rx, events, thread_id))
+            .spawn(move || run_turn(stt, rx, events, thread_id, vocabulary))
             .context("failed to spawn Parakeet turn")?;
         Ok(TurnHandle {
             turn_id,
@@ -266,6 +325,7 @@ fn run_turn(
     rx: Receiver<TurnCommand>,
     events: UnboundedSender<LiveEvent>,
     turn_id: String,
+    vocabulary: Vocabulary,
 ) {
     let started = Instant::now();
     let mut collected: Vec<f32> = Vec::new();
@@ -279,6 +339,7 @@ fn run_turn(
             &turn_id,
             &mut collected,
             &mut last_partial,
+            &vocabulary,
         )
     } else {
         offline_turn(rx, &mut collected, &mut last_partial)
@@ -286,21 +347,23 @@ fn run_turn(
 
     let text = match stream_result {
         TurnResult::Final(text) if !text.trim().is_empty() => text.trim().to_string(),
-        TurnResult::Final(_) | TurnResult::Fallback => match stt.transcribe_pcm(&collected) {
-            Ok(text) if !text.trim().is_empty() => text.trim().to_string(),
-            Ok(_) if !last_partial.trim().is_empty() => last_partial.trim().to_string(),
-            Ok(_) => String::new(),
-            Err(error) if !last_partial.trim().is_empty() => {
-                log::warn!("Parakeet offline fallback failed: {error:#}");
-                last_partial.trim().to_string()
+        TurnResult::Final(_) | TurnResult::Fallback => {
+            match stt.transcribe_pcm(&collected, &vocabulary) {
+                Ok(text) if !text.trim().is_empty() => text.trim().to_string(),
+                Ok(_) if !last_partial.trim().is_empty() => last_partial.trim().to_string(),
+                Ok(_) => String::new(),
+                Err(error) if !last_partial.trim().is_empty() => {
+                    log::warn!("Parakeet offline fallback failed: {error:#}");
+                    last_partial.trim().to_string()
+                }
+                Err(error) => {
+                    let _ = events.send(LiveEvent::Error {
+                        message: format!("Parakeet transcription failed: {error:#}"),
+                    });
+                    String::new()
+                }
             }
-            Err(error) => {
-                let _ = events.send(LiveEvent::Error {
-                    message: format!("Parakeet transcription failed: {error:#}"),
-                });
-                String::new()
-            }
-        },
+        }
         TurnResult::Cancelled => return,
     };
     if !text.is_empty() {
@@ -325,6 +388,7 @@ fn stream_turn(
     turn_id: &str,
     collected: &mut Vec<f32>,
     last_partial: &mut String,
+    vocabulary: &Vocabulary,
 ) -> TurnResult {
     let Ok(model) = stt.ensure_model() else {
         drain_to_finish(rx, collected);
@@ -334,7 +398,7 @@ fn stream_turn(
         drain_to_finish(rx, collected);
         return TurnResult::Fallback;
     };
-    let mut stream = match session.stream(&run_options(), &stream_options()) {
+    let mut stream = match session.stream(&run_options(vocabulary), &stream_options()) {
         Ok(stream) => stream,
         Err(error) => {
             log::warn!("Parakeet stream begin failed ({error}); this turn will decode offline");
@@ -499,14 +563,23 @@ fn load_model(path: &Path) -> Result<Model> {
     }
 }
 
-fn run_options() -> RunOptions {
-    RunOptions {
+fn run_options(vocabulary: &Vocabulary) -> RunOptions {
+    let mut options = RunOptions {
         task: Task::Transcribe,
         timestamps: TimestampKind::Token,
         language: Some("en".to_string()),
-        vocabulary: vec!["Stark".to_string()],
         ..RunOptions::default()
+    };
+    if let Some(bias) = vocabulary.bias_parts() {
+        options.vocabulary = bias.terms;
+        options.family = Some(RunExtension::ParakeetVocabulary(
+            ParakeetVocabularyOptions {
+                boost: Some(bias.boost),
+                sounds_like: bias.sounds_like,
+            },
+        ));
     }
+    options
 }
 
 fn stream_options() -> StreamOptions {
@@ -527,6 +600,7 @@ pub const TRAILING_SILENCE_SAMPLES: usize = UNIFIED_TRAILING_SILENCE;
 
 #[cfg(test)]
 mod tests {
+    use super::super::vocabulary::{VocabularyBoost, VocabularyEntry};
     use super::*;
 
     #[test]
@@ -552,5 +626,36 @@ mod tests {
         assert_eq!(options.left_ms, Some(5_600));
         assert_eq!(options.chunk_ms, Some(1_040));
         assert_eq!(options.right_ms, Some(1_040));
+    }
+
+    #[test]
+    fn vocabulary_reaches_the_parakeet_run_extension() {
+        let vocabulary = Vocabulary {
+            entries: vec![
+                VocabularyEntry {
+                    term: "OpenCode".into(),
+                    sounds_like: vec!["open code".into()],
+                },
+                VocabularyEntry {
+                    term: "Rune".into(),
+                    sounds_like: Vec::new(),
+                },
+            ],
+            boost: VocabularyBoost::Strong,
+        };
+        let options = run_options(&vocabulary);
+        assert_eq!(options.vocabulary, ["OpenCode", "Rune"]);
+        let Some(RunExtension::ParakeetVocabulary(bias)) = options.family else {
+            panic!("parakeet vocabulary extension");
+        };
+        assert_eq!(bias.boost, Some(4.0));
+        assert_eq!(bias.sounds_like, [(0, "open code".to_string())]);
+    }
+
+    #[test]
+    fn an_empty_vocabulary_adds_no_decoder_work() {
+        let options = run_options(&Vocabulary::default());
+        assert!(options.vocabulary.is_empty());
+        assert!(options.family.is_none());
     }
 }

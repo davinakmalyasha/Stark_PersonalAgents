@@ -31,6 +31,9 @@ pub enum VoiceMsg {
         text: String,
         is_final: bool,
     },
+    /// The server's gate found no speech in a turn (noise, a click). Clear
+    /// the interim bubble but keep the capture running.
+    Discarded,
     /// Non-fatal note (STT build limits, link problems): reported
     /// without stopping a live meter, unlike [`VoiceMsg::Error`].
     Note(String),
@@ -168,7 +171,16 @@ impl VoiceBus {
                 std::sync::mpsc::sync_channel(crate::voice_audio::MAX_AUDIO_QUEUE);
             let host = crate::rune_transcript::DEFAULT_API_HOST;
             let port = crate::rune_transcript::api_port();
-            let started = match crate::voice_ws::try_open(host, port) {
+            // The server owns Parakeet, so the saved vocabulary travels with
+            // this capture's session start; a saved edit applies to the next
+            // dictation.
+            let prefs = crate::prefs::load();
+            let started = match crate::voice_ws::try_open(
+                host,
+                port,
+                &prefs.vocabulary,
+                prefs.vocabulary_boost,
+            ) {
                 Ok(socket) => crate::voice_ws::spawn_with(socket, pcm_rx, tx.clone(), flag.clone())
                     .map_err(|error| Some(format!("dictation unavailable: {error}"))),
                 Err(server) => {
@@ -229,6 +241,10 @@ impl VoiceBus {
                     } else {
                         self.live_text = text;
                     }
+                    changed = true;
+                }
+                VoiceMsg::Discarded => {
+                    self.live_text.clear();
                     changed = true;
                 }
                 VoiceMsg::Note(note) => {

@@ -79,14 +79,21 @@ The native app is also a background desktop surface:
   starts windowless (tray only) and
   the launcher forwards `STARK_BACKGROUND` across update restarts.
 - **Speech models are live-mode owned.** The backend loads Parakeet Unified
-  English (0.6B Q8_0) lazily on first live use (`session.start`, file
-  transcription) and `POST /api/voice/release_asr` drops it; TTS warms when
-  the first bus arms or a chat selects Live (`POST /api/voice/warm_tts`) and
-  releases only once no bus is armed, no chat is live and no reply is speaking
-  (`POST /api/voice/release_tts`). The app captures PCM only; there is no
-  on-device STT engine. Stopping capture drops back to armed-idle. An idle,
-  disarmed app holds no STT memory; the ~500 MB UI baseline is the
-  Rune/GPU/fonts working set, not speech.
+  English (0.6B Q8_0) and Silero VAD v6.2 lazily on first live use
+  (`session.start`, file transcription) and `POST /api/voice/release_asr`
+  drops both; TTS warms when the first bus arms or a chat selects Live
+  (`POST /api/voice/warm_tts`) and releases only once no bus is armed, no chat
+  is live and no reply is speaking (`POST /api/voice/release_tts`). The app
+  captures PCM only; there is no on-device STT engine. Each completed turn
+  passes Hex's 30 ms level gate and then Silero before Parakeet sees it, so a
+  click, a fan or a noise-only turn never reaches the model; the client clears
+  that turn's interim bubble and keeps capturing. The app sends its saved
+  vocabulary (terms plus "sounds like" spellings and the Off/Light/Normal/
+  Strong boost) with `session.start`; Parakeet's `ParakeetVocabularyOptions`
+  rescores the decode and its exact-spelling pass fixes listed mishearings.
+  Stopping capture drops back to armed-idle. An idle, disarmed app holds no
+  STT memory; the ~500 MB UI baseline is the Rune/GPU/fonts working set, not
+  speech.
 - **Tray** (`tray.rs`) owns a native status icon and menu: Open Stark, Listen,
   Show/Hide island, Auto-send voice, Start with Windows and Quit. A second
   launch signals the running UI through `Local\StarkRuneOpen` instead of
@@ -96,8 +103,9 @@ The native app is also a background desktop surface:
   opens Stark. Voice finals either stage a reviewable composer draft or send
   immediately, depending on the local **Auto-send voice** preference.
 - **Preferences** (`prefs.rs`) live in `.deep_agents/desktop.json`: island
-  visibility, auto-send, capture exclusion and Start with Windows. The file is
-  local and is not part of chat exports.
+  visibility, auto-send, capture exclusion, Start with Windows, and the shared
+  Parakeet vocabulary (one term per line, optional `|` sounds-like spellings)
+  with its boost. The file is local and is not part of chat exports.
 - The browser build keeps the in-page voice dialog; native-only overlays, tray
   and global shortcuts are compiled out on wasm.
 

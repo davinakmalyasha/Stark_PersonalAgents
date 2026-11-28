@@ -18,9 +18,9 @@ use anyhow::{Context, Result};
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 
-use crate::stt::SttService;
 #[cfg(feature = "stt")]
 use crate::stt::{SpeechFrames, TurnHandle};
+use crate::stt::{SttService, Vocabulary};
 
 pub const LIVE_SAMPLE_RATE: u32 = 16_000;
 const POLL_INTERVAL: Duration = Duration::from_millis(60);
@@ -49,6 +49,11 @@ pub enum LiveEvent {
         text: String,
         duration_ms: u64,
     },
+    /// The turn ended with no speech worth transcribing (level gate, Silero).
+    /// The client clears its interim bubble but keeps the capture running.
+    TurnDiscarded {
+        turn_id: String,
+    },
     Error {
         message: String,
     },
@@ -61,7 +66,11 @@ pub struct LiveSession {
 
 #[cfg(not(feature = "stt"))]
 impl LiveSession {
-    pub fn start(_stt: Arc<SttService>, _events: UnboundedSender<LiveEvent>) -> Result<Self> {
+    pub fn start(
+        _stt: Arc<SttService>,
+        _events: UnboundedSender<LiveEvent>,
+        _vocabulary: Vocabulary,
+    ) -> Result<Self> {
         anyhow::bail!("Parakeet STT is not available in this build")
     }
 
@@ -89,12 +98,17 @@ pub struct LiveSession {
 
 #[cfg(feature = "stt")]
 impl LiveSession {
-    pub fn start(stt: Arc<SttService>, events: UnboundedSender<LiveEvent>) -> Result<Self> {
+    pub fn start(
+        stt: Arc<SttService>,
+        events: UnboundedSender<LiveEvent>,
+        vocabulary: Vocabulary,
+    ) -> Result<Self> {
         let (audio_tx, audio_rx) = mpsc::sync_channel::<Command>(MAX_AUDIO_QUEUE);
         let model = stt.model_name().to_string();
+        let vocabulary = vocabulary.sanitized();
         let worker = thread::Builder::new()
             .name("stark-live-parakeet".to_string())
-            .spawn(move || run_session(stt, audio_rx, events))
+            .spawn(move || run_session(stt, audio_rx, events, vocabulary))
             .context("failed to spawn live STT worker")?;
         Ok(Self {
             audio_tx,
@@ -151,6 +165,7 @@ fn run_session(
     stt: Arc<SttService>,
     audio_rx: mpsc::Receiver<Command>,
     events: UnboundedSender<LiveEvent>,
+    vocabulary: Vocabulary,
 ) {
     let mut speech = SpeechFrames::default();
     let mut pre_roll: VecDeque<Vec<f32>> = VecDeque::new();
@@ -160,7 +175,7 @@ fn run_session(
         match audio_rx.recv_timeout(POLL_INTERVAL) {
             Ok(Command::Stop) => {
                 if let Some(active) = turn.take() {
-                    finish_turn(active, &events);
+                    finish_turn(active, &stt, &events);
                 }
                 break;
             }
@@ -192,7 +207,7 @@ fn run_session(
                         active.silence_ms >= ENDPOINT_MS && active.speech_ms >= MIN_SPEECH_MS;
                     if endpoint || active.total_ms >= MAX_TURN_MS {
                         let active = turn.take().unwrap();
-                        finish_turn(active, &events);
+                        finish_turn(active, &stt, &events);
                         // The pre-roll belongs to the next utterance, not the
                         // tail of the one that just ended. Queued audio after
                         // the endpoint refills it with silence.
@@ -200,15 +215,16 @@ fn run_session(
                     }
                 } else if voiced {
                     let turn_id = Uuid::new_v4().to_string();
-                    let handle = match stt.start_turn(events.clone(), turn_id.clone()) {
-                        Ok(handle) => handle,
-                        Err(error) => {
-                            let _ = events.send(LiveEvent::Error {
-                                message: format!("cannot start Parakeet turn: {error:#}"),
-                            });
-                            continue;
-                        }
-                    };
+                    let handle =
+                        match stt.start_turn(events.clone(), turn_id.clone(), vocabulary.clone()) {
+                            Ok(handle) => handle,
+                            Err(error) => {
+                                let _ = events.send(LiveEvent::Error {
+                                    message: format!("cannot start Parakeet turn: {error:#}"),
+                                });
+                                continue;
+                            }
+                        };
                     let mut pcm = Vec::new();
                     let mut speech_ms = 0;
                     let mut total_ms = 0;
@@ -253,8 +269,15 @@ fn run_session(
 }
 
 #[cfg(feature = "stt")]
-fn finish_turn(active: ActiveTurn, events: &UnboundedSender<LiveEvent>) {
-    let _ = events;
+fn finish_turn(active: ActiveTurn, stt: &Arc<SttService>, events: &UnboundedSender<LiveEvent>) {
+    if !stt.accepts_speech(&active.pcm) {
+        let turn_id = active.handle.turn_id().to_string();
+        // Stop any stream already running on this turn before the client
+        // clears the interim bubble, so a late partial cannot resurrect it.
+        active.handle.cancel();
+        let _ = events.send(LiveEvent::TurnDiscarded { turn_id });
+        return;
+    }
     let clip = active.pcm.clone();
     active.handle.finish(clip);
 }

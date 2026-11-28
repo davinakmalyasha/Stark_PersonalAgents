@@ -1516,7 +1516,11 @@ fn canvas_target(state: &ServerState, chat: &Value) -> Result<RunTarget, String>
             None => {
                 let decision = registry.route_decision(scope, &workspace, &state.harness_root);
                 if let Some(warning) = &decision.warning {
-                    tracing::warn!("{warning}");
+                    tracing::warn!(
+                        workspace = %workspace.display(),
+                        workspace_kind = %scope,
+                        "agent routing ambiguity: {warning}"
+                    );
                 }
                 decision.agent
             }
@@ -2203,7 +2207,11 @@ Attached files:
                     &state.harness_root,
                 );
                 if let Some(warning) = &decision.warning {
-                    tracing::warn!("{warning}");
+                    tracing::warn!(
+                        workspace = %workspace.display(),
+                        workspace_kind = %request.workspace_kind,
+                        "agent routing ambiguity: {warning}"
+                    );
                     route_warning = Some(warning.clone());
                 }
                 decision.agent

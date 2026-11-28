@@ -18,7 +18,9 @@ unchanged.
   Custom access defaults to `read`. A read-only agent cannot receive a
   mutating tool. Depth ≥ 2 is always read-only.
 - **Closed MCP/skills.** For custom agents, omitted `skills`/`mcp` means none,
-  not all. MCP names must exist in the live config when saved. Skills are
+  not all. Workspace skills are trusted instructions: symlinked skill
+  directories and `SKILL.md` files are ignored, so a cloned repo cannot point
+  a skill at an arbitrary host file. MCP names must exist in the live config when saved. Skills are
   workspace-aware: save/preview with `workspace_path` validates strictly;
   without it unknown skills are warnings because they may be project-local.
   The `skill` tool enforces the same allowlist at dispatch.
@@ -95,6 +97,10 @@ Notes:
   means both must match. A unique match wins; multiple matches fall back with
   a warning. Explicit built-in keys and virtual kinds (`general`, `house`,
   `personal`, `design`, …) win over routing.
+- Routing paths are absolute globs. `\` is normalized to `/`, trailing
+  separators are ignored, and matching is case-insensitive on Windows and
+  macOS. Empty or relative globs fail save validation; on load they are
+  dropped with a warning instead of quarantining the agent.
 
 ## Endpoints
 

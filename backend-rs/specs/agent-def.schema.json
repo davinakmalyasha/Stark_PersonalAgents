@@ -153,10 +153,11 @@
         },
         "paths": {
           "type": "array",
-          "description": "Glob patterns over the normalised absolute workspace path.",
+          "description": "Absolute glob patterns over the normalised workspace path. Backslashes are accepted and normalised to '/'. Matching is case-insensitive on Windows and macOS. Empty and relative patterns are rejected.",
           "uniqueItems": true,
           "items": {
-            "type": "string"
+            "type": "string",
+            "minLength": 1
           }
         }
       }

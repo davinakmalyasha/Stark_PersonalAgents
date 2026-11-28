@@ -112,7 +112,9 @@ Rules for custom definitions:
   list. Custom `only`/`full_codemode` are rejected and remain built-in
   Developer features.
 - `routing` is custom-only, unique-match, and ignored when an explicit agent
-  or chat agent key exists.
+  or chat agent key exists. Paths are normalized absolute globs; relative or
+  empty rules fail save validation and are dropped with a warning on load.
+- Symlinked skill directories and `SKILL.md` files are ignored.
 - Built-ins can narrow their compiled caps but never widen them.
 
 Schema: `agent-def.schema.json`. API: `docs/agent-builder-api.md`.

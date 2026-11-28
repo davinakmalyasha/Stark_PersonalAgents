@@ -248,6 +248,12 @@ impl AgentRegistry {
             .collect();
         if matches.len() == 1 {
             let agent = matches[0].clone();
+            tracing::debug!(
+                agent = %agent.key,
+                workspace_kind = %kind,
+                workspace = %workspace_path.display(),
+                "custom agent routing matched"
+            );
             return RouteDecision {
                 agent,
                 matched: Some(format!("routing:{kind}")),
@@ -529,7 +535,12 @@ impl AgentRegistry {
         effective.prompt_profile = normalize_profile(&effective.prompt_profile)
             .unwrap_or("general")
             .to_string();
-        let (routing_kinds, routing_paths) = custom_routing(file)?;
+        let (routing_kinds, routing_paths, routing_warnings) = custom_routing(file, false)?;
+        self.warnings.extend(
+            routing_warnings
+                .into_iter()
+                .map(|warning| format!("{key}: {warning}")),
+        );
         effective.routing_workspace_kinds = routing_kinds;
         effective.routing_paths = routing_paths;
         let tools = file.tools.as_ref().ok_or_else(|| {
@@ -637,6 +648,45 @@ fn is_explicit_builtin_kind(kind: &str) -> bool {
     workspace_agents().iter().any(|spec| spec.key == kind) || VIRTUAL.contains(&kind)
 }
 
+/// Windows and macOS usually mount paths case-insensitively, so routing must
+/// follow the same rule or `D:/Work` silently misses `d:/work`.
+fn routing_case_insensitive() -> bool {
+    cfg!(windows) || cfg!(target_os = "macos")
+}
+
+/// Normalize a routing path/glob into the one form matching uses:
+/// forward slashes, no Windows verbatim prefix, no trailing separator.
+fn normalize_routing_pattern(raw: &str) -> String {
+    let mut value = raw.trim().replace('\\', "/");
+    if let Some(rest) = value.strip_prefix("//?/UNC/") {
+        value = format!("//{rest}");
+    } else if let Some(rest) = value
+        .strip_prefix("//?/")
+        .or_else(|| value.strip_prefix("//./"))
+    {
+        value = rest.to_string();
+    }
+    while value.len() > 1 && value.ends_with('/') && !value.ends_with(":/") {
+        value.pop();
+    }
+    value
+}
+
+fn routing_pattern_is_absolute(pattern: &str) -> bool {
+    if pattern.starts_with('/') {
+        return true;
+    }
+    let bytes = pattern.as_bytes();
+    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/'
+}
+
+fn compile_routing_glob(pattern: &str) -> Result<globset::GlobMatcher, globset::Error> {
+    globset::GlobBuilder::new(pattern)
+        .case_insensitive(routing_case_insensitive())
+        .build()
+        .map(|glob| glob.compile_matcher())
+}
+
 fn routing_matches(agent: &EffectiveAgent, kind: &str, workspace_path: &Path) -> bool {
     if agent.routing_workspace_kinds.is_empty() && agent.routing_paths.is_empty() {
         return false;
@@ -652,21 +702,18 @@ fn routing_matches(agent: &EffectiveAgent, kind: &str, workspace_path: &Path) ->
     if agent.routing_paths.is_empty() {
         return true;
     }
-    let normalized = workspace_path.to_string_lossy().replace('\\', "/");
+    let normalized = normalize_routing_pattern(&workspace_path.to_string_lossy());
     let canonical = workspace_path
         .canonicalize()
         .ok()
-        .map(|path| path.to_string_lossy().replace('\\', "/"));
+        .map(|path| normalize_routing_pattern(&path.to_string_lossy()));
     agent.routing_paths.iter().any(|pattern| {
-        globset::Glob::new(pattern)
-            .ok()
-            .map(|glob| glob.compile_matcher())
-            .is_some_and(|matcher| {
-                matcher.is_match(&normalized)
-                    || canonical
-                        .as_deref()
-                        .is_some_and(|path| matcher.is_match(path))
-            })
+        compile_routing_glob(pattern).is_ok_and(|matcher| {
+            matcher.is_match(&normalized)
+                || canonical
+                    .as_deref()
+                    .is_some_and(|path| matcher.is_match(path))
+        })
     })
 }
 
@@ -775,9 +822,11 @@ fn validate_custom_tools(
     Ok(out)
 }
 
-fn custom_routing(file: &AgentFile) -> Result<(Vec<String>, Vec<String>), String> {
+type RoutingRules = (Vec<String>, Vec<String>, Vec<String>);
+
+fn custom_routing(file: &AgentFile, strict: bool) -> Result<RoutingRules, String> {
     let Some(routing) = &file.routing else {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
     };
     let mut kinds: Vec<String> = routing
         .workspace_kinds
@@ -788,21 +837,47 @@ fn custom_routing(file: &AgentFile) -> Result<(Vec<String>, Vec<String>), String
     kinds.sort();
     kinds.dedup();
     let mut paths = Vec::new();
+    let mut warnings = Vec::new();
     for raw in &routing.paths {
-        let pattern = raw.trim().replace('\\', "/");
+        let pattern = normalize_routing_pattern(raw);
         if pattern.is_empty() {
+            let message = "routing path globs cannot be empty".to_string();
+            if strict {
+                return Err(message);
+            }
+            warnings.push(message);
             continue;
         }
-        globset::Glob::new(&pattern)
-            .map_err(|error| format!("invalid routing path glob '{pattern}': {error}"))?;
+        if let Err(error) = compile_routing_glob(&pattern) {
+            let message = format!("invalid routing path glob '{pattern}': {error}");
+            if strict {
+                return Err(message);
+            }
+            warnings.push(message);
+            continue;
+        }
+        if !routing_pattern_is_absolute(&pattern) {
+            let message = format!("routing path glob '{pattern}' must be absolute");
+            if strict {
+                return Err(message);
+            }
+            warnings.push(message);
+            continue;
+        }
         paths.push(pattern);
     }
     paths.sort();
     paths.dedup();
     if kinds.is_empty() && paths.is_empty() {
-        return Err("routing needs at least one workspace kind or path pattern".to_string());
+        let message = "routing has no usable workspace kinds or path globs; ignored".to_string();
+        if strict {
+            return Err(
+                "routing needs at least one workspace kind or absolute path glob".to_string(),
+            );
+        }
+        warnings.push(message);
     }
-    Ok((kinds, paths))
+    Ok((kinds, paths, warnings))
 }
 
 fn custom_code_mode(file: &AgentFile, tools: &[String]) -> Result<stark_tools::CodeMode, String> {
@@ -1106,7 +1181,7 @@ pub fn validate_definition_in(
         check.errors.extend(builtin_override_errors(spec, file));
     } else {
         // Custom definition.
-        if let Err(error) = custom_routing(file) {
+        if let Err(error) = custom_routing(file, true) {
             check.errors.push(error);
         }
         let access = file
@@ -1608,6 +1683,127 @@ mod tests {
         let decision = registry.route_decision("coding", &workspace, dir.path());
         assert_eq!(decision.agent.key, "developer");
         assert!(decision.warning.is_some());
+    }
+
+    #[test]
+    fn routing_patterns_normalize_windows_forms() {
+        assert_eq!(normalize_routing_pattern(r"\\?\D:\Work\"), "D:/Work");
+        assert_eq!(
+            normalize_routing_pattern(r"\\?\UNC\server\share\"),
+            "//server/share"
+        );
+        assert_eq!(normalize_routing_pattern("/tmp/work/"), "/tmp/work");
+        assert_eq!(normalize_routing_pattern("D:/"), "D:/");
+        assert_eq!(normalize_routing_pattern("/"), "/");
+        assert!(routing_pattern_is_absolute("D:/work/**"));
+        assert!(routing_pattern_is_absolute("//server/share/**"));
+        assert!(!routing_pattern_is_absolute("relative/**"));
+    }
+
+    #[test]
+    fn routing_drift_warns_on_load_but_is_rejected_on_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = custom("backend", &["read"], "read");
+        backend.routing = Some(stark_config::AgentRoutingFile {
+            workspace_kinds: Vec::new(),
+            paths: vec!["relative/**".to_string()],
+        });
+        write_agent(
+            dir.path(),
+            "backend",
+            serde_json::to_value(&backend).unwrap(),
+        );
+        let config = ConfigStore::open(dir.path());
+        let registry = AgentRegistry::load(&config, dir.path());
+        let agent = registry
+            .get("backend")
+            .expect("routing drift must not quarantine the agent");
+        assert!(agent.routing_paths.is_empty());
+        assert!(
+            registry
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("must be absolute")),
+            "{:?}",
+            registry.warnings()
+        );
+        let check = validate_definition(&config, dir.path(), "backend", &backend, &registry);
+        assert!(
+            check
+                .errors
+                .iter()
+                .any(|error| error.contains("must be absolute")),
+            "{:?}",
+            check.errors
+        );
+
+        let mut empty = custom("empty", &["read"], "read");
+        empty.routing = Some(stark_config::AgentRoutingFile {
+            workspace_kinds: Vec::new(),
+            paths: vec![String::new()],
+        });
+        assert!(
+            custom_routing(&empty, true)
+                .unwrap_err()
+                .contains("cannot be empty")
+        );
+        assert!(
+            custom_routing(&empty, false)
+                .unwrap()
+                .2
+                .iter()
+                .any(|warning| warning.contains("cannot be empty"))
+        );
+    }
+
+    #[test]
+    fn routing_invalid_glob_warns_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = custom("backend", &["read"], "read");
+        backend.routing = Some(stark_config::AgentRoutingFile {
+            workspace_kinds: vec!["coding".to_string()],
+            paths: vec!["[".to_string()],
+        });
+        write_agent(
+            dir.path(),
+            "backend",
+            serde_json::to_value(&backend).unwrap(),
+        );
+        let config = ConfigStore::open(dir.path());
+        let registry = AgentRegistry::load(&config, dir.path());
+        assert!(registry.get("backend").is_some());
+        assert!(
+            registry
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("invalid routing path glob")),
+            "{:?}",
+            registry.warnings()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn routing_matches_windows_case_and_separators() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = custom("backend", &["read"], "read");
+        backend.routing = Some(stark_config::AgentRoutingFile {
+            workspace_kinds: vec!["coding".to_string()],
+            paths: vec!["C:/Work/**".to_string()],
+        });
+        write_agent(
+            dir.path(),
+            "backend",
+            serde_json::to_value(&backend).unwrap(),
+        );
+        let config = ConfigStore::open(dir.path());
+        let registry = AgentRegistry::load(&config, dir.path());
+        let agent = registry.get("backend").unwrap();
+        assert!(routing_matches(
+            agent,
+            "coding",
+            Path::new(r"c:\work\project")
+        ));
     }
 
     #[test]

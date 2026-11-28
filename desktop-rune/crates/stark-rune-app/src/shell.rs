@@ -2597,7 +2597,9 @@ fn apply_created_project(s: &mut ShellState) -> bool {
     let Some(created) = crate::projects::take_new_project(&mut s.canvas.projects) else {
         return false;
     };
-    s.canvas.open_created_chat(&created);
+    if !created.chat_id.is_empty() {
+        s.canvas.open_created_chat(&created);
+    }
     if !s
         .chats
         .snapshot
@@ -2607,19 +2609,21 @@ fn apply_created_project(s: &mut ShellState) -> bool {
     {
         s.chats.snapshot.workspaces.push(created.workspace.clone());
     }
-    let chat_key = format!("{}:{}", created.workspace.id, created.chat_id);
-    if !s.chats.snapshot.chats.iter().any(|c| c.key() == chat_key) {
-        let at = crate::rune_transcript::now_iso();
-        s.chats.snapshot.chats.push(crate::chats::ChatSummary {
-            id: created.chat_id.clone(),
-            workspace_id: created.workspace.id.clone(),
-            workspace_name: created.workspace.name.clone(),
-            workspace_kind: created.workspace.kind.clone(),
-            title: created.chat_title.clone(),
-            updated_at: at.clone(),
-            created_at: at,
-            ..crate::chats::ChatSummary::default()
-        });
+    if !created.chat_id.is_empty() {
+        let chat_key = format!("{}:{}", created.workspace.id, created.chat_id);
+        if !s.chats.snapshot.chats.iter().any(|c| c.key() == chat_key) {
+            let at = crate::rune_transcript::now_iso();
+            s.chats.snapshot.chats.push(crate::chats::ChatSummary {
+                id: created.chat_id.clone(),
+                workspace_id: created.workspace.id.clone(),
+                workspace_name: created.workspace.name.clone(),
+                workspace_kind: created.workspace.kind.clone(),
+                title: created.chat_title.clone(),
+                updated_at: at.clone(),
+                created_at: at,
+                ..crate::chats::ChatSummary::default()
+            });
+        }
     }
     crate::chats::refresh(&mut s.chats);
     if let Some(project_id) = created.project_id {
@@ -3555,6 +3559,7 @@ mod tests {
             done: 1,
             total: 4,
             waiting: 1,
+            ..Default::default()
         }];
         let mut rt = Runtime::new(state, shell_view, (1280.0, 900.0), env);
         rt.frame(0.0);
@@ -3580,6 +3585,122 @@ mod tests {
             "backdrop dismisses the group modal"
         );
         assert!(rt.find("gp-modal").is_none());
+    }
+
+    #[test]
+    fn project_kebab_opens_management_menu_without_opening_the_modal() {
+        let env = Env::new(true, 1.0);
+        let mut state = ShellState::default();
+        state.canvas.rail = RailTab::Group;
+        state.canvas.projects.auto = false;
+        state.canvas.projects.projects = vec![crate::projects::GroupProject {
+            id: "p1".to_string(),
+            title: "Analytics".to_string(),
+            status: "running".to_string(),
+            done: 1,
+            total: 4,
+            waiting: 0,
+            ..Default::default()
+        }];
+        let mut rt = Runtime::new(state, shell_view, (1280.0, 900.0), env);
+        rt.frame(0.0);
+        let (x, y) = rt.find("side-projects-p1-menu").expect("kebab");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.0);
+        assert_eq!(
+            rt.state.canvas.projects.menu.as_deref(),
+            Some("p1"),
+            "kebab opens the project menu"
+        );
+        assert!(
+            rt.state.canvas.projects.group.open_id.is_none(),
+            "kebab does not open the modal"
+        );
+        assert!(rt.find("side-projects-p1-actions").is_some());
+        assert!(rt.find("side-projects-p1-edit").is_some());
+        assert!(rt.find("side-projects-p1-trash").is_some());
+    }
+
+    #[test]
+    fn new_project_second_step_exposes_team_start_and_repeat() {
+        let env = Env::new(true, 1.0);
+        let mut state = ShellState::default();
+        state.canvas.rail = RailTab::Group;
+        state.canvas.projects.auto = false;
+        state.canvas.projects.dialog.open = true;
+        state.canvas.projects.dialog.path.text = "C:/work/team".to_string();
+        let mut rt = Runtime::new(state, shell_view, (1280.0, 900.0), env);
+        rt.frame(0.0);
+        let (x, y) = rt.find("new-project-next").expect("next");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.0);
+        assert_eq!(rt.state.canvas.projects.dialog.step, 2);
+        assert!(rt.find("new-project-agent-developer").is_some());
+        assert!(rt.find("new-project-agent-plus-developer").is_some());
+        assert!(rt.find("new-project-start-now").is_some());
+        assert!(rt.find("new-project-repeat-none").is_some());
+        assert!(rt.find("new-project-review-plan").is_some());
+    }
+
+    #[test]
+    fn group_settings_sheet_mounts_and_team_tab_has_amount_controls() {
+        let env = Env::new(true, 1.0);
+        let mut state = ShellState::default();
+        state.canvas.rail = RailTab::Group;
+        state.canvas.projects.auto = false;
+        state.canvas.projects.group.open_id = Some("p1".to_string());
+        state.canvas.projects.group.detail = Some(crate::group::data::GroupDetail::from_json(
+            &serde_json::json!({
+                "id": "p1", "path": "C:/meta", "workspace_path": "C:/work",
+                "current_cycle": 1,
+                "project": {"id": "p1", "title": "Analytics", "goal": "Ship", "status": "running", "cycle": 1, "max_parallel": 2, "planner_agent": "orchestrator", "plan_review": true,
+                  "schedule": {"start_mode": "now", "recurrence": "daily", "repeat_active": true}},
+                "members": [{"id": "m1", "display": "Developer 1", "agent_key": "developer", "slot_index": 1, "assigned": 1, "done": 0}],
+                "milestones": [], "items": [], "messages": [], "events": [], "runs": []
+            }),
+        ));
+        state.canvas.projects.group.settings.open = true;
+        let mut rt = Runtime::new(state, shell_view, (1280.0, 900.0), env);
+        rt.frame(0.0);
+        assert!(rt.find("gp-settings").is_some());
+        let (x, y) = rt.find("gp-settings-tab-Team").expect("team tab");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.0);
+        assert!(rt.find("gp-settings-team").is_some());
+        assert!(rt.find("gp-settings-plus-developer").is_some());
+        assert!(rt.find("gp-settings-minus-developer").is_some());
+    }
+
+    #[test]
+    fn group_board_mounts_add_and_status_controls() {
+        let env = Env::new(true, 1.0);
+        let mut state = ShellState::default();
+        state.canvas.rail = RailTab::Group;
+        state.canvas.projects.auto = false;
+        state.canvas.projects.group.open_id = Some("p1".to_string());
+        state.canvas.projects.group.rail_tab = crate::group::RailTab::Board;
+        state.canvas.projects.group.board_open = Some("m1".to_string());
+        state.canvas.projects.group.item_open = Some("i1".to_string());
+        state.canvas.projects.group.detail = Some(crate::group::data::GroupDetail::from_json(
+            &serde_json::json!({
+                "id": "p1", "path": "C:/meta", "workspace_path": "C:/work",
+                "current_cycle": 1,
+                "project": {"id": "p1", "title": "Analytics", "goal": "Ship", "status": "running", "cycle": 1, "max_parallel": 1},
+                "members": [],
+                "milestones": [{"id": "m1", "title": "Build", "status": "active", "cycle": 1, "depends_on": []}],
+                "items": [{"id": "i1", "milestone_id": "m1", "title": "Write", "status": "pending", "cycle": 1}],
+                "messages": [], "events": [], "runs": []
+            }),
+        ));
+        let mut rt = Runtime::new(state, shell_view, (1280.0, 900.0), env);
+        rt.frame(0.0);
+        assert!(rt.find("gp-add-milestone").is_some());
+        assert!(rt.find("gp-ms-m1-status-done").is_some());
+        assert!(rt.find("gp-board-item-i1").is_some());
+        assert!(rt.find("gp-complete-i1").is_some());
     }
 
     #[test]
@@ -3854,22 +3975,15 @@ mod tests {
             state.canvas.projects.dialog.error
         );
         assert!(poll_projects(&mut state, 1.0), "result applied");
-        assert_eq!(
-            state.canvas.active_id, "chat:ws-new:chat-new",
-            "created chat is active"
-        );
-        let thread = state.canvas.thread_mut("chat:ws-new:chat-new").clone();
-        assert_eq!(thread.workspace_id, "ws-new");
-        assert_eq!(thread.chat_id, "chat-new");
-        assert!(thread.chat_ready);
-        assert!(thread.edit.text.is_empty(), "group mode seeds no prompt");
+        // Group mode opens the project board directly; it does not create a
+        // throwaway first chat.
         assert!(
-            state
+            !state
                 .canvas
                 .chat_rows
                 .iter()
                 .any(|chat| chat.key() == "ws-new:chat-new"),
-            "new chat registered on the map"
+            "group mode creates no throwaway chat"
         );
         assert_eq!(
             state.canvas.projects.group.open_id.as_deref(),
@@ -4143,6 +4257,7 @@ mod tests {
             done: 1,
             total: 4,
             waiting: 1,
+            ..Default::default()
         }];
         assert!(resolve_pending_group(&mut state));
         assert_eq!(state.canvas.projects.group.open_id.as_deref(), Some("p1"));

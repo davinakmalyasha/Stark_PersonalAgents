@@ -11,7 +11,7 @@
         "properties": {
           "description": {
             "type": "string",
-            "description": "Clear, concise description of what this command does in active voice, 5-10 words (shown in the UI). Examples: \"ls\" \u2192 \"List files in current directory\"; \"git status\" \u2192 \"Show working tree status\"; \"npm install\" \u2192 \"Install package dependencies\"."
+            "description": "Clear, concise description of what this command does in active voice, 5-10 words (shown in the UI). Examples: \"ls\" → \"List files in current directory\"; \"git status\" → \"Show working tree status\"; \"npm install\" → \"Install package dependencies\"."
           },
           "command": {
             "type": "string",
@@ -86,7 +86,7 @@
       "required": [
         "action"
       ],
-      "doc": "job(action, job_id?, wait?, timeout_ms?, reason?) \u2014 Manage bash background jobs: list | output | kill."
+      "doc": "job(action, job_id?, wait?, timeout_ms?, reason?) — Manage bash background jobs: list | output | kill."
     },
     {
       "name": "read",
@@ -402,7 +402,7 @@
         "target",
         "message"
       ],
-      "doc": "message_agent(target, message, wake?) \u2014 Queue a message; wake=true triggers an idle agent turn."
+      "doc": "message_agent(target, message, wake?) — Queue a message; wake=true triggers an idle agent turn."
     },
     {
       "name": "wait_agent",
@@ -490,7 +490,7 @@
       "required": [
         "file_path"
       ],
-      "doc": "read_pdf(file_path, max_pages?, page_numbers?) \u2014 Read text from a PDF file."
+      "doc": "read_pdf(file_path, max_pages?, page_numbers?) — Read text from a PDF file."
     },
     {
       "name": "create_docx",
@@ -508,7 +508,7 @@
           },
           "content": {
             "type": "string",
-            "description": "Document body \u2014 one paragraph per line."
+            "description": "Document body — one paragraph per line."
           }
         },
         "required": [
@@ -519,7 +519,7 @@
       "required": [
         "file_path"
       ],
-      "doc": "create_docx(file_path, title?, content?) \u2014 Create a Word document (.docx)."
+      "doc": "create_docx(file_path, title?, content?) — Create a Word document (.docx)."
     },
     {
       "name": "create_xlsx",
@@ -555,7 +555,7 @@
       "required": [
         "file_path"
       ],
-      "doc": "create_xlsx(file_path, headers, rows) \u2014 Create an Excel spreadsheet (.xlsx)."
+      "doc": "create_xlsx(file_path, headers, rows) — Create an Excel spreadsheet (.xlsx)."
     },
     {
       "name": "browser_act",
@@ -695,7 +695,7 @@
       "required": [
         "action"
       ],
-      "doc": "browser_act(action, selector?, text?, key?, what?, path?) \u2014 click / fill / type / press / extract / screenshot / close."
+      "doc": "browser_act(action, selector?, text?, key?, what?, path?) — click / fill / type / press / extract / screenshot / close."
     },
     {
       "name": "look_at_screen",
@@ -707,7 +707,7 @@
       },
       "exposed": true,
       "required": [],
-      "doc": "look_at_screen() \u2014 Capture the user's live screen now and attach it inline (vision). For 'this'/'here'/highlighted content questions; enables sharing if off."
+      "doc": "look_at_screen() — Capture the user's live screen now and attach it inline (vision). For 'this'/'here'/highlighted content questions; enables sharing if off."
     },
     {
       "name": "set_screen_share",
@@ -733,7 +733,7 @@
       "required": [
         "mode"
       ],
-      "doc": "set_screen_share(mode) \u2014 Live screen sharing: on / off / continuous (continuous refreshes every few seconds for near-real-time look_at_screen)."
+      "doc": "set_screen_share(mode) — Live screen sharing: on / off / continuous (continuous refreshes every few seconds for near-real-time look_at_screen)."
     },
     {
       "name": "update_feature",
@@ -793,7 +793,7 @@
     },
     {
       "name": "workspace",
-      "description": "Manage project workspaces (the folder registry in .deep_agents/workspaces.json). action=create makes a new folder under root, or registers an existing path, or clones a git repo with repo=; action=clone re-clones a registered workspace that is missing on this machine; action=list shows registered folders plus the virtual General/House/Personal/DFD workspaces; action=info looks one up by id, name, or path; action=remove unregisters it (files are never deleted, virtual workspaces cannot be removed). Results report the folder relative to the projects root, never an absolute path. Starting work stays in delegate / agent spawn / create_group \u2014 this tool never starts an agent or creates a chat.",
+      "description": "Manage project workspaces (the folder registry in .deep_agents/workspaces.json). action=create makes a new folder under root, or registers an existing path, or clones a git repo with repo=; action=clone re-clones a registered workspace that is missing on this machine; action=list shows registered folders plus the virtual General/House/Personal/DFD workspaces; action=info looks one up by id, name, or path; action=remove unregisters it (files are never deleted, virtual workspaces cannot be removed). Results report the folder relative to the projects root, never an absolute path. Starting work stays in delegate / agent spawn / create_group — this tool never starts an agent or creates a chat.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -810,7 +810,7 @@
           },
           "name": {
             "type": "string",
-            "description": "Folder name for action=create. 1-64 chars; filesystem-safe \u2014 avoid '/', '\\', '..', control characters, and leading dots. Use kebab-case or snake_case. Ignored unless creating by name."
+            "description": "Folder name for action=create. 1-64 chars; filesystem-safe — avoid '/', '\\', '..', control characters, and leading dots. Use kebab-case or snake_case. Ignored unless creating by name."
           },
           "root": {
             "type": "string",
@@ -845,11 +845,11 @@
       "required": [
         "action"
       ],
-      "doc": "workspace(action, name?, root?, path?, repo?, branch?, workspace_id?, query?) \u2014 Registry primitive: create (mkdir, register path, or git clone via repo), clone (re-clone a missing registered workspace from its stored repo), list, info, remove (unregister only, never deletes files). Dispatch stays in delegate / agent spawn / create_group."
+      "doc": "workspace(action, name?, root?, path?, repo?, branch?, workspace_id?, query?) — Registry primitive: create (mkdir, register path, or git clone via repo), clone (re-clone a missing registered workspace from its stored repo), list, info, remove (unregister only, never deletes files). Dispatch stays in delegate / agent spawn / create_group."
     },
     {
       "name": "personal_os",
-      "description": "Personal OS records for everyday life: money (expenses, income, monthly budgets), todos, food/calories, and training. Local-first JSON store at .deep_agents/personal_os.json \u2014 always use this tool, never edit that file directly. Actions: overview; money_add(amount, kind=expense|income, category, note, date); money_list(month, category, limit); money_summary(month); money_budget_set(amount, category, month); todo_add(text, due, priority=low|normal|high); todo_list(status=open|done|all); todo_done(id); todo_remove(id); food_log(calories, name, date); food_summary(date); training_log(activity, minutes, date, note); training_summary(days). Dates are YYYY-MM-DD, months YYYY-MM, amounts are decimal currency units. Bookkeeping only: this tool never moves money.",
+      "description": "Personal OS records for everyday life: money (expenses, income, monthly budgets), todos, food/calories, and training. Local-first JSON store at .deep_agents/personal_os.json — always use this tool, never edit that file directly. Actions: overview; money_add(amount, kind=expense|income, category, note, date); money_list(month, category, limit); money_summary(month); money_budget_set(amount, category, month); todo_add(text, due, priority=low|normal|high); todo_list(status=open|done|all); todo_done(id); todo_remove(id); food_log(calories, name, date); food_summary(date); training_log(activity, minutes, date, note); training_summary(days). Dates are YYYY-MM-DD, months YYYY-MM, amounts are decimal currency units. Bookkeeping only: this tool never moves money.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -963,11 +963,11 @@
       "required": [
         "action"
       ],
-      "doc": "personal_os(action, amount?, kind?, category?, note?, date?, month?, text?, due?, priority?, status?, id?, calories?, name?, activity?, minutes?, days?, limit?) \u2014 local-first money/todo/food/training records; bookkeeping only, never moves money."
+      "doc": "personal_os(action, amount?, kind?, category?, note?, date?, month?, text?, due?, priority?, status?, id?, calories?, name?, activity?, minutes?, days?, limit?) — local-first money/todo/food/training records; bookkeeping only, never moves money."
     },
     {
       "name": "update_plan",
-      "description": "Maintain the plan dock. Call when jobs change (spawn, progress, abort). FULL REPLACEMENT each call: send every step with its current status; at most one in_progress. Settled jobs use status=completed \u2014 put the reason in the step text when not successful. For small tweaks use ops instead of resending everything (mutually exclusive with plan): [{op, match?, step?, status?}] with op=add (needs step) | set_status (needs match+status) | rename (needs match+step) | remove (needs match); match is a case-insensitive substring of the step text.",
+      "description": "Maintain the plan dock. Call when jobs change (spawn, progress, abort). FULL REPLACEMENT each call: send every step with its current status; at most one in_progress. Settled jobs use status=completed — put the reason in the step text when not successful. For small tweaks use ops instead of resending everything (mutually exclusive with plan): [{op, match?, step?, status?}] with op=add (needs step) | set_status (needs match+status) | rename (needs match+step) | remove (needs match); match is a case-insensitive substring of the step text.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -1023,7 +1023,7 @@
                 "step": {
                   "type": "string",
                   "minLength": 1,
-                  "description": "Short, human-readable job description. For settled jobs, prefix the reason when not successful (e.g. 'Build snake game \u2014 failed: tests did not pass')."
+                  "description": "Short, human-readable job description. For settled jobs, prefix the reason when not successful (e.g. 'Build snake game — failed: tests did not pass')."
                 },
                 "status": {
                   "type": "string",
@@ -1046,11 +1046,11 @@
       },
       "exposed": true,
       "required": [],
-      "doc": "update_plan(explanation?, plan?, ops?) \u2014 Maintain the task plan. FULL replacement: always send every step (at most one in_progress), or patch small tweaks via ops=[{op: add|set_status|rename|remove, match?, step?, status?}] (mutually exclusive with plan)."
+      "doc": "update_plan(explanation?, plan?, ops?) — Maintain the task plan. FULL replacement: always send every step (at most one in_progress), or patch small tweaks via ops=[{op: add|set_status|rename|remove, match?, step?, status?}] (mutually exclusive with plan)."
     },
     {
       "name": "delegate",
-      "description": "Spawn one or more workspace agents (Developer / General / House) IN PARALLEL. Every item gets its own visible chat; final replies arrive as [DELEGATION RESULT] events while you keep coordinating.\n\nBRIEF \u2014 you define WHAT, never HOW. Each item carries outcome (what the user gets when it is done, in the user's terms) and acceptance (how success will be judged \u2014 observable evidence). Never prescribe libraries, frameworks, architecture, step lists, file-by-file plans, or design direction; the specialist is the pro and owns the method (it may deviate and must report deviations). Name a command in acceptance only if the user named it or it is the project's standard entry point; otherwise describe the behavior and let the specialist choose the proof. One or two lines each \u2014 if they get long, you are doing the specialist's job. Method reminders are added to the task automatically; do not write them yourself.\n\nBATCHING \u2014 per user turn: put EVERY independent job from the current request into a SINGLE delegate(items=[...]) call. Any agent mix is allowed and runs in parallel \u2014 solo scope (just Developer, just General, or just House) or mixed (Developer + General, Developer + House, all three). The sole batching criterion is independence. If job B needs job A's output, do NOT bundle B with A: delegate A first, wait for its [DELEGATION RESULT], then delegate B with A's result in the task. Never split a single request across multiple delegate calls for tidiness or sequencing \u2014 one call, all independent items.\n\nEFFORT \u2014 match effort to the request: one job for a simple ask, 2-4 for comparisons, more ONLY when directions are truly independent. Jobs beyond the parallel cap wait as 'queued' and start automatically \u2014 never flood the system.\n\nRESULTS \u2014 each job's final reply arrives as a [DELEGATION RESULT] summary (plus its artifact path and, when set, acceptance). Drill into the full report with delegation_status(id=...) when needed; never paste reports into your reply.\n\nCHAT CONTINUATION \u2014 chat_id is optional. Omit it for a new job (default). Set it ONLY when this item is a follow-up, correction, or bug on a chat you can identify from a prior [DELEGATION RESULT] in this session. If the chat_id you pass does not exist, the runtime silently starts a new chat \u2014 so never guess an id.\n\nRESUME \u2014 project continues a REGISTERED project's durable Dev session instead of starting a new chat. When the request is a follow-up, bug fix, or new work on an EXISTING project and you have no chat_id from a prior [DELEGATION RESULT] in this session, pass project=<name> (agent must be Dev or omitted) instead of workspace/chat_id. The message goes to the project's durable Dev in its own project chat \u2014 nothing new is created \u2014 and the completion arrives as a [DELEGATION RESULT] like any other job. Unknown names return [NOT FOUND] with the available names \u2014 never guess. Omit project for genuinely new work.",
+      "description": "Spawn one or more workspace agents (Developer / General / House) IN PARALLEL. Every item gets its own visible chat; final replies arrive as [DELEGATION RESULT] events while you keep coordinating.\n\nBRIEF — you define WHAT, never HOW. Each item carries outcome (what the user gets when it is done, in the user's terms) and acceptance (how success will be judged — observable evidence). Never prescribe libraries, frameworks, architecture, step lists, file-by-file plans, or design direction; the specialist is the pro and owns the method (it may deviate and must report deviations). Name a command in acceptance only if the user named it or it is the project's standard entry point; otherwise describe the behavior and let the specialist choose the proof. One or two lines each — if they get long, you are doing the specialist's job. Method reminders are added to the task automatically; do not write them yourself.\n\nBATCHING — per user turn: put EVERY independent job from the current request into a SINGLE delegate(items=[...]) call. Any agent mix is allowed and runs in parallel — solo scope (just Developer, just General, or just House) or mixed (Developer + General, Developer + House, all three). The sole batching criterion is independence. If job B needs job A's output, do NOT bundle B with A: delegate A first, wait for its [DELEGATION RESULT], then delegate B with A's result in the task. Never split a single request across multiple delegate calls for tidiness or sequencing — one call, all independent items.\n\nEFFORT — match effort to the request: one job for a simple ask, 2-4 for comparisons, more ONLY when directions are truly independent. Jobs beyond the parallel cap wait as 'queued' and start automatically — never flood the system.\n\nRESULTS — each job's final reply arrives as a [DELEGATION RESULT] summary (plus its artifact path and, when set, acceptance). Drill into the full report with delegation_status(id=...) when needed; never paste reports into your reply.\n\nCHAT CONTINUATION — chat_id is optional. Omit it for a new job (default). Set it ONLY when this item is a follow-up, correction, or bug on a chat you can identify from a prior [DELEGATION RESULT] in this session. If the chat_id you pass does not exist, the runtime silently starts a new chat — so never guess an id.\n\nRESUME — project continues a REGISTERED project's durable Dev session instead of starting a new chat. When the request is a follow-up, bug fix, or new work on an EXISTING project and you have no chat_id from a prior [DELEGATION RESULT] in this session, pass project=<name> (agent must be Dev or omitted) instead of workspace/chat_id. The message goes to the project's durable Dev in its own project chat — nothing new is created — and the completion arrives as a [DELEGATION RESULT] like any other job. Unknown names return [NOT FOUND] with the available names — never guess. Omit project for genuinely new work.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -1072,15 +1072,15 @@
                 },
                 "task": {
                   "type": "string",
-                  "description": "Complete, self-contained instruction: goal, relevant paths/targets, constraints. The agent sees only this text. Context, not method \u2014 do not prescribe step-by-step process (use outcome/acceptance for the WHAT)."
+                  "description": "Complete, self-contained instruction: goal, relevant paths/targets, constraints. The agent sees only this text. Context, not method — do not prescribe step-by-step process (use outcome/acceptance for the WHAT)."
                 },
                 "outcome": {
                   "type": "string",
-                  "description": "What the user gets when this job is done \u2014 the visible result, in the user's terms, 1-2 sentences. WHAT, never HOW: no libraries, frameworks, architecture, step lists, or design direction. Real paths the user named are fine as targets; invented ones are not."
+                  "description": "What the user gets when this job is done — the visible result, in the user's terms, 1-2 sentences. WHAT, never HOW: no libraries, frameworks, architecture, step lists, or design direction. Real paths the user named are fine as targets; invented ones are not."
                 },
                 "acceptance": {
                   "type": "string",
-                  "description": "How success will be judged \u2014 observable evidence (a behavior, a result, something that must exist or respond). Not internals. Name a command only if the user named it or it is the project's standard entry point. The specialist chooses how to meet and prove it."
+                  "description": "How success will be judged — observable evidence (a behavior, a result, something that must exist or respond). Not internals. Name a command only if the user named it or it is the project's standard entry point. The specialist chooses how to meet and prove it."
                 },
                 "timeout": {
                   "type": "integer",
@@ -1089,15 +1089,15 @@
                 },
                 "title": {
                   "type": "string",
-                  "description": "Short label for the delegation chat (e.g. 'Space game \u00b7 Dev')."
+                  "description": "Short label for the delegation chat (e.g. 'Space game · Dev')."
                 },
                 "chat_id": {
                   "type": "string",
-                  "description": "Omit for a new chat. Set ONLY with a chat_id surfaced by an earlier [DELEGATION RESULT] in this session \u2014 never guess. Unknown ids silently start a new chat."
+                  "description": "Omit for a new chat. Set ONLY with a chat_id surfaced by an earlier [DELEGATION RESULT] in this session — never guess. Unknown ids silently start a new chat."
                 },
                 "project": {
                   "type": "string",
-                  "description": "Registered project id or exact name (no fuzzy matching). Set this INSTEAD of workspace/chat_id to continue the project's durable Dev session in its own project chat \u2014 no new tab is created. Only with agent Dev (or omitted)."
+                  "description": "Registered project id or exact name (no fuzzy matching). Set this INSTEAD of workspace/chat_id to continue the project's durable Dev session in its own project chat — no new tab is created. Only with agent Dev (or omitted)."
                 },
                 "workspace": {
                   "type": "string",
@@ -1127,21 +1127,21 @@
                   {
                     "agent": "Dev",
                     "task": "Build a snake game in Python with tests",
-                    "title": "Snake game \u00b7 Dev",
+                    "title": "Snake game · Dev",
                     "outcome": "A playable snake game that starts with one command and keeps a high score.",
                     "acceptance": "The game starts and is playable; the project's test command passes."
                   },
                   {
                     "agent": "House",
                     "task": "Turn off the living room lights",
-                    "title": "Lights off \u00b7 House",
+                    "title": "Lights off · House",
                     "outcome": "Living room lights are off.",
                     "acceptance": "The living room light reports power=off."
                   },
                   {
                     "agent": "General",
                     "task": "Save a journal note: shipped v0.1",
-                    "title": "Note \u00b7 General",
+                    "title": "Note · General",
                     "outcome": "The note is saved in the journal.",
                     "acceptance": "Searching the journal for 'shipped v0.1' finds the note."
                   }
@@ -1180,11 +1180,11 @@
       "required": [
         "items"
       ],
-      "doc": "delegate(items=[{agent, task, outcome?, acceptance?, timeout?, title?, chat_id?, project?, workspace?, images?}]) \u2014 Spawn Developer/General/House agents; each gets its own chat (project=<name> continues a registered project's durable Dev in its own chat instead). outcome/acceptance define WHAT success is \u2014 never method. Results arrive as [DELEGATION RESULT] summaries + artifact paths; drill in with delegation_status(id)."
+      "doc": "delegate(items=[{agent, task, outcome?, acceptance?, timeout?, title?, chat_id?, project?, workspace?, images?}]) — Spawn Developer/General/House agents; each gets its own chat (project=<name> continues a registered project's durable Dev in its own chat instead). outcome/acceptance define WHAT success is — never method. Results arrive as [DELEGATION RESULT] summaries + artifact paths; drill in with delegation_status(id)."
     },
     {
       "name": "delegation_status",
-      "description": "Snapshot only \u2014 not a polling tool. Delegation results arrive automatically as [DELEGATION RESULT] events. Call once only when the user asks for status or after a wait/timeout, then stop. Pass id for one job's evidence; wait_seconds should stay 0 unless the user explicitly asks to wait.",
+      "description": "Snapshot only — not a polling tool. Delegation results arrive automatically as [DELEGATION RESULT] events. Call once only when the user asks for status or after a wait/timeout, then stop. Pass id for one job's evidence; wait_seconds should stay 0 unless the user explicitly asks to wait.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -1214,11 +1214,11 @@
       },
       "exposed": true,
       "required": [],
-      "doc": "delegation_status(id?, wait_seconds?, status?) \u2014 one snapshot of this session's delegations. Results are event-driven; never poll. wait_seconds is opt-in and defaults to 0."
+      "doc": "delegation_status(id?, wait_seconds?, status?) — one snapshot of this session's delegations. Results are event-driven; never poll. wait_seconds is opt-in and defaults to 0."
     },
     {
       "name": "job_message",
-      "description": "Steer a RUNNING delegation mid-flight when the user adds scope or changes direction. Fresh jobs: mirrored into the job chat + queued on its steering channel. Resume jobs: queued on the durable Dev child (FIFO). Only works while the job is running \u2014 otherwise delegate a follow-up. Never blocks.",
+      "description": "Steer a RUNNING delegation mid-flight when the user adds scope or changes direction. Fresh jobs: mirrored into the job chat + queued on its steering channel. Resume jobs: queued on the durable Dev child (FIFO). Only works while the job is running — otherwise delegate a follow-up. Never blocks.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -1241,7 +1241,7 @@
         "job_id",
         "message"
       ],
-      "doc": "job_message(job_id, message) \u2014 Steer a RUNNING delegation mid-flight (fresh: steering channel; resume: durable Dev FIFO). Running jobs only; never blocks."
+      "doc": "job_message(job_id, message) — Steer a RUNNING delegation mid-flight (fresh: steering channel; resume: durable Dev FIFO). Running jobs only; never blocks."
     },
     {
       "name": "job_cancel",
@@ -1266,7 +1266,7 @@
       "required": [
         "job_id"
       ],
-      "doc": "job_cancel(job_id, reason?) \u2014 Cancel ONE running delegation (fresh: abort; resume: interrupt). Reports back as [DELEGATION RESULT] CANCELLED."
+      "doc": "job_cancel(job_id, reason?) — Cancel ONE running delegation (fresh: abort; resume: interrupt). Reports back as [DELEGATION RESULT] CANCELLED."
     },
     {
       "name": "files_changed",
@@ -1297,7 +1297,7 @@
       },
       "exposed": true,
       "required": [],
-      "doc": "house_get_state() \u2014 Read the full house state: rooms, devices, scenes, energy, security. Call first for any house question."
+      "doc": "house_get_state() — Read the full house state: rooms, devices, scenes, energy, security. Call first for any house question."
     },
     {
       "name": "house_get_device",
@@ -1318,7 +1318,7 @@
       "required": [
         "device_id"
       ],
-      "doc": "house_get_device(device_id) \u2014 One device's state, capabilities, room, online status."
+      "doc": "house_get_device(device_id) — One device's state, capabilities, room, online status."
     },
     {
       "name": "house_set_device",
@@ -1345,7 +1345,7 @@
         "device_id",
         "state"
       ],
-      "doc": "house_set_device(device_id, state) \u2014 Actuate a device: light {power,brightness,colorTemp}, thermostat {targetTemp,mode}, lock {locked}, plug {power}, blinds {position}, camera {recording}. Sensors read-only."
+      "doc": "house_set_device(device_id, state) — Actuate a device: light {power,brightness,colorTemp}, thermostat {targetTemp,mode}, lock {locked}, plug {power}, blinds {position}, camera {recording}. Sensors read-only."
     },
     {
       "name": "house_run_scene",
@@ -1366,7 +1366,7 @@
       "required": [
         "scene_id"
       ],
-      "doc": "house_run_scene(scene_id) \u2014 Activate a scene (applies all actions at once)."
+      "doc": "house_run_scene(scene_id) — Activate a scene (applies all actions at once)."
     },
     {
       "name": "house_get_history",
@@ -1391,7 +1391,7 @@
       "required": [
         "device_id"
       ],
-      "doc": "house_get_history(device_id, hours?) \u2014 Mock hourly kWh usage series for a device (max 168h)."
+      "doc": "house_get_history(device_id, hours?) — Mock hourly kWh usage series for a device (max 168h)."
     },
     {
       "name": "dfd_bridge",
@@ -1436,7 +1436,7 @@
       },
       "exposed": true,
       "required": [],
-      "doc": "dfd_bridge(action?, id?, orderId?, payload?, path?, method?, url?, timeout?) \u2014 Call the DFD Agency API bridge (NON-MONEY): leads, orders, milestones, notes, activities, client requests, projects, articles, whatsapp. Named actions (lead_list, order_get, milestone_create, note_create, activity_create, request_update, project_update, article_create, whatsapp_send) or raw method+url."
+      "doc": "dfd_bridge(action?, id?, orderId?, payload?, path?, method?, url?, timeout?) — Call the DFD Agency API bridge (NON-MONEY): leads, orders, milestones, notes, activities, client requests, projects, articles, whatsapp. Named actions (lead_list, order_get, milestone_create, note_create, activity_create, request_update, project_update, article_create, whatsapp_send) or raw method+url."
     },
     {
       "name": "create_client",
@@ -1486,11 +1486,11 @@
         "business_name",
         "vertical"
       ],
-      "doc": "create_client(business_name, vertical, features?, whatsapp?, domain?, approved_by?, order_id?) \u2014 Create client scaffold under D:\\MyProject\\DFDClientProjects\\<slug>\\ (client.json + progress.md + mem/). REQUIRES explicit owner approval (approved_by)."
+      "doc": "create_client(business_name, vertical, features?, whatsapp?, domain?, approved_by?, order_id?) — Create client scaffold under D:\\MyProject\\DFDClientProjects\\<slug>\\ (client.json + progress.md + mem/). REQUIRES explicit owner approval (approved_by)."
     },
     {
       "name": "create_group",
-      "description": "Start a durable project that keeps working until it is done, across sessions and restarts, with its own folder, agents, tasks and board. Use when the goal is genuinely durable and multi-step. Do NOT use for a single self-contained request or for recurring work. Pass structured milestones and members \u2014 do not hand-write a manifest. Returns the project id and folder path; the effects are queued, so follow progress with group_board.",
+      "description": "Start a durable project that keeps working until done, across sessions and restarts, with its own folder, agents, tasks and board. Use when the goal is genuinely durable and multi-step. Pass structured milestones and members; omit milestones to let the orchestrator draft a plan when auto_plan is true. Returns the project id and work-folder path; follow progress with group_board.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -1500,21 +1500,21 @@
           },
           "milestones": {
             "type": "array",
-            "description": "Ordered phases. Each: {id, title, depends_on?, items:[{id, title, detail, acceptance:[...]}]}. Every item MUST have at least one acceptance criterion or it can never be completed.",
+            "description": "Ordered phases. Each: {title, detail?, depends_on?, items:[{title, detail?, acceptance:[...], owner?, priority?, requires_approval?}]}. Omit to let the orchestrator plan when auto_plan is true.",
             "items": {
               "type": "object"
             }
           },
           "members": {
             "type": "array",
-            "description": "Agents for this project. Each: {name, derived_from, model?, thinking?, tools?, skills?, mcp?}. Omit entirely for a single-agent project (the orchestrator does the work).",
+            "description": "Agents for the project. Each: {agent_key, display?, amount?}. amount creates that many independent slots (1-8). Omit for one Developer slot.",
             "items": {
               "type": "object"
             }
           },
           "autonomy": {
             "type": "object",
-            "description": "Permission envelope, enforced. project_folder / external_read / external_write / destructive: autonomous | needs_approval | blocked. Work inside the project folder is always free; anything outside follows external_write, and needs_approval means the member parks and waits for the owner rather than failing \u2014 tell the owner that an outside action will need their approval. Also run_command: never | blocked | autonomous \u2014 never (the default) removes the shell from every member's toolset entirely, while blocked offers it and refuses dangerous commands at runtime. Set run_command to blocked or autonomous only for projects that genuinely need builds or tests; a member holding a shell can reach outside the project folder."
+            "description": "Permission envelope, enforced. project_folder / external_read / external_write / destructive: autonomous | needs_approval | blocked. Work inside the project folder is always free; anything outside follows external_write, and needs_approval means the member parks and waits for the owner rather than failing — tell the owner that an outside action will need their approval. Also run_command: never | blocked | autonomous — never (the default) removes the shell from every member's toolset entirely, while blocked offers it and refuses dangerous commands at runtime. Set run_command to blocked or autonomous only for projects that genuinely need builds or tests; a member holding a shell can reach outside the project folder."
           },
           "completion": {
             "type": "object",
@@ -1557,11 +1557,11 @@
         "goal",
         "milestones"
       ],
-      "doc": "create_group(goal, milestones, members?, autonomy?, completion?, budget_usd?, deadline?, skills?, mcp?, project_id?) \u2014 Start a durable project that runs until done, across restarts. Create only when the goal is genuinely durable; the orchestrator decides with high reasoning. Every item needs acceptance criteria. Queued; follow with group_board."
+      "doc": "create_group(goal, milestones, members?, autonomy?, completion?, budget_usd?, deadline?, skills?, mcp?, project_id?) — Start a durable project that runs until done, across restarts. Create only when the goal is genuinely durable; the orchestrator decides with high reasoning. Every item needs acceptance criteria. Queued; follow with group_board."
     },
     {
       "name": "group_board",
-      "description": "Snapshot only \u2014 not a polling tool. Group progress is event-driven; call once when the user asks for status, or before a final summary, then stop.",
+      "description": "Snapshot only — not a polling tool. Group progress is event-driven; call once when the user asks for status, or before a final summary, then stop.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -1578,11 +1578,11 @@
       "required": [
         "project_id"
       ],
-      "doc": "group_board(project_id) \u2014 one snapshot of milestones, items, statuses, spend, and approvals. Do not poll."
+      "doc": "group_board(project_id) — one snapshot of milestones, items, statuses, spend, and approvals. Do not poll."
     },
     {
       "name": "group_item_detail",
-      "description": "Snapshot of one group item \u2014 not a polling tool. Call once when the user asks about it, then stop.",
+      "description": "Snapshot of one group item — not a polling tool. Call once when the user asks about it, then stop.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -1605,11 +1605,11 @@
         "item_id",
         "project_id"
       ],
-      "doc": "group_item_detail(project_id, item_id) \u2014 One item in full: attempts, latest result, and its acceptance criteria (why it passed or failed)."
+      "doc": "group_item_detail(project_id, item_id) — One item in full: attempts, latest result, and its acceptance criteria (why it passed or failed)."
     },
     {
       "name": "group_events",
-      "description": "Snapshot of the project event log \u2014 not a polling tool. Call once when the user asks what happened, then stop.",
+      "description": "Snapshot of the project event log — not a polling tool. Call once when the user asks what happened, then stop.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -1634,11 +1634,11 @@
       "required": [
         "project_id"
       ],
-      "doc": "group_events(project_id, since?, limit?) \u2014 one snapshot of the event log. Do not poll."
+      "doc": "group_events(project_id, since?, limit?) — one snapshot of the event log. Do not poll."
     },
     {
       "name": "group_update",
-      "description": "Change a RUNNING project. One op per call, applied by the supervisor on its next tick (~15s), writing exactly one event. ops: add_item, add_milestone, invalidate_item, cancel_item, add_member, remove_member, attach_tool, attach_mcp, detach_mcp, attach_skill, detach_skill, pause, resume, close. 'invalidate_item' means the PLAN was wrong \u2014 not that the work failed; it does not count as a retry. Use it when a member reports an assumption turned out to be false. Read the result back with group_board.",
+      "description": "Change a group project immediately. One op per call. ops: start, pause, stop, close, restart_cycle, add_milestone, update_milestone, delete_milestone, add_item, update_item, delete_item, retry_item, cancel_item, invalidate_item, reopen_item, complete_item, add_member, remove_member, set_settings, set_workspace, message, set_plan, approve_plan, set_planning, retry_plan. Plan approval and starts are applied on the next runner tick.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -1649,26 +1649,37 @@
           "op": {
             "type": "string",
             "enum": [
-              "add_item",
+              "start",
+              "pause",
+              "stop",
+              "close",
+              "restart_cycle",
               "add_milestone",
-              "invalidate_item",
+              "update_milestone",
+              "delete_milestone",
+              "add_item",
+              "update_item",
+              "delete_item",
+              "retry_item",
               "cancel_item",
+              "invalidate_item",
+              "reopen_item",
+              "complete_item",
               "add_member",
               "remove_member",
-              "attach_tool",
-              "attach_mcp",
-              "detach_mcp",
-              "attach_skill",
-              "detach_skill",
-              "pause",
-              "resume",
-              "close"
+              "set_settings",
+              "set_workspace",
+              "message",
+              "set_plan",
+              "approve_plan",
+              "set_planning",
+              "retry_plan"
             ],
             "description": "Which change to make."
           },
           "params": {
             "type": "object",
-            "description": "Op arguments: e.g. {item_id, reason} for invalidate_item; {milestone_id, title, detail, acceptance} for add_item; {name, derived_from} for add_member; {server} for attach_mcp."
+            "description": "Op arguments: {milestone_id,title,detail,status,due_at,acceptance} for milestones; {item_id,title,detail,status,owner_member_id,priority,due_at,requires_approval} for items; {agent_key,amount,display} for add_member; {member_id} for remove_member; {title,goal,workspace_path,recurrence,repeat_active,start_mode,start_at,max_parallel,plan_review,planner_agent} for set_settings; {body,to,kind} for message; {plan:{milestones:[...]}} for set_plan."
           }
         },
         "required": [
@@ -1681,7 +1692,7 @@
         "op",
         "project_id"
       ],
-      "doc": "group_update(project_id, op, params?) \u2014 Change a RUNNING project: add_item, add_milestone, invalidate_item, cancel_item, add_member, remove_member, attach_tool, attach_mcp, detach_mcp, attach_skill, detach_skill, pause, resume, close. One op per call; queued until the next supervisor tick (~15s). invalidate_item = the PLAN was wrong, not that work failed."
+      "doc": "group_update(project_id, op, params?) — change a group project immediately: lifecycle, milestones, items, members, schedule, messages, and plan approval. One op per call."
     },
     {
       "name": "schedule",
@@ -1723,7 +1734,7 @@
       },
       "exposed": true,
       "required": [],
-      "doc": "schedule(action?, name?, at?, prompt?, recurrence?, schedule_id?) \u2014 Create/list/cancel a time-triggered wake for this orchestrator chat. When due it appends a scheduled message and wakes the orchestrator. recurrence: none|daily|weekly|monthly|interval-<minutes>. No manual task UI."
+      "doc": "schedule(action?, name?, at?, prompt?, recurrence?, schedule_id?) — Create/list/cancel a time-triggered wake for this orchestrator chat. When due it appends a scheduled message and wakes the orchestrator. recurrence: none|daily|weekly|monthly|interval-<minutes>. No manual task UI."
     },
     {
       "name": "give_note",
@@ -1767,7 +1778,7 @@
       },
       "exposed": true,
       "required": [],
-      "doc": "give_note(action?, target?, title?, body?, todos?, note_id?) \u2014 Orchestrator-owned sticky note/checklist for chat:<id> or group:<id>. Actions create/update/remove/list. Notes are memory, not work items."
+      "doc": "give_note(action?, target?, title?, body?, todos?, note_id?) — Orchestrator-owned sticky note/checklist for chat:<id> or group:<id>. Actions create/update/remove/list. Notes are memory, not work items."
     },
     {
       "name": "canvas_mode",
@@ -1831,7 +1842,7 @@
       },
       "exposed": true,
       "required": [],
-      "doc": "canvas_mode(action?, mode?, targets?, wake_on?, max_actions?, until?, target?, message?) \u2014 Watch agent chats (single/multiple/all) and wake the orchestrator on completion/failure. available lists selectable chats/groups; read returns the work snapshot; message sends follow-up to a watched chat; exit stops watching."
+      "doc": "canvas_mode(action?, mode?, targets?, wake_on?, max_actions?, until?, target?, message?) — Watch agent chats (single/multiple/all) and wake the orchestrator on completion/failure. available lists selectable chats/groups; read returns the work snapshot; message sends follow-up to a watched chat; exit stops watching."
     },
     {
       "name": "execute",
@@ -1852,7 +1863,7 @@
       "required": [
         "code"
       ],
-      "doc": "execute(code) \u2014 Run a confined JavaScript program that calls Stark tools. Use await tools.<name>({...}); return one compact value."
+      "doc": "execute(code) — Run a confined JavaScript program that calls Stark tools. Use await tools.<name>({...}); return one compact value."
     },
     {
       "name": "agent",
@@ -1928,7 +1939,7 @@
       "required": [
         "action"
       ],
-      "doc": "agent(action, kind?, agent?, task?, title?, workspace_id?, workspace_path?, agent_id?, message?, quiet?, wait_seconds?) \u2014 Durable spawn/list/status/send/report for orchestrator \u2192 workspace \u2192 subagent."
+      "doc": "agent(action, kind?, agent?, task?, title?, workspace_id?, workspace_path?, agent_id?, message?, quiet?, wait_seconds?) — Durable spawn/list/status/send/report for orchestrator → workspace → subagent."
     },
     {
       "name": "memory",
@@ -1999,7 +2010,7 @@
       },
       "exposed": true,
       "required": [],
-      "doc": "memory(action?, topic?, query?, text?, kind?, entry_id?, pinned?) \u2014 Read/search durable workspace memory or add/forget/pin notes."
+      "doc": "memory(action?, topic?, query?, text?, kind?, entry_id?, pinned?) — Read/search durable workspace memory or add/forget/pin notes."
     },
     {
       "name": "tool_search",

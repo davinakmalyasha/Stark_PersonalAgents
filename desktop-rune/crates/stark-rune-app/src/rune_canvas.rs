@@ -6013,6 +6013,7 @@ mod tests {
             done: 3,
             total: 4,
             waiting: 1,
+            ..Default::default()
         }];
         init.projects.auto = false;
         // Close chat-2 so the Chats tab has exactly one row.

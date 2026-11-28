@@ -6,6 +6,7 @@ pub mod data;
 pub mod modal;
 pub mod notes;
 pub mod rail;
+pub mod settings;
 pub mod ui;
 
 use std::sync::mpsc::Receiver;
@@ -18,7 +19,7 @@ pub enum RailTab {
     #[default]
     Board,
     Team,
-    Details,
+    Activity,
 }
 
 /// The composer's target/mention menu (`GroupProjectChat.tsx`).
@@ -58,6 +59,8 @@ pub struct GroupState {
     pub rail_tab: RailTab,
     /// Board item expanded in the rail (`GroupProjectBoard` local state).
     pub board_open: Option<String>,
+    /// Expanded item inside the board (separate from the open milestone).
+    pub item_open: Option<String>,
     /// Details activity list open.
     pub show_activity: bool,
     pub filter: String,
@@ -68,6 +71,20 @@ pub struct GroupState {
     pub draft: rune::TextEdit,
     pub sending: bool,
     pub send_error: Option<String>,
+    pub settings: settings::GroupSettingsState,
+    pub activity_filter: String,
+    pub show_past_cycles: bool,
+    pub new_milestone: rune::TextEdit,
+    pub new_milestone_open: bool,
+    pub new_item: rune::TextEdit,
+    pub new_item_milestone: Option<String>,
+    pub item_drafts: std::collections::HashMap<String, rune::TextEdit>,
+    pub editing_title: Option<String>,
+    pub status_busy: Option<String>,
+    pub selected_run: Option<crate::group::data::GroupRun>,
+    pub trash_busy: bool,
+    pub trash_inbox: Option<Receiver<Result<(), String>>>,
+    pub pending_settings: bool,
     pub notes: crate::notes::NotesState,
     last_ok: f64,
     last_try: f64,
@@ -103,6 +120,7 @@ impl Clone for GroupState {
             show_rail: self.show_rail,
             rail_tab: self.rail_tab,
             board_open: self.board_open.clone(),
+            item_open: self.item_open.clone(),
             show_activity: self.show_activity,
             filter: self.filter.clone(),
             target: self.target.clone(),
@@ -111,6 +129,20 @@ impl Clone for GroupState {
             draft: self.draft.clone(),
             sending: self.sending,
             send_error: self.send_error.clone(),
+            settings: self.settings.clone(),
+            activity_filter: self.activity_filter.clone(),
+            show_past_cycles: self.show_past_cycles,
+            new_milestone: self.new_milestone.clone(),
+            new_milestone_open: self.new_milestone_open,
+            new_item: self.new_item.clone(),
+            new_item_milestone: self.new_item_milestone.clone(),
+            item_drafts: self.item_drafts.clone(),
+            editing_title: self.editing_title.clone(),
+            status_busy: self.status_busy.clone(),
+            selected_run: self.selected_run.clone(),
+            trash_busy: self.trash_busy,
+            trash_inbox: None,
+            pending_settings: self.pending_settings,
             notes: self.notes.clone(),
             last_ok: self.last_ok,
             last_try: self.last_try,
@@ -137,7 +169,8 @@ impl Default for GroupState {
             show_rail: false,
             rail_tab: RailTab::Board,
             board_open: None,
-            show_activity: false,
+            item_open: None,
+            show_activity: true,
             filter: "everyone".to_string(),
             target: "all".to_string(),
             menu: Menu::None,
@@ -145,6 +178,20 @@ impl Default for GroupState {
             draft: rune::TextEdit::new(""),
             sending: false,
             send_error: None,
+            settings: settings::GroupSettingsState::default(),
+            activity_filter: "all".to_string(),
+            show_past_cycles: false,
+            new_milestone: rune::TextEdit::new(""),
+            new_milestone_open: false,
+            new_item: rune::TextEdit::new(""),
+            new_item_milestone: None,
+            item_drafts: std::collections::HashMap::new(),
+            editing_title: None,
+            status_busy: None,
+            selected_run: None,
+            trash_busy: false,
+            trash_inbox: None,
+            pending_settings: false,
             notes: crate::notes::NotesState::default(),
             last_ok: 0.0,
             last_try: 0.0,
@@ -177,7 +224,8 @@ impl GroupState {
         self.rail_tab = RailTab::Board;
         self.filter = "everyone".to_string();
         self.board_open = None;
-        self.show_activity = false;
+        self.item_open = None;
+        self.show_activity = true;
         self.target = "all".to_string();
         self.menu = Menu::None;
         self.expanded.clear();
@@ -185,7 +233,28 @@ impl GroupState {
         self.send_error = None;
         self.notes.host = self.host.clone();
         self.notes.port = port;
+        self.settings = settings::GroupSettingsState::default();
+        self.activity_filter = "all".to_string();
+        self.show_past_cycles = false;
+        self.new_milestone_open = false;
+        self.new_milestone.text.clear();
+        self.new_item.text.clear();
+        self.new_item_milestone = None;
+        self.item_drafts.clear();
+        self.editing_title = None;
+        self.status_busy = None;
+        self.selected_run = None;
+        self.trash_busy = false;
+        self.trash_inbox = None;
+        self.pending_settings = false;
         self.spawn_detail(id, false);
+    }
+
+    /// Open a project directly on its settings sheet. Used by the sidebar's
+    /// Edit action; the sheet waits for the first detail snapshot.
+    pub fn open_with_settings(&mut self, host: String, port: u16, id: String) {
+        self.open(host, port, id);
+        self.pending_settings = true;
     }
 
     pub fn close(&mut self) {
@@ -203,6 +272,8 @@ impl GroupState {
         self.send_error = None;
         self.inbox = None;
         self.notes.open = false;
+        self.settings.open = false;
+        self.selected_run = None;
     }
 
     fn spawn_detail(&mut self, id: String, action: bool) {
@@ -231,6 +302,27 @@ impl GroupState {
 
     /// Drain one snapshotted request and keep the 3 s detail poll alive.
     pub fn poll(&mut self, clock: f64) -> bool {
+        if let Some(rx) = self.trash_inbox.take() {
+            match rx.try_recv() {
+                Ok(Ok(())) => {
+                    self.trash_busy = false;
+                    self.close();
+                    return true;
+                }
+                Ok(Err(error)) => {
+                    self.trash_busy = false;
+                    self.action_error = Some(error);
+                    return true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.trash_inbox = Some(rx);
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.trash_busy = false;
+                    self.action_error = Some("Could not move the project to Trash.".to_string());
+                }
+            }
+        }
         let Some(rx) = self.inbox.take() else {
             if self.open_id.is_some()
                 && clock - self.last_ok >= 3.0
@@ -253,6 +345,10 @@ impl GroupState {
                 match msg.detail {
                     Ok(detail) => {
                         self.detail = Some(detail);
+                        if self.pending_settings {
+                            self.pending_settings = false;
+                            crate::group::settings::open(self);
+                        }
                         self.error = None;
                         self.action_error = None;
                         self.last_ok = clock;
@@ -339,6 +435,10 @@ impl GroupState {
     }
 
     pub fn op(&mut self, op: &str) {
+        self.op_with(op, serde_json::json!({}));
+    }
+
+    pub fn op_with(&mut self, op: &str, params: serde_json::Value) {
         let Some(id) = self.open_id.clone() else {
             return;
         };
@@ -347,7 +447,7 @@ impl GroupState {
         self.queued = None;
         #[cfg(not(target_arch = "wasm32"))]
         let (host, port) = (self.host.clone(), self.port);
-        let body = serde_json::json!({ "op": op, "params": {} });
+        let body = serde_json::json!({ "op": op, "params": params });
         let path = format!("/api/groups/{id}/update");
         let id_for_fetch = id.clone();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -446,6 +546,83 @@ impl GroupState {
                 detail: result,
                 action: true,
             });
+        });
+    }
+
+    pub fn stop(&mut self) {
+        self.op("stop");
+    }
+
+    pub fn approve_plan(&mut self) {
+        let Some(id) = self.open_id.clone() else {
+            return;
+        };
+        self.op_busy = Some("approve_plan".to_string());
+        self.action_error = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.inbox = Some(rx);
+        #[cfg(not(target_arch = "wasm32"))]
+        let (host, port) = (self.host.clone(), self.port);
+        let path = format!("/api/groups/{id}/approve-plan");
+        #[cfg(target_arch = "wasm32")]
+        {
+            wasm_bindgen_futures::spawn_local(async move {
+                let result =
+                    match crate::transport::fetch_send("POST", &path, Some(&serde_json::json!({})))
+                        .await
+                    {
+                        Ok(_) => fetch_detail_wasm(&id).await,
+                        Err(e) => Err(e),
+                    };
+                let _ = tx.send(GroupMsg {
+                    detail: result,
+                    action: true,
+                });
+            });
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        std::thread::spawn(move || {
+            let result =
+                crate::transport::send_json(&host, port, "POST", &path, &serde_json::json!({}))
+                    .map(|_| ())
+                    .and_then(|()| fetch_detail(&host, port, &id));
+            let _ = tx.send(GroupMsg {
+                detail: result,
+                action: true,
+            });
+        });
+    }
+
+    pub fn trash_project(&mut self) {
+        let Some(id) = self.open_id.clone() else {
+            return;
+        };
+        if self.trash_busy {
+            return;
+        }
+        self.trash_busy = true;
+        self.action_error = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.trash_inbox = Some(rx);
+        #[cfg(not(target_arch = "wasm32"))]
+        let (host, port) = (self.host.clone(), self.port);
+        let path = format!("/api/groups/{id}");
+        #[cfg(target_arch = "wasm32")]
+        {
+            wasm_bindgen_futures::spawn_local(async move {
+                let result = match crate::transport::fetch_send("DELETE", &path, None).await {
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(e),
+                };
+                let _ = tx.send(result);
+            });
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        std::thread::spawn(move || {
+            let result =
+                crate::transport::send_json(&host, port, "DELETE", &path, &serde_json::json!({}))
+                    .map(|_| ());
+            let _ = tx.send(result);
         });
     }
 

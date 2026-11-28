@@ -3,10 +3,8 @@
 use crate::keys::EnterPress;
 use rune::{col, row, text, El};
 
-use super::data::{GroupDetail, GroupItem, GroupMember};
-use super::ui::{
-    active_item_for, avatar, display_actor, event_label, money, status_chip, time_ago,
-};
+use super::data::{GroupDetail, GroupItem, GroupMilestone};
+use super::ui::{avatar, display_actor, event_label, money, status_chip, time_ago};
 use super::{GroupState, RailTab};
 use crate::projects::ProjectsHost;
 
@@ -361,7 +359,7 @@ fn tabs<S: ProjectsHost + 'static>(g: &GroupState, team: usize) -> El {
     for (tab, label) in [
         (RailTab::Board, "Board".to_string()),
         (RailTab::Team, format!("Team {team}")),
-        (RailTab::Details, "Details".to_string()),
+        (RailTab::Activity, "Activity".to_string()),
     ] {
         let active = g.rail_tab == tab;
         row = row.child(
@@ -371,7 +369,7 @@ fn tabs<S: ProjectsHost + 'static>(g: &GroupState, team: usize) -> El {
                     match tab {
                         RailTab::Board => "board",
                         RailTab::Team => "team",
-                        RailTab::Details => "details",
+                        RailTab::Activity => "activity",
                     }
                 ))
                 .grow(1.0)
@@ -393,7 +391,7 @@ fn tabs<S: ProjectsHost + 'static>(g: &GroupState, team: usize) -> El {
                 .label(match tab {
                     RailTab::Board => "Board",
                     RailTab::Team => "Team",
-                    RailTab::Details => "Details",
+                    RailTab::Activity => "Activity",
                 })
                 .focusable(true)
                 .focus_selected(active)
@@ -406,21 +404,219 @@ fn tabs<S: ProjectsHost + 'static>(g: &GroupState, team: usize) -> El {
     row
 }
 
-fn board<S: ProjectsHost + 'static>(g: &GroupState, detail: &GroupDetail) -> El {
-    if detail.milestones.is_empty() {
-        return text("No milestones yet.".to_string())
-            .padding(10.0)
-            .font(rune::tok::TextStyle::new(10.0, 400.0))
-            .color(ink("#52525b"));
+fn status_controls<S: ProjectsHost + 'static>(milestone: &GroupMilestone) -> El {
+    let mut row = row().w_full().gap(3.0).pt(2.0);
+    for (status, label) in [
+        ("todo", "New"),
+        ("active", "Ongoing"),
+        ("done", "Done"),
+        ("blocked", "Blocked"),
+    ] {
+        let active =
+            milestone.status == status || (status == "todo" && milestone.status == "pending");
+        let id = milestone.id.clone();
+        let next = status.to_string();
+        row = row.child(
+            text(label.to_string())
+                .key(format!("gp-ms-{}-status-{status}", milestone.id))
+                .px(6.0)
+                .py(2.0)
+                .radius(4.0)
+                .font(rune::tok::TextStyle::new(8.5, 600.0))
+                .color(if active {
+                    ink("#0a0a0d")
+                } else {
+                    ink("#71717a")
+                })
+                .fill(if active {
+                    ink("#e4e4e7")
+                } else {
+                    rgba(255.0, 255.0, 255.0, 0.05)
+                })
+                .role("button")
+                .label(format!("Set {} {label}", milestone.title))
+                .focusable(true)
+                .on_press_enter(move |s: &mut S| {
+                    s.projects_mut().group.op_with(
+                        "update_milestone",
+                        serde_json::json!({"milestone_id": id, "status": next}),
+                    );
+                }),
+        );
     }
+    row
+}
+
+fn item_action<S: ProjectsHost + 'static>(key: &str, label: &str, op: &str, item_id: &str) -> El {
+    let op = op.to_string();
+    let id = item_id.to_string();
+    text(label.to_string())
+        .key(key.to_string())
+        .px(6.0)
+        .py(2.0)
+        .radius(4.0)
+        .font(rune::tok::TextStyle::new(8.5, 600.0))
+        .color(ink("#a1a1aa"))
+        .fill(rgba(255.0, 255.0, 255.0, 0.045))
+        .role("button")
+        .focusable(true)
+        .on_press_enter(move |s: &mut S| {
+            let g = &mut s.projects_mut().group;
+            if op == "delete_item" {
+                let key = format!("delete-item-{id}");
+                if g.status_busy.as_deref() == Some(key.as_str()) {
+                    g.status_busy = None;
+                    g.op_with("delete_item", serde_json::json!({"item_id": id}));
+                } else {
+                    g.status_busy = Some(key);
+                }
+            } else {
+                g.op_with(&op, serde_json::json!({"item_id": id}));
+            }
+        })
+}
+
+fn add_item_row<S: ProjectsHost + 'static>(g: &GroupState, milestone_id: &str) -> El {
+    let id = milestone_id.to_string();
+    row()
+        .w_full()
+        .gap(5.0)
+        .pt(2.0)
+        .child(
+            rune::text_input(&g.new_item, rune::tok::TextStyle::new(10.0, 400.0))
+                .key(format!("gp-new-item-{milestone_id}"))
+                .single_line()
+                .grow(1.0)
+                .radius(6.0)
+                .px(7.0)
+                .py(4.0)
+                .fill(ink("#00000066"))
+                .border(1.0, ink("#ffffff14"))
+                .border_layout()
+                .placeholder("New item", ink("#52525b"))
+                .on_edit(|s: &mut S| &mut s.projects_mut().group.new_item)
+                .on_submit(move |s: &mut S, _tx: &mut rune::Tx| {
+                    add_item_from_draft(s, &id);
+                }),
+        )
+        .child(
+            text("Add".to_string())
+                .px(7.0)
+                .py(4.0)
+                .radius(5.0)
+                .fill(ink("#ffffff"))
+                .font(rune::tok::TextStyle::new(9.0, 700.0))
+                .color(ink("#0a0a0d"))
+                .role("button")
+                .focusable(true)
+                .on_press_enter({
+                    let id = milestone_id.to_string();
+                    move |s: &mut S| add_item_from_draft(s, &id)
+                }),
+        )
+}
+
+fn add_item_from_draft<S: ProjectsHost + 'static>(s: &mut S, milestone_id: &str) {
+    let g = &mut s.projects_mut().group;
+    let title = g.new_item.text.trim().to_string();
+    if title.is_empty() {
+        return;
+    }
+    g.op_with(
+        "add_item",
+        serde_json::json!({
+            "milestone_id": milestone_id,
+            "title": title,
+            "acceptance": ["The deliverable is complete and summarized"]
+        }),
+    );
+    g.new_item.text.clear();
+    g.new_item_milestone = None;
+}
+
+fn board<S: ProjectsHost + 'static>(g: &GroupState, detail: &GroupDetail) -> El {
     let mut out = col().key("gp-board").w_full().gap(10.0);
-    for milestone in &detail.milestones {
-        let mine: Vec<&GroupItem> = detail
-            .items
-            .iter()
-            .filter(|i| i.milestone_id.as_deref() == Some(milestone.id.as_str()))
-            .collect();
+    let mut add = row().w_full().items_center().gap(5.0);
+    if g.new_milestone_open {
+        add = add
+            .child(
+                rune::text_input(&g.new_milestone, rune::tok::TextStyle::new(10.5, 400.0))
+                    .key("gp-new-milestone")
+                    .single_line()
+                    .grow(1.0)
+                    .radius(7.0)
+                    .px(8.0)
+                    .py(5.0)
+                    .fill(ink("#00000066"))
+                    .border(1.0, ink("#ffffff14"))
+                    .border_layout()
+                    .placeholder("Milestone title", ink("#52525b"))
+                    .caret(ink("#e4e4e7"), crate::motion::TEXT_SELECTION)
+                    .on_edit(|s: &mut S| &mut s.projects_mut().group.new_milestone)
+                    .on_submit(|s: &mut S, _tx: &mut rune::Tx| {
+                        let g = &mut s.projects_mut().group;
+                        let title = g.new_milestone.text.trim().to_string();
+                        if !title.is_empty() {
+                            g.op_with("add_milestone", serde_json::json!({"title": title}));
+                            g.new_milestone.text.clear();
+                            g.new_milestone_open = false;
+                        }
+                    }),
+            )
+            .child(
+                text("Add".to_string())
+                    .px(8.0)
+                    .py(5.0)
+                    .radius(6.0)
+                    .fill(ink("#ffffff"))
+                    .font(rune::tok::TextStyle::new(9.5, 700.0))
+                    .color(ink("#0a0a0d"))
+                    .role("button")
+                    .focusable(true)
+                    .on_press_enter(|s: &mut S| {
+                        let g = &mut s.projects_mut().group;
+                        let title = g.new_milestone.text.trim().to_string();
+                        if !title.is_empty() {
+                            g.op_with("add_milestone", serde_json::json!({"title": title}));
+                            g.new_milestone.text.clear();
+                            g.new_milestone_open = false;
+                        }
+                    }),
+            );
+    } else {
+        add = add.child(rune::el().grow(1.0)).child(
+            text("+ Milestone".to_string())
+                .key("gp-add-milestone")
+                .px(8.0)
+                .py(4.0)
+                .radius(6.0)
+                .fill(rgba(255.0, 255.0, 255.0, 0.06))
+                .font(rune::tok::TextStyle::new(9.5, 600.0))
+                .color(ink("#d4d4d8"))
+                .role("button")
+                .focusable(true)
+                .on_press_enter(|s: &mut S| {
+                    s.projects_mut().group.new_milestone_open = true;
+                }),
+        );
+    }
+    out = out.child(add);
+    if detail.milestones.is_empty() {
+        out = out.child(
+            text("No milestones yet. Add one or ask the orchestrator to plan.".to_string())
+                .padding(10.0)
+                .font(rune::tok::TextStyle::new(10.0, 400.0))
+                .color(ink("#52525b")),
+        );
+    }
+    let current: Vec<&GroupMilestone> = detail.current_milestones().collect();
+    for milestone in current {
+        let open = g.board_open.as_deref() == Some(milestone.id.as_str());
+        let mine = detail.items_for(&milestone.id);
+        let done = mine.iter().filter(|item| item.status == "done").count();
+        let total = mine.len();
         let mut section = col()
+            .key(format!("gp-ms-{}", milestone.id))
             .w_full()
             .radius(9.0)
             .border(1.0, rgba(255.0, 255.0, 255.0, 0.065))
@@ -428,10 +624,25 @@ fn board<S: ProjectsHost + 'static>(g: &GroupState, detail: &GroupDetail) -> El 
             .fill(rgba(255.0, 255.0, 255.0, 0.014))
             .child(
                 row()
+                    .key(format!("gp-ms-{}-head", milestone.id))
                     .w_full()
                     .items_center()
                     .gap(5.0)
                     .padding(8.0)
+                    .role("button")
+                    .focusable(true)
+                    .hover(rgba(255.0, 255.0, 255.0, 0.04))
+                    .on_press_enter({
+                        let id = milestone.id.clone();
+                        move |s: &mut S| {
+                            let g = &mut s.projects_mut().group;
+                            g.board_open = if g.board_open.as_deref() == Some(id.as_str()) {
+                                None
+                            } else {
+                                Some(id.clone())
+                            };
+                        }
+                    })
                     .child(icon(
                         12.0,
                         crate::icons::chevron_right(12.0, ink("#52525b")),
@@ -444,107 +655,235 @@ fn board<S: ProjectsHost + 'static>(g: &GroupState, detail: &GroupDetail) -> El 
                             .font(rune::tok::TextStyle::new(11.0, 600.0))
                             .color(ink("#d4d4d8")),
                     )
+                    .child(
+                        text(format!("{done}/{total}"))
+                            .font(rune::tok::TextStyle::new(8.5, 500.0).mono())
+                            .color(ink("#71717a")),
+                    )
                     .child(status_chip(&milestone.status, false)),
             );
-        let mut items = col().w_full().gap(3.0).px(6.0).pb(7.0);
-        if mine.is_empty() {
-            items = items.child(
-                text("No items yet.".to_string())
-                    .padding(8.0)
-                    .font(rune::tok::TextStyle::new(10.0, 400.0))
-                    .color(ink("#52525b")),
-            );
-        }
-        for item in mine {
-            let open = g.board_open.as_deref() == Some(item.id.as_str());
-            let id = item.id.clone();
-            let awaiting = item.awaiting_approval();
-            items = items.child(
-                col()
+        if open {
+            let mut body = col()
+                .w_full()
+                .gap(6.0)
+                .px(8.0)
+                .pb(8.0)
+                .border_sides([0.0, 1.0, 0.0, 0.0], rgba(255.0, 255.0, 255.0, 0.055))
+                .border_layout();
+            if !milestone.detail.is_empty() {
+                body = body.child(
+                    text(milestone.detail.clone())
+                        .w_full()
+                        .wrap()
+                        .font(rune::tok::TextStyle::new(9.5, 400.0))
+                        .color(ink("#a1a1aa")),
+                );
+            }
+            body = body.child(status_controls::<S>(milestone));
+            let item_id = milestone.id.clone();
+            body = body.child(
+                row()
                     .w_full()
-                    .radius(6.0)
-                    .border_layout()
-                    .fill(rgba(255.0, 255.0, 255.0, 0.022))
+                    .items_center()
+                    .gap(5.0)
                     .child(
-                        row()
-                            .key(format!("gp-board-item-{}", item.id))
-                            .w_full()
-                            .items_center()
-                            .gap(6.0)
-                            .min_h(30.0)
-                            .px(7.0)
-                            .py(4.0)
+                        text("+ Item".to_string())
+                            .px(6.0)
+                            .py(2.0)
+                            .radius(4.0)
+                            .font(rune::tok::TextStyle::new(8.5, 600.0))
+                            .color(ink("#c4c4c8"))
+                            .fill(rgba(255.0, 255.0, 255.0, 0.05))
                             .role("button")
-                            .label(format!("{} details", item.title))
                             .focusable(true)
-                            .focus_ring(2.0, 2.0, rgba(255.0, 255.0, 255.0, 0.55))
-                            .hover(rgba(255.0, 255.0, 255.0, 0.04))
                             .on_press_enter(move |s: &mut S| {
                                 let g = &mut s.projects_mut().group;
-                                g.board_open = if g.board_open.as_deref() == Some(id.as_str()) {
-                                    None
-                                } else {
-                                    Some(id.clone())
-                                };
-                            })
-                            .child(
-                                text(item.id.clone())
-                                    .w(36.0)
-                                    .truncate()
-                                    .font(rune::tok::TextStyle::new(9.0, 400.0).mono())
-                                    .color(ink("#52525b")),
-                            )
-                            .child(
-                                text(item.title.clone())
-                                    .grow(1.0)
-                                    .min_w(0.0)
-                                    .truncate()
-                                    .font(rune::tok::TextStyle::new(10.5, 400.0))
-                                    .color(ink("#c4c4c8")),
-                            )
-                            .child(if let Some(owner) = &item.lease_owner {
-                                text(display_actor(owner))
-                                    .font(rune::tok::TextStyle::new(9.0, 400.0))
-                                    .color(ink("#71717a"))
-                            } else {
-                                rune::el().size(0.0, 0.0).inert()
-                            })
-                            .child(status_chip(&item.status, awaiting)),
+                                g.new_item_milestone = Some(item_id.clone());
+                                g.new_item.text.clear();
+                            }),
                     )
-                    .child(if open {
-                        item_detail(item)
-                    } else {
-                        rune::el().size(0.0, 0.0).inert()
-                    }),
+                    .child(rune::el().grow(1.0))
+                    .child(
+                        text("Delete".to_string())
+                            .px(6.0)
+                            .py(2.0)
+                            .radius(4.0)
+                            .font(rune::tok::TextStyle::new(8.5, 600.0))
+                            .color(ink("#fda4af"))
+                            .role("button")
+                            .focusable(true)
+                            .on_press_enter({
+                                let id = milestone.id.clone();
+                                move |s: &mut S| {
+                                    let g = &mut s.projects_mut().group;
+                                    let key = format!("delete-ms-{id}");
+                                    if g.status_busy.as_deref() == Some(key.as_str()) {
+                                        g.status_busy = None;
+                                        g.op_with(
+                                            "delete_milestone",
+                                            serde_json::json!({"milestone_id": id}),
+                                        );
+                                    } else {
+                                        g.status_busy = Some(key);
+                                    }
+                                }
+                            }),
+                    ),
+            );
+            if g.new_item_milestone.as_deref() == Some(milestone.id.as_str()) {
+                body = body.child(add_item_row::<S>(g, &milestone.id));
+            }
+            let mut items = col().w_full().gap(3.0);
+            if mine.is_empty() {
+                items = items.child(
+                    text("No items yet.".to_string())
+                        .padding(6.0)
+                        .font(rune::tok::TextStyle::new(9.5, 400.0))
+                        .color(ink("#52525b")),
+                );
+            }
+            for item in mine {
+                let open_item = g.item_open.as_deref() == Some(item.id.as_str());
+                let item_id = item.id.clone();
+                let awaiting = item.awaiting_approval();
+                items = items.child(
+                    col()
+                        .w_full()
+                        .radius(6.0)
+                        .border_layout()
+                        .fill(rgba(255.0, 255.0, 255.0, 0.022))
+                        .child(
+                            row()
+                                .key(format!("gp-board-item-{}", item.id))
+                                .w_full()
+                                .items_center()
+                                .gap(6.0)
+                                .min_h(30.0)
+                                .px(7.0)
+                                .py(4.0)
+                                .role("button")
+                                .label(format!("{} details", item.title))
+                                .focusable(true)
+                                .hover(rgba(255.0, 255.0, 255.0, 0.04))
+                                .on_press_enter(move |s: &mut S| {
+                                    let g = &mut s.projects_mut().group;
+                                    g.item_open =
+                                        if g.item_open.as_deref() == Some(item_id.as_str()) {
+                                            None
+                                        } else {
+                                            Some(item_id.clone())
+                                        };
+                                })
+                                .child(
+                                    text(item.id.clone())
+                                        .w(36.0)
+                                        .truncate()
+                                        .font(rune::tok::TextStyle::new(8.5, 400.0).mono())
+                                        .color(ink("#52525b")),
+                                )
+                                .child(
+                                    text(item.title.clone())
+                                        .grow(1.0)
+                                        .min_w(0.0)
+                                        .truncate()
+                                        .font(rune::tok::TextStyle::new(10.0, 450.0))
+                                        .color(ink("#c4c4c8")),
+                                )
+                                .child(if !item.owner_label().is_empty() {
+                                    text(item.owner_label())
+                                        .font(rune::tok::TextStyle::new(8.5, 400.0))
+                                        .color(ink("#71717a"))
+                                } else {
+                                    rune::el().size(0.0, 0.0).inert()
+                                })
+                                .child(status_chip(&item.status, awaiting)),
+                        )
+                        .child(if open_item {
+                            item_detail::<S>(item)
+                        } else {
+                            rune::el().size(0.0, 0.0).inert()
+                        }),
+                );
+            }
+            body = body.child(items);
+            section = section.child(body);
+        }
+        out = out.child(section);
+    }
+    let history: Vec<&GroupMilestone> = detail
+        .milestones
+        .iter()
+        .filter(|milestone| milestone.cycle < detail.current_cycle)
+        .collect();
+    if !history.is_empty() {
+        let mut past = col().w_full().gap(3.0);
+        past = past.child(
+            text("PAST CYCLES".to_string())
+                .font(rune::tok::TextStyle::new(8.5, 700.0))
+                .color(ink("#52525b")),
+        );
+        for milestone in history.iter().rev().take(20) {
+            past = past.child(
+                row()
+                    .w_full()
+                    .items_center()
+                    .gap(6.0)
+                    .px(7.0)
+                    .py(3.0)
+                    .radius(5.0)
+                    .fill(rgba(255.0, 255.0, 255.0, 0.018))
+                    .child(
+                        text(format!("C{}", milestone.cycle))
+                            .font(rune::tok::TextStyle::new(8.0, 700.0))
+                            .color(ink("#52525b")),
+                    )
+                    .child(
+                        text(milestone.title.clone())
+                            .grow(1.0)
+                            .truncate()
+                            .font(rune::tok::TextStyle::new(9.0, 400.0))
+                            .color(ink("#71717a")),
+                    )
+                    .child(status_chip(&milestone.status, false)),
             );
         }
-        section = section.child(items);
-        out = out.child(section);
+        out = out.child(past);
     }
     out
 }
 
-fn item_detail(item: &GroupItem) -> El {
+fn item_detail<S: ProjectsHost + 'static>(item: &GroupItem) -> El {
     let mut detail = col()
         .w_full()
-        .gap(7.0)
-        .px(9.0)
-        .pt(8.0)
-        .pb(10.0)
+        .gap(6.0)
+        .px(8.0)
+        .pt(7.0)
+        .pb(9.0)
         .border_sides([0.0, 1.0, 0.0, 0.0], rgba(255.0, 255.0, 255.0, 0.055))
-        .border_layout()
-        .font(rune::tok::TextStyle::new(10.5, 400.0));
+        .border_layout();
     if !item.detail.is_empty() {
-        detail = detail.child(text(item.detail.clone()).color(ink("#a1a1aa")));
+        detail = detail.child(
+            text(item.detail.clone())
+                .w_full()
+                .wrap()
+                .font(rune::tok::TextStyle::new(9.5, 400.0))
+                .color(ink("#a1a1aa")),
+        );
     }
     if let Some(error) = &item.error {
-        detail = detail.child(text(format!("! {error}")).color(ink("#fda4af")));
+        detail = detail.child(
+            text(format!("! {error}"))
+                .w_full()
+                .wrap()
+                .font(rune::tok::TextStyle::new(9.0, 400.0))
+                .color(ink("#fda4af")),
+        );
     }
     if let Some(result) = &item.result {
         detail = detail.child(
             col()
                 .w_full()
-                .max_h(220.0)
+                .max_h(200.0)
                 .radius(6.0)
                 .border(1.0, rgba(255.0, 255.0, 255.0, 0.055))
                 .border_layout()
@@ -555,25 +894,70 @@ fn item_detail(item: &GroupItem) -> El {
                     result,
                     "#c4c4c8",
                     {
-                        let mut style = rune::tok::TextStyle::new(10.5, 400.0);
-                        style.line_height = 15.75;
+                        let mut style = rune::tok::TextStyle::new(10.0, 400.0);
+                        style.line_height = 15.0;
                         style
                     },
                 )),
         );
     }
+    let mut actions = row().w_full().gap(4.0).flex_wrap();
+    if matches!(
+        item.status.as_str(),
+        "failed" | "cancelled" | "invalidated" | "blocked"
+    ) {
+        actions = actions.child(item_action::<S>(
+            &format!("gp-retry-{}", item.id),
+            "Retry",
+            "retry_item",
+            &item.id,
+        ));
+    }
+    if item.status != "done" && item.status != "doing" {
+        actions = actions.child(item_action::<S>(
+            &format!("gp-complete-{}", item.id),
+            "Mark done",
+            "complete_item",
+            &item.id,
+        ));
+    }
+    if item.status != "cancelled" && item.status != "doing" {
+        actions = actions.child(item_action::<S>(
+            &format!("gp-cancel-{}", item.id),
+            "Cancel",
+            "cancel_item",
+            &item.id,
+        ));
+    }
+    if item.status == "cancelled" || item.status == "done" {
+        actions = actions.child(item_action::<S>(
+            &format!("gp-reopen-{}", item.id),
+            "Reopen",
+            "reopen_item",
+            &item.id,
+        ));
+    }
+    actions = actions.child(item_action::<S>(
+        &format!("gp-delete-{}", item.id),
+        "Delete",
+        "delete_item",
+        &item.id,
+    ));
+    detail = detail.child(actions);
     if item.acceptance.as_array().is_some_and(|a| !a.is_empty()) {
         detail = detail.child(
             col()
-                .gap(4.0)
+                .gap(3.0)
                 .child(
                     text("DONE MEANS".to_string())
-                        .font(rune::tok::TextStyle::new(9.0, 650.0))
+                        .font(rune::tok::TextStyle::new(8.5, 650.0))
                         .color(ink("#71717a")),
                 )
                 .child(
                     text(serde_json::to_string_pretty(&item.acceptance).unwrap_or_default())
-                        .font(rune::tok::TextStyle::new(9.0, 400.0).mono())
+                        .w_full()
+                        .wrap()
+                        .font(rune::tok::TextStyle::new(8.5, 400.0).mono())
                         .color(ink("#a1a1aa")),
                 ),
         );
@@ -586,21 +970,14 @@ fn item_detail(item: &GroupItem) -> El {
                 text(format!(
                     "{}/{} attempts",
                     item.attempts,
-                    item.max_attempts.max(3)
+                    item.max_attempts.max(1)
                 ))
-                .font(rune::tok::TextStyle::new(9.0, 400.0))
+                .font(rune::tok::TextStyle::new(8.5, 400.0))
                 .color(ink("#52525b")),
             )
-            .child(if let Some(owner) = &item.owner_member {
-                text(format!("owner {}", display_actor(owner)))
-                    .font(rune::tok::TextStyle::new(9.0, 400.0))
-                    .color(ink("#52525b"))
-            } else {
-                rune::el().size(0.0, 0.0).inert()
-            })
-            .child(if item.cost_usd.unwrap_or(0.0) > 0.0 {
-                text(money(item.cost_usd.unwrap_or(0.0)))
-                    .font(rune::tok::TextStyle::new(9.0, 400.0))
+            .child(if !item.owner_label().is_empty() {
+                text(format!("owner {}", item.owner_label()))
+                    .font(rune::tok::TextStyle::new(8.5, 400.0))
                     .color(ink("#52525b"))
             } else {
                 rune::el().size(0.0, 0.0).inert()
@@ -608,89 +985,109 @@ fn item_detail(item: &GroupItem) -> El {
     )
 }
 
-fn team(detail: &GroupDetail) -> El {
-    let members: Vec<GroupMember> = if detail.members.is_empty() {
-        let mut names: Vec<(String, String)> = Vec::new();
-        for item in &detail.items {
-            for name in [&item.owner_member, &item.lease_owner]
-                .into_iter()
-                .flatten()
-            {
-                if !names.iter().any(|(n, _)| n == name) {
-                    names.push((name.clone(), display_actor(name)));
-                }
-            }
-        }
-        names
-            .into_iter()
-            .map(|(name, display)| GroupMember {
-                name,
-                display,
-                kind: "member".to_string(),
-                model: String::new(),
-            })
-            .collect()
-    } else {
-        detail.members.clone()
-    };
-    let mut out = col().key("gp-team").w_full().gap(3.0);
-    if members.is_empty() {
-        return text("No named members.".to_string())
+fn team<S: ProjectsHost + 'static>(g: &GroupState, detail: &GroupDetail) -> El {
+    let mut out = col().key("gp-team").w_full().gap(7.0);
+    if detail.members.is_empty() {
+        return text("No team slots yet. Open settings to add agents.".to_string())
             .padding(10.0)
             .font(rune::tok::TextStyle::new(10.0, 400.0))
             .color(ink("#52525b"));
     }
-    for member in &members {
-        let active = active_item_for(&detail.items, &member.name);
+    out = out.child(
+        row()
+            .w_full()
+            .items_center()
+            .child(
+                text("TEAM USAGE".to_string())
+                    .grow(1.0)
+                    .font(rune::tok::TextStyle::new(9.0, 700.0))
+                    .color(ink("#71717a")),
+            )
+            .child(
+                text("Manage".to_string())
+                    .px(6.0)
+                    .py(2.0)
+                    .radius(4.0)
+                    .font(rune::tok::TextStyle::new(8.5, 600.0))
+                    .color(ink("#a1a1aa"))
+                    .role("button")
+                    .focusable(true)
+                    .on_press_enter(|s: &mut S| {
+                        super::settings::open(&mut s.projects_mut().group);
+                    }),
+            ),
+    );
+    for member in &detail.members {
+        let active = member.running;
         out = out.child(
-            row()
+            col()
+                .key(format!("gp-member-{}", member.id))
                 .w_full()
-                .items_center()
-                .gap(8.0)
+                .gap(4.0)
                 .padding(8.0)
                 .radius(8.0)
-                .fill(rgba(255.0, 255.0, 255.0, 0.02))
-                .child(avatar(&member.name, true, false))
+                .fill(rgba(255.0, 255.0, 255.0, 0.022))
                 .child(
-                    col()
-                        .grow(1.0)
-                        .min_w(0.0)
-                        .gap(1.0)
+                    row()
+                        .w_full()
+                        .items_center()
+                        .gap(7.0)
+                        .child(avatar(&member.label(), true, false))
                         .child(
-                            text(if member.display.is_empty() {
-                                display_actor(&member.name)
-                            } else {
-                                member.display.clone()
-                            })
-                            .font(rune::tok::TextStyle::new(11.0, 600.0))
-                            .color(ink("#d4d4d8")),
+                            col()
+                                .grow(1.0)
+                                .min_w(0.0)
+                                .gap(1.0)
+                                .child(
+                                    text(member.label())
+                                        .font(rune::tok::TextStyle::new(10.5, 600.0))
+                                        .color(ink("#d4d4d8")),
+                                )
+                                .child(
+                                    text(
+                                        member
+                                            .current_item
+                                            .clone()
+                                            .unwrap_or_else(|| member.agent_key.clone()),
+                                    )
+                                    .truncate()
+                                    .font(rune::tok::TextStyle::new(8.5, 400.0))
+                                    .color(if active {
+                                        ink("#7dd3fc")
+                                    } else {
+                                        ink("#71717a")
+                                    }),
+                                ),
                         )
-                        .child(
-                            text(active.map(|item| item.title.clone()).unwrap_or_else(|| {
-                                if !member.model.is_empty() {
-                                    member.model.clone()
-                                } else if !member.kind.is_empty() {
-                                    member.kind.clone()
-                                } else {
-                                    "member".to_string()
-                                }
-                            }))
-                            .font(rune::tok::TextStyle::new(9.5, 400.0))
-                            .color(ink("#71717a")),
-                        ),
-                )
-                .child(
-                    rune::el()
-                        .size(5.0, 5.0)
-                        .radius(2.5)
-                        .fill(if active.is_some() {
-                            ink("#e4e4e7")
+                        .child(rune::el().size(5.0, 5.0).radius(2.5).fill(if active {
+                            ink("#7dd3fc")
                         } else {
                             ink("#3f3f46")
-                        }),
+                        })),
+                )
+                .child(
+                    row()
+                        .w_full()
+                        .gap(9.0)
+                        .child(
+                            text(format!("{}/{} done", member.done, member.assigned))
+                                .font(rune::tok::TextStyle::new(8.5, 500.0))
+                                .color(ink("#a1a1aa")),
+                        )
+                        .child(
+                            text(format!("{} tokens", member.tokens))
+                                .font(rune::tok::TextStyle::new(8.5, 400.0).mono())
+                                .color(ink("#71717a")),
+                        )
+                        .child(
+                            text(money(member.cost_usd))
+                                .font(rune::tok::TextStyle::new(8.5, 400.0).mono())
+                                .color(ink("#71717a")),
+                        ),
                 ),
         );
     }
+    let _ = g;
     out
 }
 
@@ -700,7 +1097,11 @@ fn details<S: ProjectsHost + 'static>(g: &GroupState, detail: &GroupDetail) -> E
     } else {
         detail.project.status.as_str()
     };
-    let path = detail.path.clone();
+    let path = if detail.workspace_path.is_empty() {
+        detail.path.clone()
+    } else {
+        detail.workspace_path.clone()
+    };
     let mut out = card().key("gp-details").pb(9.0).child(section_title(
         "Project",
         crate::icons::users(12.0, ink("#71717a")),
@@ -718,22 +1119,41 @@ fn details<S: ProjectsHost + 'static>(g: &GroupState, detail: &GroupDetail) -> E
         ("Status", status.to_uppercase()),
         (
             "Milestones",
-            format!("{}/{}", detail.milestones_done(), detail.milestones.len()),
+            format!(
+                "{}/{}",
+                detail.milestones_done(),
+                detail.current_milestones().count()
+            ),
         ),
         (
             "Items",
-            format!("{}/{}", detail.items_done(), detail.items.len()),
+            format!("{}/{}", detail.items_done(), detail.current_items().count()),
+        ),
+        (
+            "Schedule",
+            match detail.project.schedule.repeat_label().as_str() {
+                "No repeat" => "One cycle".to_string(),
+                other => other.to_string(),
+            },
         ),
         (
             "Spend",
             format!(
                 "{}{}",
-                money(detail.project.spent_usd.unwrap_or(0.0)),
+                money(detail.project.spent_usd.unwrap_or(detail.usage.cost_usd)),
                 detail
                     .project
                     .budget_usd
                     .map(|cap| format!(" / {}", money(cap)))
                     .unwrap_or_default()
+            ),
+        ),
+        (
+            "Usage",
+            format!(
+                "{} runs · {} tokens",
+                detail.usage.runs,
+                detail.usage.tokens()
             ),
         ),
     ] {
@@ -846,6 +1266,41 @@ fn details<S: ProjectsHost + 'static>(g: &GroupState, detail: &GroupDetail) -> E
             ),
     );
     if g.show_activity {
+        let mut chips = row().w_full().gap(3.0).flex_wrap().mt(5.0).px(12.0);
+        for filter in ["all", "items", "milestones", "approvals", "system"] {
+            let active = g.activity_filter == filter;
+            let label = match filter {
+                "items" => "Items",
+                "milestones" => "Milestones",
+                "approvals" => "Approvals",
+                "system" => "System",
+                _ => "All",
+            };
+            let value = filter.to_string();
+            chips = chips.child(
+                text(label.to_string())
+                    .px(6.0)
+                    .py(1.0)
+                    .radius(4.0)
+                    .font(rune::tok::TextStyle::new(8.0, 600.0))
+                    .color(if active {
+                        ink("#0a0a0d")
+                    } else {
+                        ink("#a1a1aa")
+                    })
+                    .fill(if active {
+                        ink("#e4e4e7")
+                    } else {
+                        rgba(255.0, 255.0, 255.0, 0.045)
+                    })
+                    .role("button")
+                    .focusable(true)
+                    .on_press_enter(move |s: &mut S| {
+                        s.projects_mut().group.activity_filter = value.clone();
+                    }),
+            );
+        }
+        out = out.child(chips);
         let mut list = col().w_full().gap(1.0).mt(6.0).px(12.0);
         if detail.events.is_empty() {
             list = list.child(
@@ -854,7 +1309,26 @@ fn details<S: ProjectsHost + 'static>(g: &GroupState, detail: &GroupDetail) -> E
                     .color(ink("#52525b")),
             );
         }
-        for event in detail.events.iter().rev().take(30) {
+        for event in detail
+            .events
+            .iter()
+            .rev()
+            .filter(|event| match g.activity_filter.as_str() {
+                "items" => event.kind.starts_with("item."),
+                "milestones" => {
+                    event.kind.starts_with("milestone.") || event.kind.starts_with("plan.")
+                }
+                "approvals" => event.kind.starts_with("approval."),
+                "system" => {
+                    event.kind.starts_with("project.")
+                        || event.kind.starts_with("cycle.")
+                        || event.kind.starts_with("run.")
+                        || event.kind.starts_with("workspace.")
+                }
+                _ => true,
+            })
+            .take(80)
+        {
             list = list.child(
                 row()
                     .w_full()
@@ -880,6 +1354,148 @@ fn details<S: ProjectsHost + 'static>(g: &GroupState, detail: &GroupDetail) -> E
             );
         }
         out = out.child(list);
+    }
+    if !detail.runs.is_empty() {
+        let mut runs = col().w_full().gap(3.0).mt(6.0).px(12.0);
+        runs = runs.child(
+            text("RUNS".to_string())
+                .font(rune::tok::TextStyle::new(8.5, 700.0))
+                .color(ink("#52525b")),
+        );
+        for run in detail.runs.iter().take(12) {
+            let run_id = run.id.clone();
+            let run_clone = run.clone();
+            runs = runs.child(
+                row()
+                    .key(format!("gp-run-{}", run.id))
+                    .w_full()
+                    .items_center()
+                    .gap(6.0)
+                    .py(2.0)
+                    .role("button")
+                    .focusable(true)
+                    .hover(rgba(255.0, 255.0, 255.0, 0.04))
+                    .on_press_enter(move |s: &mut S| {
+                        let g = &mut s.projects_mut().group;
+                        g.selected_run = if g.selected_run.as_ref().is_some_and(|r| r.id == run_id)
+                        {
+                            None
+                        } else {
+                            Some(run_clone.clone())
+                        };
+                    })
+                    .child(
+                        text(run.kind.clone())
+                            .w(42.0)
+                            .font(rune::tok::TextStyle::new(8.0, 600.0))
+                            .color(if run.status == "failed" {
+                                ink("#fda4af")
+                            } else {
+                                ink("#71717a")
+                            }),
+                    )
+                    .child(
+                        text(
+                            run.item_title
+                                .clone()
+                                .or_else(|| run.member.clone())
+                                .unwrap_or_else(|| run.id.clone()),
+                        )
+                        .grow(1.0)
+                        .truncate()
+                        .font(rune::tok::TextStyle::new(8.5, 400.0))
+                        .color(ink("#a1a1aa")),
+                    )
+                    .child(
+                        text(format!("{}t", run.tokens()))
+                            .font(rune::tok::TextStyle::new(8.0, 400.0).mono())
+                            .color(ink("#52525b")),
+                    )
+                    .child(
+                        text(money(run.cost_usd))
+                            .font(rune::tok::TextStyle::new(8.0, 400.0).mono())
+                            .color(ink("#52525b")),
+                    ),
+            );
+        }
+        out = out.child(runs);
+    }
+    if let Some(run) = &g.selected_run {
+        let mut card = card().key("gp-run-detail").pb(8.0).child(section_title(
+            "Run detail",
+            crate::icons::terminal(12.0, ink("#71717a")),
+        ));
+        card = card.child(
+            row()
+                .w_full()
+                .gap(8.0)
+                .px(12.0)
+                .py(3.0)
+                .child(
+                    text(format!("{} · {}", run.kind, run.status))
+                        .font(rune::tok::TextStyle::new(9.0, 600.0))
+                        .color(if run.status == "failed" {
+                            ink("#fda4af")
+                        } else {
+                            ink("#a1a1aa")
+                        }),
+                )
+                .child(
+                    text(format!("{} tokens", run.tokens()))
+                        .font(rune::tok::TextStyle::new(9.0, 400.0).mono())
+                        .color(ink("#71717a")),
+                )
+                .child(
+                    text(money(run.cost_usd))
+                        .font(rune::tok::TextStyle::new(9.0, 400.0).mono())
+                        .color(ink("#71717a")),
+                )
+                .child(rune::el().grow(1.0))
+                .child(
+                    text("Close".to_string())
+                        .px(6.0)
+                        .py(2.0)
+                        .radius(4.0)
+                        .font(rune::tok::TextStyle::new(8.5, 600.0))
+                        .color(ink("#a1a1aa"))
+                        .role("button")
+                        .focusable(true)
+                        .on_press_enter(|s: &mut S| {
+                            s.projects_mut().group.selected_run = None;
+                        }),
+                ),
+        );
+        if let Some(report) = &run.report {
+            card = card.child(
+                col()
+                    .w_full()
+                    .max_h(260.0)
+                    .scroll(rune::ScrollSpec {
+                        stick_bottom: false,
+                    })
+                    .px(12.0)
+                    .pt(5.0)
+                    .child(
+                        text(report.clone())
+                            .w_full()
+                            .wrap()
+                            .font(rune::tok::TextStyle::new(9.0, 400.0).mono())
+                            .color(ink("#a1a1aa")),
+                    ),
+            );
+        }
+        if let Some(error) = &run.error {
+            card = card.child(
+                text(error.clone())
+                    .w_full()
+                    .wrap()
+                    .px(12.0)
+                    .pt(5.0)
+                    .font(rune::tok::TextStyle::new(9.0, 400.0))
+                    .color(ink("#fda4af")),
+            );
+        }
+        out = out.child(card);
     }
     out
 }
@@ -930,8 +1546,8 @@ pub fn rail_panel<S: ProjectsHost + 'static>(
             .child(tabs::<S>(g, members))
             .child(match g.rail_tab {
                 RailTab::Board => board::<S>(g, detail),
-                RailTab::Team => team(detail),
-                RailTab::Details => details::<S>(g, detail),
+                RailTab::Team => team::<S>(g, detail),
+                RailTab::Activity => details::<S>(g, detail),
             }),
     );
     rail

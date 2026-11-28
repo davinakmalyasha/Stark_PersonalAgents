@@ -235,6 +235,16 @@ fn header<S: ProjectsHost + 'static>(
         )
         .child(
             icon_action(
+                "gp-settings-open",
+                "Project settings",
+                crate::icons::settings(15.0, ink("#71717a")),
+            )
+            .on_press_enter(|s: &mut S| {
+                super::settings::open(&mut s.projects_mut().group);
+            }),
+        )
+        .child(
+            icon_action(
                 "gp-folder",
                 "Open folder",
                 crate::icons::folder_open(15.0, ink("#71717a")),
@@ -262,18 +272,30 @@ fn header<S: ProjectsHost + 'static>(
             }),
         );
     if status == "running" {
-        actions = actions.child(
-            action_button(
-                "Pause",
-                false,
-                Some(crate::icons::pause(12.0, ink("#d4d4d8"))),
+        actions = actions
+            .child(
+                action_button(
+                    "Pause",
+                    false,
+                    Some(crate::icons::pause(12.0, ink("#d4d4d8"))),
+                )
+                .key("gp-pause")
+                .on_press_enter(move |s: &mut S| {
+                    let _ = &pause_id;
+                    s.projects_mut().group.op("pause");
+                }),
             )
-            .key("gp-pause")
-            .on_press_enter(move |s: &mut S| {
-                let _ = &pause_id;
-                s.projects_mut().group.op("pause");
-            }),
-        );
+            .child(
+                action_button(
+                    "Stop",
+                    false,
+                    Some(crate::icons::square(11.0, ink("#d4d4d8"))),
+                )
+                .key("gp-stop")
+                .on_press_enter(move |s: &mut S| {
+                    s.projects_mut().group.stop();
+                }),
+            );
     } else if status == "paused" {
         actions = actions.child(
             action_button(
@@ -550,8 +572,87 @@ pub fn group_modal<S: ProjectsHost + 'static>(g: &GroupState, w: f32, h: f32) ->
         .hover_motion_within(crate::motion::HOVER, crate::motion::HOVER)
         // The card is the modal root, so the backdrop is outside it: a
         // backdrop press dismisses and focus is trapped inside the card.
-        .modal(true, |s: &mut S| s.projects_mut().group.close())
+        .modal(true, |s: &mut S| {
+            if !s.projects_mut().group.settings.open {
+                s.projects_mut().group.close();
+            }
+        })
         .child(header::<S>(g, &project, detail, compact, rail_visible));
+    if let Some(detail) = detail {
+        if detail.project.is_plan_ready() {
+            card = card.child(
+                row()
+                    .key("gp-plan-ready")
+                    .w_full()
+                    .items_center()
+                    .gap(9.0)
+                    .px(18.0)
+                    .py(9.0)
+                    .border_sides([0.0, 0.0, 1.0, 0.0], rgba(125.0, 211.0, 252.0, 0.16))
+                    .border_layout()
+                    .fill(rgba(125.0, 211.0, 252.0, 0.06))
+                    .child(icon(14.0, crate::icons::sparkles(14.0, ink("#7dd3fc"))))
+                    .child(
+                        text(
+                            "The plan is ready. Review the board, then start the team.".to_string(),
+                        )
+                        .grow(1.0)
+                        .font(rune::tok::TextStyle::new(10.5, 500.0))
+                        .color(ink("#bae6fd")),
+                    )
+                    .child(
+                        action_button("Review", false, None)
+                            .key("gp-plan-review")
+                            .on_press_enter(|s: &mut S| {
+                                let g = &mut s.projects_mut().group;
+                                g.rail_tab = super::RailTab::Board;
+                                g.show_rail = true;
+                            }),
+                    )
+                    .child(
+                        action_button(
+                            "Approve & start",
+                            true,
+                            Some(crate::icons::play(11.0, ink("#0a0a0d"))),
+                        )
+                        .key("gp-plan-approve")
+                        .on_press_enter(|s: &mut S| {
+                            s.projects_mut().group.approve_plan();
+                        }),
+                    ),
+            );
+        }
+    }
+    if let Some(detail) = detail {
+        if detail.workspace_missing {
+            card = card.child(
+            row()
+                .key("gp-workspace-missing")
+                .w_full()
+                .items_center()
+                .gap(9.0)
+                .px(18.0)
+                .py(8.0)
+                .border_sides([0.0, 0.0, 1.0, 0.0], rgba(251.0, 191.0, 36.0, 0.18))
+                .border_layout()
+                .fill(rgba(251.0, 191.0, 36.0, 0.06))
+                .child(icon(13.0, crate::icons::triangle_alert(13.0, ink("#fcd34d"))))
+                .child(
+                    text("This project has no valid work folder. Relink it in settings before starting.".to_string())
+                        .grow(1.0)
+                        .font(rune::tok::TextStyle::new(10.5, 500.0))
+                        .color(ink("#fcd34d")),
+                )
+                .child(
+                    action_button("Settings", false, None)
+                        .key("gp-workspace-settings")
+                        .on_press_enter(|s: &mut S| {
+                            super::settings::open(&mut s.projects_mut().group);
+                        }),
+                ),
+        );
+        }
+    }
     if has_notice {
         card = card.child(notice);
     }
@@ -567,7 +668,9 @@ pub fn group_modal<S: ProjectsHost + 'static>(g: &GroupState, w: f32, h: f32) ->
         .center()
         .transition(crate::motion::backdrop_enter())
         .child(card);
-    if g.notes.open {
+    if g.settings.open {
+        backdrop.child(super::settings::settings_sheet::<S>(g, w, h))
+    } else if g.notes.open {
         backdrop.child(super::notes::group_notes_sheet::<S>(
             &g.notes,
             g.open_id.clone().unwrap_or_default(),

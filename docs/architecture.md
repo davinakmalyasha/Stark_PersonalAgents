@@ -106,6 +106,18 @@ State is plain Rust. Host traits (`TranscriptHost`, `CanvasHost`,
 active thread or panel without borrowing the whole app. Handlers capture stable
 IDs or keys, never row indices.
 
+### Group projects
+
+Group projects are independent SQLite databases under
+`.deep_agents/groups/<id>/.gp/state.db`. The database is metadata only; agents
+execute in the project's explicit **work folder**. A project owns member slots
+(one row per unit), a current cycle, milestones/items, a schedule/repeat anchor,
+planner state, per-run usage, and a durable message/event log. The runner is
+capacity-aware (per-slot and `max_parallel`), retries failed items, blocks the
+project when retries are exhausted, and creates a fresh plan copy for each
+repeat cycle while keeping prior cycles visible. See
+[`group-projects.md`](group-projects.md) for the lifecycle and API.
+
 ### Run transport
 
 1. `POST /api/chats/{chat_id}/run` starts a run and returns

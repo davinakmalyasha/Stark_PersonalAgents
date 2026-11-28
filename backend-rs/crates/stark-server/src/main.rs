@@ -28,7 +28,7 @@ use stark_core::{
     AgentRegistry, RunContext, agent_access_for, preview_system_prompt, resolve_definition,
     run_agent, validate_definition,
 };
-use stark_providers::{ImagePart, Provider, ProviderConfig};
+use stark_providers::{ChatMessage, ImagePart, Provider, ProviderConfig, ProviderSession};
 use stark_store::{
     AgentRecord, AgentStore, CanvasStore, ChatStore, GroupStore, MemoryStore, NewEntry,
     ScheduleRecord, ScheduleStore, WorkspaceRegistry, parse_schedule_time, schedule_json,
@@ -385,6 +385,7 @@ struct ServerState {
     /// Registry snapshot keyed by `ConfigStore::revision()`.
     registry_cache: RegistryCache,
     registry: WorkspaceRegistry,
+    groups: GroupStore,
     pairing: Arc<PairingStore>,
     ui_state_path: PathBuf,
     harness_root: PathBuf,
@@ -936,6 +937,7 @@ async fn main() -> anyhow::Result<()> {
         runs: Arc::new(RunManager::default()),
         registry_cache: Arc::new(Mutex::new(None)),
         registry: WorkspaceRegistry::new(&harness_root),
+        groups: GroupStore::default_root(),
         pairing: Arc::new(PairingStore::new(&harness_root)),
         ui_state_path: harness_root.join(".deep_agents").join("ui_state.json"),
         harness_root,
@@ -1155,7 +1157,39 @@ async fn main() -> anyhow::Result<()> {
             "/api/groups",
             get(groups_handler).post(create_group_handler),
         )
-        .route("/api/groups/{project_id}", get(group_handler))
+        .route("/api/groups/trash", get(group_trash_handler))
+        .route(
+            "/api/groups/trash/{folder}/restore",
+            post(group_restore_handler),
+        )
+        .route(
+            "/api/groups/trash/{folder}",
+            delete(group_permanent_delete_handler),
+        )
+        .route(
+            "/api/groups/{project_id}",
+            get(group_handler)
+                .patch(group_patch_handler)
+                .delete(group_delete_handler),
+        )
+        .route("/api/groups/{project_id}/start", post(group_start_handler))
+        .route("/api/groups/{project_id}/pause", post(group_pause_handler))
+        .route("/api/groups/{project_id}/stop", post(group_stop_handler))
+        .route("/api/groups/{project_id}/close", post(group_close_handler))
+        .route(
+            "/api/groups/{project_id}/restart",
+            post(group_restart_handler),
+        )
+        .route("/api/groups/{project_id}/plan", post(group_plan_handler))
+        .route(
+            "/api/groups/{project_id}/approve-plan",
+            post(group_approve_plan_handler),
+        )
+        .route(
+            "/api/groups/{project_id}/messages",
+            post(group_message_handler),
+        )
+        .route("/api/groups/{project_id}/runs", get(group_runs_handler))
         .route("/api/agents", get(agents_handler))
         .route("/api/agents/{agent_id}", get(agent_handler))
         .route("/api/agents/{agent_id}/cancel", post(agent_cancel_handler))
@@ -1703,7 +1737,7 @@ async fn schedule_loop(state: ServerState, shutdown: CancellationToken) {
 }
 
 async fn group_loop(state: ServerState, shutdown: CancellationToken) {
-    let groups = GroupStore::default_root();
+    let groups = state.groups.clone();
     match groups.recover_doing_items().await {
         Ok(count) if count > 0 => tracing::info!("recovered {count} interrupted group item(s)"),
         Ok(_) => {}
@@ -1713,29 +1747,331 @@ async fn group_loop(state: ServerState, shutdown: CancellationToken) {
         if !sleep_or_shutdown(std::time::Duration::from_secs(2), &shutdown).await {
             break;
         }
+        for project in groups.due_projects().await {
+            let Some(project_id) = project["id"].as_str() else {
+                continue;
+            };
+            if let Err(error) = groups.start_due(project_id).await {
+                tracing::warn!("group {project_id} scheduled start failed: {error}");
+            }
+        }
         for project in groups
             .list()
             .await
             .into_iter()
-            .filter(|project| project["status"] == "running")
+            .filter(|project| project["status"] == "running" || project["status"] == "planning")
         {
-            let Some(project_id) = project["id"].as_str() else {
+            let Some(project_id) = project["id"].as_str().map(str::to_string) else {
                 continue;
             };
-            match groups.claim_next_ready(project_id).await {
-                Ok(Some(item)) => {
-                    let state = state.clone();
-                    let groups = groups.clone();
-                    let project_id = project_id.to_string();
-                    tokio::spawn(async move {
-                        run_group_item(state, groups, project_id, item).await;
-                    });
+            if (project["status"] == "planning" || project["plan_status"] == "queued")
+                && groups.claim_planning(&project_id).await.unwrap_or(false)
+            {
+                let state = state.clone();
+                let groups = groups.clone();
+                tokio::spawn(async move {
+                    run_group_planner(state, groups, project_id).await;
+                });
+                continue;
+            }
+            if project["status"] != "running" {
+                continue;
+            }
+            // Fill the project's available worker slots. claim_next_ready is
+            // atomic and capacity-aware, so an over-claim is impossible.
+            for _ in 0..8 {
+                match groups.claim_next_ready(&project_id).await {
+                    Ok(Some(item)) => {
+                        let state = state.clone();
+                        let groups = groups.clone();
+                        let project_id = project_id.clone();
+                        tokio::spawn(async move {
+                            run_group_item(state, groups, project_id, item).await;
+                        });
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        tracing::warn!("group runner could not claim an item: {error}");
+                        break;
+                    }
                 }
-                Ok(None) => {}
-                Err(error) => tracing::warn!("group runner could not claim an item: {error}"),
             }
         }
     }
+}
+
+fn extract_json_object(text: &str) -> Option<Value> {
+    let trimmed = text.trim();
+    let candidate = if let Some(start) = trimmed.find("```json") {
+        let rest = &trimmed[start + 7..];
+        rest.split("```").next().unwrap_or(rest).trim()
+    } else if let Some(start) = trimmed.find("```") {
+        let rest = &trimmed[start + 3..];
+        rest.split("```").next().unwrap_or(rest).trim()
+    } else {
+        trimmed
+    };
+    if let Ok(value) = serde_json::from_str::<Value>(candidate) {
+        return Some(value);
+    }
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    serde_json::from_str::<Value>(trimmed.get(start..=end)?).ok()
+}
+
+fn group_plan_prompt(detail: &Value) -> String {
+    let members = detail["members"]
+        .as_array()
+        .map(|members| {
+            members
+                .iter()
+                .map(|member| {
+                    format!(
+                        "- {} (agent {}, {} items assigned)",
+                        member["display"].as_str().unwrap_or("Agent"),
+                        member["agent_key"].as_str().unwrap_or("developer"),
+                        member["assigned"].as_i64().unwrap_or(0)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    let workspace = detail["workspace_path"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .or_else(|| detail["project"]["workspace_path"].as_str())
+        .unwrap_or("");
+    format!(
+        r#"You are the planning lead for a group project. You do not do the work; you produce a precise, executable plan.
+
+Project title: {title}
+Goal:
+{goal}
+
+Work folder: {workspace}
+
+Team:
+{members}
+
+Return ONE JSON object only, with no prose outside the code fence:
+```json
+{{
+  "summary": "one short sentence",
+  "milestones": [
+    {{
+      "title": "phase title",
+      "detail": "what this phase delivers",
+      "depends_on": ["id of an earlier milestone"],
+      "items": [
+        {{
+          "title": "one concrete deliverable",
+          "detail": "exactly what to do and where",
+          "acceptance": ["a machine-checkable condition or a clearly manual check"],
+          "owner": "exact team member display name or null",
+          "priority": 0,
+          "requires_approval": false
+        }}
+      ]
+    }}
+  ]
+}}
+```
+
+Rules:
+- 2-8 milestones, 1-8 items per milestone, ordered by dependency.
+- Every item needs at least one acceptance criterion. Prefer concrete, verifiable checks.
+- Assign each item to one member display name from the team. Balance the work.
+- Coding items should name the files or directories they touch. If two items would edit the same files, put them in different milestones or sequence them with depends_on.
+- Do not create a separate "make a plan" item. The plan is the output.
+- Do not invent credentials, external access, or files that are not in the work folder.
+- Mark `requires_approval: true` for anything destructive, external, paid, or publish/send-related.
+- If the goal is ambiguous, make the smallest safe plan that produces a reviewable result."#,
+        title = detail["project"]["title"].as_str().unwrap_or("Project"),
+        goal = detail["project"]["goal"].as_str().unwrap_or(""),
+        members = members,
+        workspace = workspace,
+    )
+}
+
+async fn run_group_planner(state: ServerState, groups: GroupStore, project_id: String) {
+    let detail = match groups.detail(&project_id, 0).await {
+        Ok(detail) => detail,
+        Err(error) => {
+            tracing::warn!("group {project_id} planner detail failed: {error}");
+            let _ = groups.plan_failed(&project_id, &error).await;
+            return;
+        }
+    };
+    let cycle = detail["current_cycle"].as_i64().unwrap_or(1);
+    let planner_key = detail["project"]["planner_agent"]
+        .as_str()
+        .unwrap_or("orchestrator");
+    let registry = agent_registry(&state);
+    let agent = registry
+        .get(planner_key)
+        .cloned()
+        .or_else(|| registry.get("orchestrator").cloned());
+    let Some(agent) = agent else {
+        let _ = groups
+            .plan_failed(&project_id, "no planner agent is configured")
+            .await;
+        return;
+    };
+    let provider = state.provider_for(&agent);
+    let run_id = match groups
+        .start_run(
+            &project_id,
+            cycle,
+            None,
+            None,
+            &agent.key,
+            None,
+            None,
+            "planning",
+        )
+        .await
+    {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::warn!("group {project_id} planner run row failed: {error}");
+            let _ = groups.plan_failed(&project_id, &error).await;
+            return;
+        }
+    };
+    let prompt = group_plan_prompt(&detail);
+    let session_key = format!("group-plan-{}", project_id.replace([':', '/', '\\'], "-"));
+    let session = ProviderSession {
+        session_id: &session_key,
+        affinity: &session_key,
+        reasoning_effort: agent.thinking.as_deref(),
+    };
+    let messages = vec![
+        ChatMessage::system(
+            "You are a meticulous project planner. Return only the requested JSON. Never claim work was performed.",
+        ),
+        ChatMessage::user(prompt),
+    ];
+    let result = tokio::time::timeout(
+        Duration::from_secs(180),
+        provider.complete_text_for_session(&messages, 0.2, session),
+    )
+    .await;
+    match result {
+        Ok(Ok(completion)) => {
+            let usage = completion.usage;
+            let parsed = extract_json_object(&completion.text);
+            let applied = match parsed {
+                Some(plan) => groups.apply_plan(&project_id, &plan).await,
+                None => Err("planner did not return valid JSON".to_string()),
+            };
+            match applied {
+                Ok(()) => {
+                    let _ = groups
+                        .finish_run(
+                            &project_id,
+                            &run_id,
+                            "complete",
+                            usage.input_tokens as i64,
+                            usage.output_tokens as i64,
+                            usage.cost,
+                            Some(&completion.text),
+                            None,
+                        )
+                        .await;
+                }
+                Err(error) => {
+                    let _ = groups
+                        .finish_run(
+                            &project_id,
+                            &run_id,
+                            "failed",
+                            usage.input_tokens as i64,
+                            usage.output_tokens as i64,
+                            usage.cost,
+                            Some(&completion.text),
+                            Some(&error),
+                        )
+                        .await;
+                    let _ = groups.plan_failed(&project_id, &error).await;
+                }
+            }
+        }
+        Ok(Err(error)) => {
+            let message = format!("planner provider failed: {error}");
+            let _ = groups
+                .finish_run(
+                    &project_id,
+                    &run_id,
+                    "failed",
+                    0,
+                    0,
+                    0.0,
+                    None,
+                    Some(&message),
+                )
+                .await;
+            let _ = groups.plan_failed(&project_id, &message).await;
+        }
+        Err(_) => {
+            let message = "planner timed out after 180 seconds".to_string();
+            let _ = groups
+                .finish_run(
+                    &project_id,
+                    &run_id,
+                    "failed",
+                    0,
+                    0,
+                    0.0,
+                    None,
+                    Some(&message),
+                )
+                .await;
+            let _ = groups.plan_failed(&project_id, &message).await;
+        }
+    }
+}
+
+async fn group_workspace(
+    state: &ServerState,
+    groups: &GroupStore,
+    detail: &Value,
+) -> Result<PathBuf, String> {
+    let stored = detail["workspace_path"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            detail["project"]["workspace_path"]
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .map(PathBuf::from)
+        });
+    if let Some(path) = stored.filter(|path| path.is_dir()) {
+        return Ok(path);
+    }
+    let origin = detail["project"]["origin_workspace_id"]
+        .as_str()
+        .filter(|value| !value.is_empty());
+    if let Some(origin) = origin
+        && let Some(record) = state.registry.get(origin)
+        && FsPath::new(&record.path).is_dir()
+    {
+        let _ = groups
+            .set_workspace_path(detail["id"].as_str().unwrap_or(""), &record.path)
+            .await;
+        return Ok(PathBuf::from(record.path));
+    }
+    // Legacy projects created before workspace_path existed have no origin
+    // folder to resolve. They may run in their state folder until the owner
+    // relinks them; new projects always need a real workspace.
+    if let Some(path) = detail["path"]
+        .as_str()
+        .filter(|path| FsPath::new(path).is_dir())
+    {
+        return Ok(PathBuf::from(path));
+    }
+    Err("project workspace is missing; relink the work folder in settings".to_string())
 }
 
 fn group_member_runtime(
@@ -1777,6 +2113,35 @@ fn group_item_runtime(
     item: &Value,
     detail: &Value,
 ) -> Result<EffectiveAgent, String> {
+    if let Some(member) = item.get("member") {
+        for key in ["agent_key", "id", "display", "name"] {
+            if let Some(candidate) = member.get(key).and_then(Value::as_str)
+                && let Some(agent) = registry.get(candidate)
+            {
+                return Ok(agent.clone());
+            }
+        }
+    }
+    let owner_member_id = item
+        .get("owner_member_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if !owner_member_id.is_empty()
+        && let Some(members) = detail.get("members").and_then(Value::as_array)
+    {
+        for member in members {
+            if member.get("id").and_then(Value::as_str) == Some(owner_member_id) {
+                for key in ["agent_key", "display", "id"] {
+                    if let Some(candidate) = member.get(key).and_then(Value::as_str)
+                        && let Some(agent) = registry.get(candidate)
+                    {
+                        return Ok(agent.clone());
+                    }
+                }
+            }
+        }
+    }
     let owner = item
         .get("owner_member")
         .and_then(Value::as_str)
@@ -1796,9 +2161,8 @@ const GROUP_RUNTIME_NOTICE: &str = "Group projects run in their project folder. 
 
 async fn run_group_item(state: ServerState, groups: GroupStore, project_id: String, item: Value) {
     let item_id = item["id"].as_str().unwrap_or("").to_string();
-    // Pre-run approval gate: a tagged (or flagged) item parks for the owner
-    // instead of executing. The existing approval route returns it to `todo`
-    // on grant, so the claim loop picks it up again — nothing is lost.
+    // Pre-run approval gate: a flagged item parks for the owner instead of
+    // executing. Approval returns it to todo, so the loop picks it up again.
     let wants_approval = item
         .get("requires_approval")
         .and_then(Value::as_bool)
@@ -1842,36 +2206,60 @@ async fn run_group_item(state: ServerState, groups: GroupStore, project_id: Stri
     } else {
         origin_workspace_id.to_string()
     };
-    // Group work belongs to the project folder, not the workspace that asked
-    // for the project. Running in the origin workspace (often the harness
-    // root for General) would let an item write outside its project.
-    let workspace = detail["path"]
-        .as_str()
-        .filter(|path| !path.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| state.harness_root.clone());
+    let workspace = match group_workspace(&state, &groups, &detail).await {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            let _ = groups
+                .finish_item_with_usage(&project_id, &item_id, false, &error, 0, 0, 0.0, None)
+                .await;
+            notify_group_origin(
+                &state,
+                &groups,
+                &project_id,
+                &item_id,
+                item["title"].as_str().unwrap_or("item"),
+                false,
+                &error,
+            )
+            .await;
+            return;
+        }
+    };
     let registry = agent_registry(&state);
     let agent = match group_item_runtime(&registry, &item, &detail) {
         Ok(agent) => agent,
         Err(error) => {
             let _ = groups
-                .finish_item(
-                    &project_id,
-                    item["id"].as_str().unwrap_or(""),
-                    false,
-                    &error,
-                )
+                .finish_item_with_usage(&project_id, &item_id, false, &error, 0, 0, 0.0, None)
                 .await;
             return;
         }
     };
+    let member = item.get("member").cloned().unwrap_or_else(|| json!({}));
+    let member_id = member
+        .get("id")
+        .and_then(Value::as_str)
+        .or_else(|| item.get("owner_member_id").and_then(Value::as_str))
+        .unwrap_or("")
+        .to_string();
+    let member_display = member
+        .get("display")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&agent.display)
+        .to_string();
+    let cycle = item["cycle"].as_i64().unwrap_or(1);
     let effective = Arc::new(agent.clone());
     let model = effective.model.clone();
     let provider = state.provider_for(&effective);
     let title = format!(
-        "Group: {} ({})",
+        "Group: {} · {} ({})",
         item["title"].as_str().unwrap_or("Task"),
-        agent.display
+        item["title_project"]
+            .as_str()
+            .or_else(|| detail["project"]["title"].as_str())
+            .unwrap_or("Project"),
+        member_display
     );
     let chat = match state
         .store
@@ -1887,27 +2275,26 @@ async fn run_group_item(state: ServerState, groups: GroupStore, project_id: Stri
         Err(error) => {
             let message = format!("Could not create the worker chat: {error}");
             let _ = groups
-                .finish_item(
-                    &project_id,
-                    item["id"].as_str().unwrap_or(""),
-                    false,
-                    &message,
-                )
+                .finish_item_with_usage(&project_id, &item_id, false, &message, 0, 0, 0.0, None)
                 .await;
             return;
         }
     };
     let chat_id = chat["id"].as_str().unwrap_or_default().to_string();
+    let _ = state
+        .store
+        .set_chat_agent_with_hash(&chat_id, &agent.key, Some(&agent.definition_hash))
+        .await;
     let (tx, _) = broadcast::channel(RUN_EVENT_CAPACITY);
     let cancel = CancellationToken::new();
     let steering = Arc::new(Mutex::new(VecDeque::new()));
     let follow_up = Arc::new(Mutex::new(VecDeque::new()));
-    let run_id = Checkpoint::next_run_id();
+    let agent_run_id = Checkpoint::next_run_id();
     let latest = Arc::new(Mutex::new(None));
     if let Err(error) = state.runs.claim(
         &chat_id,
         RunClaim {
-            run_id: run_id.clone(),
+            run_id: agent_run_id.clone(),
             latest: latest.clone(),
             cancel: cancel.clone(),
             tx: tx.clone(),
@@ -1917,21 +2304,39 @@ async fn run_group_item(state: ServerState, groups: GroupStore, project_id: Stri
         },
     ) {
         if error == ClaimError::ShuttingDown {
+            let _ = groups
+                .release_item(&project_id, &item_id, "server shutting down")
+                .await;
             return;
         }
         let message = error.message();
-        let _ = groups
-            .finish_item(
-                &project_id,
-                item["id"].as_str().unwrap_or(""),
-                false,
-                &message,
-            )
-            .await;
+        let _ = groups.release_item(&project_id, &item_id, &message).await;
         return;
     }
 
-    let checkpoint = Checkpoint::begin_with_run_id(&chat_id, &workspace, run_id);
+    let group_run_id = match groups
+        .start_run(
+            &project_id,
+            cycle,
+            Some(&item_id),
+            Some(&member_id),
+            &agent.key,
+            Some(&chat_id),
+            Some(&agent_run_id),
+            "item",
+        )
+        .await
+    {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::warn!("group {project_id} run row failed: {error}");
+            state.runs.finish(&chat_id, None);
+            let _ = groups.release_item(&project_id, &item_id, &error).await;
+            return;
+        }
+    };
+
+    let checkpoint = Checkpoint::begin_with_run_id(&chat_id, &workspace, agent_run_id.clone());
     if workspace != state.harness_root {
         let snapshot = checkpoint.clone();
         let _ = tokio::task::spawn_blocking(move || snapshot.snapshot_all()).await;
@@ -1940,7 +2345,7 @@ async fn run_group_item(state: ServerState, groups: GroupStore, project_id: Stri
         chat_id: chat_id.clone(),
         workspace_id,
         workspace: workspace.clone(),
-        role: Some(agent.display.to_string()),
+        role: Some(member_display.clone()),
         scope: agent.key.to_string(),
         depth: 0,
         file_access: agent_access_for(&agent, 0, false),
@@ -1959,16 +2364,91 @@ async fn run_group_item(state: ServerState, groups: GroupStore, project_id: Stri
         config: Some(effective.clone()),
         on_job_done: None,
     };
+    let pending = groups
+        .pending_messages(&project_id, &member_id)
+        .await
+        .unwrap_or_default();
+    let message_block = if pending.is_empty() {
+        "No new messages.".to_string()
+    } else {
+        pending
+            .iter()
+            .map(|message| {
+                format!(
+                    "- {} ({}): {}",
+                    message["from"].as_str().unwrap_or("owner"),
+                    message["kind"].as_str().unwrap_or("note"),
+                    message["body"].as_str().unwrap_or("")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let delivered = pending
+        .iter()
+        .filter_map(|message| message["seq"].as_i64())
+        .collect::<Vec<_>>();
+    let _ = groups.mark_delivered(&project_id, &delivered).await;
     let acceptance =
         serde_json::to_string_pretty(&item["acceptance"]).unwrap_or_else(|_| "[]".to_string());
+    let team = detail["members"]
+        .as_array()
+        .map(|members| {
+            members
+                .iter()
+                .map(|member| {
+                    format!(
+                        "- {} ({})",
+                        member["display"].as_str().unwrap_or("Agent"),
+                        member["agent_key"].as_str().unwrap_or("developer")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
     let prompt = format!(
-        "You are acting as the {display} member for one group-project item.\n\nProject goal:\n{}\n\nMilestone:\n{}\n\nItem:\n{}\n\nDetails:\n{}\n\nAcceptance criteria (all must be met):\n{}\n\nWork only on this item. Report what changed and how each criterion was met.",
-        detail["project"]["goal"].as_str().unwrap_or(""),
-        item["milestone_title"].as_str().unwrap_or(""),
-        item["title"].as_str().unwrap_or(""),
-        item["detail"].as_str().unwrap_or(""),
-        acceptance,
-        display = agent.display,
+        r#"You are {display}, one member of a group project. Work only on this item.
+
+Project: {project}
+Goal:
+{goal}
+
+Cycle: {cycle}
+Milestone: {milestone}
+Item: {item}
+Details:
+{detail}
+
+Acceptance criteria (all must be met):
+{acceptance}
+
+Team:
+{team}
+
+Messages from the owner/team since your last turn:
+{messages}
+
+Rules:
+- Work inside the project workspace: {workspace}
+- Do not edit or read the project's metadata folder (.deep_agents/groups).
+- Inspect before editing. Report the exact files changed and evidence for each acceptance criterion.
+- If you cannot complete the item, say exactly what blocked you; do not claim success.
+- Work only on this item. Do not start other team members' items."#,
+        display = member_display,
+        project = item["title_project"]
+            .as_str()
+            .or_else(|| detail["project"]["title"].as_str())
+            .unwrap_or("Project"),
+        goal = detail["project"]["goal"].as_str().unwrap_or(""),
+        cycle = cycle,
+        milestone = item["milestone_title"].as_str().unwrap_or(""),
+        item = item["title"].as_str().unwrap_or(""),
+        detail = item["detail"].as_str().unwrap_or(""),
+        acceptance = acceptance,
+        team = team,
+        messages = message_block,
+        workspace = workspace.display(),
     );
     let result = run_agent(ctx, prompt).await;
     checkpoint.finalize();
@@ -1976,6 +2456,13 @@ async fn run_group_item(state: ServerState, groups: GroupStore, project_id: Stri
     let aborted = state_snapshot
         .as_ref()
         .is_some_and(|snapshot| snapshot.active_node == "aborted");
+    let usage = state_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.token_usage.clone())
+        .unwrap_or_default();
+    let input_tokens = usage.total_input_tokens as i64;
+    let output_tokens = usage.total_output_tokens as i64;
+    let cost_usd = usage.total_cost;
     let transcript_report = state
         .store
         .history(&chat_id, 12)
@@ -2015,10 +2502,27 @@ async fn run_group_item(state: ServerState, groups: GroupStore, project_id: Stri
         Ok(()) => "Agent run was aborted.".to_string(),
         Err(error) => error.to_string(),
     };
+    if aborted {
+        state.runs.finish(&chat_id, state_snapshot);
+        let _ = groups
+            .finish_run(
+                &project_id,
+                &group_run_id,
+                "cancelled",
+                input_tokens,
+                output_tokens,
+                cost_usd,
+                Some(&report),
+                Some("cancelled by owner"),
+            )
+            .await;
+        let _ = groups
+            .release_item(&project_id, &item_id, "agent run cancelled")
+            .await;
+        return;
+    }
     // Post-run acceptance verification: machine-checkable criteria must hold
-    // before the item counts as done; `manual` criteria park the item for the
-    // owner instead of failing it. Unsupported/free-form criteria are noted
-    // in the report, never invented as failures.
+    // before the item counts as done; `manual` criteria park it for the owner.
     let (success, output) = if success {
         let verdict = evaluate_acceptance(&workspace, &item["acceptance"]);
         if !verdict.failed.is_empty() {
@@ -2032,6 +2536,18 @@ async fn run_group_item(state: ServerState, groups: GroupStore, project_id: Stri
         } else if !verdict.needs_human.is_empty() {
             let reason = format!("manual acceptance check needed: {}", verdict.summary());
             state.runs.finish(&chat_id, state_snapshot);
+            let _ = groups
+                .finish_run(
+                    &project_id,
+                    &group_run_id,
+                    "complete",
+                    input_tokens,
+                    output_tokens,
+                    cost_usd,
+                    Some(&report),
+                    None,
+                )
+                .await;
             if let Err(error) = groups
                 .park_for_approval(&project_id, &item_id, &reason)
                 .await
@@ -2049,6 +2565,18 @@ async fn run_group_item(state: ServerState, groups: GroupStore, project_id: Stri
         (success, output)
     };
     state.runs.finish(&chat_id, state_snapshot);
+    let _ = groups
+        .finish_run(
+            &project_id,
+            &group_run_id,
+            if success { "complete" } else { "failed" },
+            input_tokens,
+            output_tokens,
+            cost_usd,
+            Some(&report),
+            if success { None } else { Some(&output) },
+        )
+        .await;
     let canvas_report = output.clone();
     let canvas_status = if success { "complete" } else { "failed" };
     spawn_canvas_notification(
@@ -2058,11 +2586,15 @@ async fn run_group_item(state: ServerState, groups: GroupStore, project_id: Stri
         canvas_status,
     );
     if let Err(error) = groups
-        .finish_item(
+        .finish_item_with_usage(
             &project_id,
-            item["id"].as_str().unwrap_or(""),
+            &item_id,
             success,
             &output,
+            input_tokens,
+            output_tokens,
+            cost_usd,
+            Some(&agent_run_id),
         )
         .await
     {
@@ -4687,14 +5219,38 @@ fn parse_opencode_usage(value: &Value) -> Value {
     let weekly = usage_window(usage.get("weekly"));
     let monthly = usage_window(usage.get("monthly"));
     if rolling.is_null() && weekly.is_null() && monthly.is_null() {
-        Value::Null
-    } else {
-        json!({
-            "rolling": rolling,
-            "weekly": weekly,
-            "monthly": monthly,
-        })
+        return Value::Null;
     }
+    let mut out = json!({
+        "rolling": rolling,
+        "weekly": weekly,
+        "monthly": monthly,
+    });
+    // The documented endpoint returns the three meters. Pass through any
+    // dashboard-style fields if the gateway returns them so the desktop can
+    // render totals without a backend change.
+    if let Some(object) = out.as_object_mut() {
+        for key in [
+            "cost",
+            "requests",
+            "tokens",
+            "total_cost",
+            "total_requests",
+            "total_tokens",
+            "daily",
+            "daily_cost",
+            "by_model",
+            "models",
+            "breakdown",
+            "details",
+            "allowance",
+        ] {
+            if let Some(extra) = usage.get(key) {
+                object.insert(key.to_string(), extra.clone());
+            }
+        }
+    }
+    out
 }
 
 async fn fetch_opencode_usage(base_url: &str, api_key: &str) -> Result<Value, String> {
@@ -6274,15 +6830,169 @@ async fn session_reset_handler() -> Json<Value> {
 #[derive(Debug, Deserialize)]
 struct CreateGroupRequest {
     #[serde(default)]
+    title: String,
+    #[serde(default)]
     goal: String,
     #[serde(default)]
     workspace_id: String,
+    #[serde(default)]
+    workspace_path: String,
+    #[serde(default)]
+    members: Value,
+    #[serde(default)]
+    milestones: Value,
+    #[serde(default)]
+    schedule: Value,
+    #[serde(default)]
+    start_mode: String,
+    #[serde(default)]
+    start_at: Value,
+    #[serde(default)]
+    recurrence: String,
+    #[serde(default)]
+    repeat_active: Option<bool>,
+    #[serde(default)]
+    plan_review: Option<bool>,
+    #[serde(default)]
+    auto_plan: Option<bool>,
+    #[serde(default)]
+    planner_agent: String,
+    #[serde(default)]
+    max_parallel: Option<i64>,
 }
 
-fn starter_group_manifest(goal: &str) -> Value {
+async fn create_group_handler(
+    State(state): State<ServerState>,
+    Json(request): Json<CreateGroupRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let goal = request.goal.trim();
+    let title = if request.title.trim().is_empty() {
+        goal
+    } else {
+        request.title.trim()
+    };
+    if goal.is_empty() && title.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "goal is required"})),
+        ));
+    }
+    let goal = if goal.is_empty() { title } else { goal };
+    let requested_path = request.workspace_path.trim();
+    let workspace = if !requested_path.is_empty() {
+        let path = FsPath::new(requested_path);
+        if !path.is_dir() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("workspace folder not found: {requested_path}")})),
+            ));
+        }
+        let found = state.registry.find_by_path(requested_path);
+        match found {
+            Some(record) => record,
+            None => state
+                .registry
+                .add(
+                    requested_path,
+                    if title.is_empty() { "Project" } else { title },
+                )
+                .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({"error": error}))))?,
+        }
+    } else if !request.workspace_id.trim().is_empty() {
+        state
+            .registry
+            .get(request.workspace_id.trim())
+            .ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "workspace not found"})),
+                )
+            })?
+    } else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "workspace_id or workspace_path is required"})),
+        ));
+    };
+    let schedule = request.schedule;
+    let milestones = if request.milestones.is_null() {
+        json!([])
+    } else {
+        request.milestones
+    };
+    let members = if request.members.is_null() {
+        json!([])
+    } else {
+        request.members
+    };
+    let start_mode = if request.start_mode.trim().is_empty() {
+        schedule
+            .get("start_mode")
+            .and_then(Value::as_str)
+            .unwrap_or("now")
+            .to_string()
+    } else {
+        request.start_mode.trim().to_string()
+    };
+    let start_at = if request.start_at.is_null() {
+        schedule.get("start_at").cloned().unwrap_or(Value::Null)
+    } else {
+        request.start_at
+    };
+    let recurrence = if request.recurrence.trim().is_empty() {
+        schedule
+            .get("recurrence")
+            .and_then(Value::as_str)
+            .unwrap_or("none")
+            .to_string()
+    } else {
+        request.recurrence.trim().to_string()
+    };
+    let manifest = json!({
+        "id": format!("{}-{}", slug_for_group(title), &Uuid::new_v4().simple().to_string()[..6]),
+        "title": title,
+        "goal": goal,
+        "workspace_path": workspace.path,
+        "owner": "localhost",
+        "members": members,
+        "milestones": milestones,
+        "schedule": {
+            "start_mode": start_mode,
+            "start_at": start_at,
+            "recurrence": recurrence,
+        },
+        "start_mode": start_mode,
+        "start_at": start_at,
+        "recurrence": recurrence,
+        "repeat_active": request.repeat_active.unwrap_or(recurrence != "none"),
+        "plan_review": request.plan_review.unwrap_or(true),
+        "auto_plan": request.auto_plan.unwrap_or(true),
+        "planner_agent": if request.planner_agent.trim().is_empty() { "orchestrator" } else { request.planner_agent.trim() },
+        "max_parallel": request.max_parallel.unwrap_or(1).clamp(1, 8),
+    });
+    let detail = state
+        .groups
+        .create(&manifest, &workspace.id)
+        .await
+        .map_err(group_error)?;
+    let id = detail["id"].as_str().unwrap_or_default();
+    Ok(Json(json!({
+        "id": id,
+        "path": detail["path"],
+        "workspace_path": detail["workspace_path"],
+        "title": title,
+        "runtime_notice": GROUP_RUNTIME_NOTICE,
+        "project": detail["project"],
+        "members": detail["members"],
+        "milestones": detail["milestones"],
+        "items": detail["items"],
+    })))
+}
+
+fn slug_for_group(value: &str) -> String {
     let mut slug = String::new();
     let mut dash = false;
-    for character in goal.chars().flat_map(char::to_lowercase) {
+    for character in value.chars().flat_map(char::to_lowercase) {
         if character.is_ascii_alphanumeric() {
             if dash && !slug.is_empty() {
                 slug.push('-');
@@ -6296,62 +7006,12 @@ fn starter_group_manifest(goal: &str) -> Value {
             break;
         }
     }
-    let id = slug.trim_matches('-');
-    let id = if id.is_empty() { "group-project" } else { id };
-    let id = format!("{}-{}", id, &Uuid::new_v4().simple().to_string()[..6]);
-    json!({
-        "id": id,
-        "goal": goal,
-        "status": "active",
-        "milestones": [
-            {
-                "id": "m1",
-                "title": "Plan",
-                "items": [{
-                    "id": "m1-i1",
-                    "title": "Break the goal into a clear deliverable",
-                    "detail": format!("Review the goal and prepare a concrete plan: {goal}"),
-                    "acceptance": ["The deliverable and its completion checks are recorded"]
-                }]
-            },
-            {
-                "id": "m2",
-                "title": "Deliver",
-                "depends_on": ["m1"],
-                "items": [{
-                    "id": "m2-i1",
-                    "title": "Complete the requested work",
-                    "detail": goal,
-                    "acceptance": ["The requested deliverable is complete and summarized"]
-                }]
-            }
-        ]
-    })
-}
-
-async fn create_group_handler(
-    State(_state): State<ServerState>,
-    Json(request): Json<CreateGroupRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let goal = request.goal.trim();
-    if goal.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "goal is required"})),
-        ));
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "group-project".to_string()
+    } else {
+        slug.to_string()
     }
-    let detail = GroupStore::default_root()
-        .create(&starter_group_manifest(goal), request.workspace_id.trim())
-        .await
-        .map_err(group_error)?;
-    let id = detail["id"].as_str().unwrap_or_default();
-    Ok(Json(json!({
-        "id": id,
-        "path": detail["path"],
-        "title": goal,
-        "runtime_notice": GROUP_RUNTIME_NOTICE,
-        "project": detail["project"],
-    })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -6560,8 +7220,8 @@ async fn groups_handler(
 ) -> Json<Value> {
     let scoped =
         !query.workspace_id.is_empty() && state.registry.get(&query.workspace_id).is_some();
-    let projects = GroupStore::default_root().list().await;
-    let mut projects = if scoped {
+    let projects = state.groups.list().await;
+    let projects = if scoped {
         projects
             .into_iter()
             .filter(|project| {
@@ -6571,26 +7231,36 @@ async fn groups_handler(
     } else {
         projects
     };
-    for project in &mut projects {
-        if project["status"] == "active" {
-            project["status"] = json!("running");
-        }
-    }
     Json(json!({"projects": projects, "scoped": scoped}))
 }
 
 async fn group_handler(
-    State(_state): State<ServerState>,
+    State(state): State<ServerState>,
     Path(project_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let mut detail = GroupStore::default_root()
+    let mut detail = state
+        .groups
         .detail(&project_id, 200)
         .await
         .map_err(group_error)?;
-    if detail["project"]["status"] == "active" {
-        detail["project"]["status"] = json!("running");
+    if detail["workspace_path"]
+        .as_str()
+        .is_none_or(|value| value.trim().is_empty())
+        && let Some(origin) = detail["project"]["origin_workspace_id"].as_str()
+        && let Some(workspace) = state.registry.get(origin)
+        && FsPath::new(&workspace.path).is_dir()
+    {
+        let _ = state
+            .groups
+            .set_workspace_path(&project_id, &workspace.path)
+            .await;
+        detail["workspace_path"] = json!(workspace.path);
+        detail["project"]["workspace_path"] = json!(workspace.path);
     }
     detail["runtime_notice"] = json!(GROUP_RUNTIME_NOTICE);
+    let workspace = detail["workspace_path"].as_str().unwrap_or("");
+    detail["workspace_missing"] =
+        json!(workspace.trim().is_empty() || !FsPath::new(workspace).is_dir());
     Ok(Json(detail))
 }
 
@@ -6603,14 +7273,278 @@ struct GroupUpdateRequest {
 }
 
 async fn group_update_handler(
+    State(state): State<ServerState>,
     Path(project_id): Path<String>,
     Json(request): Json<GroupUpdateRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    GroupStore::default_root()
+    if matches!(request.op.as_str(), "stop" | "close") {
+        for chat_id in state
+            .groups
+            .active_chats(&project_id)
+            .await
+            .unwrap_or_default()
+        {
+            state.runs.cancel(&chat_id);
+        }
+    }
+    state
+        .groups
         .update(&project_id, &request.op, &request.params)
         .await
         .map(Json)
         .map_err(group_error)
+}
+
+async fn group_patch_handler(
+    State(state): State<ServerState>,
+    Path(project_id): Path<String>,
+    Json(params): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    state
+        .groups
+        .update(&project_id, "set_settings", &params)
+        .await
+        .map(Json)
+        .map_err(group_error)
+}
+
+async fn group_delete_handler(
+    State(state): State<ServerState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    for chat_id in state
+        .groups
+        .active_chats(&project_id)
+        .await
+        .unwrap_or_default()
+    {
+        state.runs.cancel(&chat_id);
+    }
+    let _ = state.groups.update(&project_id, "stop", &json!({})).await;
+    state
+        .groups
+        .trash(&project_id)
+        .await
+        .map(Json)
+        .map_err(group_error)
+}
+
+async fn group_start_handler(
+    State(state): State<ServerState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    state
+        .groups
+        .update(&project_id, "start", &json!({}))
+        .await
+        .map(Json)
+        .map_err(group_error)
+}
+
+async fn group_pause_handler(
+    State(state): State<ServerState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    state
+        .groups
+        .update(&project_id, "pause", &json!({}))
+        .await
+        .map(Json)
+        .map_err(group_error)
+}
+
+async fn group_stop_handler(
+    State(state): State<ServerState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    for chat_id in state
+        .groups
+        .active_chats(&project_id)
+        .await
+        .unwrap_or_default()
+    {
+        state.runs.cancel(&chat_id);
+    }
+    state
+        .groups
+        .update(&project_id, "stop", &json!({}))
+        .await
+        .map(Json)
+        .map_err(group_error)
+}
+
+async fn group_close_handler(
+    State(state): State<ServerState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    for chat_id in state
+        .groups
+        .active_chats(&project_id)
+        .await
+        .unwrap_or_default()
+    {
+        state.runs.cancel(&chat_id);
+    }
+    state
+        .groups
+        .update(&project_id, "close", &json!({}))
+        .await
+        .map(Json)
+        .map_err(group_error)
+}
+
+async fn group_restart_handler(
+    State(state): State<ServerState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let detail = state
+        .groups
+        .start_next_cycle(&project_id)
+        .await
+        .map_err(group_error)?;
+    Ok(Json(json!({"ok": true, "project": detail})))
+}
+
+async fn group_plan_handler(
+    State(state): State<ServerState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    state
+        .groups
+        .set_planning(&project_id)
+        .await
+        .map_err(group_error)?;
+    Ok(Json(json!({"ok": true, "status": "planning"})))
+}
+
+async fn group_approve_plan_handler(
+    State(state): State<ServerState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    state
+        .groups
+        .approve_plan(&project_id)
+        .await
+        .map_err(group_error)?;
+    Ok(Json(json!({"ok": true, "status": "running"})))
+}
+
+#[derive(Debug, Deserialize)]
+struct GroupMessageRequest {
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    to: String,
+    #[serde(default)]
+    target: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    item_id: Option<String>,
+    #[serde(default)]
+    reply_to: Option<i64>,
+}
+
+async fn group_message_handler(
+    State(state): State<ServerState>,
+    Path(project_id): Path<String>,
+    Json(request): Json<GroupMessageRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let body = [request.body, request.content, request.message]
+        .into_iter()
+        .find(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "message needs a non-empty body"})),
+            )
+        })?;
+    let to = if !request.to.trim().is_empty() {
+        request.to.trim()
+    } else if !request.target.trim().is_empty() {
+        request.target.trim()
+    } else {
+        "all"
+    };
+    let kind = if request.kind.trim().is_empty() {
+        "note"
+    } else {
+        request.kind.trim()
+    };
+    let seq = state
+        .groups
+        .send_message(
+            &project_id,
+            &body,
+            to,
+            kind,
+            "owner",
+            None,
+            "owner",
+            request.item_id.as_deref(),
+            None,
+            true,
+        )
+        .await
+        .map_err(group_error)?;
+    // Steer active workers immediately; queued messages are delivered on the
+    // next claimed item by the runner.
+    let active = state
+        .groups
+        .active_chats(&project_id)
+        .await
+        .unwrap_or_default();
+    for chat_id in active {
+        state.runs.steer(&chat_id, &body);
+    }
+    let _ = request.reply_to;
+    Ok(Json(json!({"ok": true, "seq": seq})))
+}
+
+async fn group_runs_handler(
+    State(state): State<ServerState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let detail = state
+        .groups
+        .detail(&project_id, 0)
+        .await
+        .map_err(group_error)?;
+    Ok(Json(
+        json!({"runs": detail["runs"], "usage": detail["usage"]}),
+    ))
+}
+
+async fn group_trash_handler(State(state): State<ServerState>) -> Json<Value> {
+    Json(json!({"projects": state.groups.trash_list().await}))
+}
+
+async fn group_restore_handler(
+    State(state): State<ServerState>,
+    Path(folder): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    state
+        .groups
+        .restore(&folder)
+        .await
+        .map(Json)
+        .map_err(group_error)
+}
+
+async fn group_permanent_delete_handler(
+    State(state): State<ServerState>,
+    Path(folder): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    state
+        .groups
+        .permanent_delete(&folder)
+        .await
+        .map_err(group_error)?;
+    Ok(Json(json!({"ok": true, "deleted": folder})))
 }
 
 #[derive(Debug, Deserialize)]
@@ -6622,10 +7556,12 @@ struct GroupApprovalRequest {
 }
 
 async fn group_approval_handler(
+    State(state): State<ServerState>,
     Path((project_id, item_id)): Path<(String, String)>,
     Json(request): Json<GroupApprovalRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    GroupStore::default_root()
+    state
+        .groups
         .approval(&project_id, &item_id, request.grant, &request.note)
         .await
         .map(Json)
@@ -8193,11 +9129,17 @@ mod tests {
                 .body(Body::from("mock provider failure"))
                 .unwrap();
         }
-        let body = concat!(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"Group item complete\"}}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
-            "data: [DONE]\n\n"
-        );
+        let request = _body.to_string();
+        let content = if request.contains("planning lead") {
+            r#"```json
+{"summary":"Mock plan","milestones":[{"title":"Build","detail":"Deliver the result","items":[{"title":"Write it","detail":"Create the deliverable","acceptance":[],"owner":null,"requires_approval":false}]}]}
+```"#
+        } else {
+            "Group item complete"
+        };
+        let frame = json!({"choices":[{"delta":{"content":content}}]}).to_string();
+        let stop = json!({"choices":[{"delta":{},"finish_reason":"stop"}]}).to_string();
+        let body = format!("data: {frame}\n\ndata: {stop}\n\ndata: [DONE]\n\n");
         Response::builder()
             .header(header::CONTENT_TYPE, "text/event-stream")
             .body(Body::from(body))
@@ -8274,6 +9216,7 @@ mod tests {
             runs: Arc::new(RunManager::default()),
             registry_cache: Arc::new(Mutex::new(None)),
             registry: WorkspaceRegistry::new(root),
+            groups: GroupStore::new(root.join("projects")),
             pairing: Arc::new(PairingStore::new(root)),
             ui_state_path: root.join(".deep_agents").join("ui_state.json"),
             harness_root: root.to_path_buf(),
@@ -8303,13 +9246,17 @@ mod tests {
 
     async fn group_with_one_ready_item(root: &std::path::Path) -> GroupStore {
         let groups = GroupStore::new(root.join("projects"));
+        let work = root.join("real-work");
+        std::fs::create_dir_all(&work).unwrap();
         groups.create(&json!({
             "id": "mock-run",
             "goal": "Create a small deliverable",
+            "workspace_path": work.to_string_lossy(),
+            "members": [{"agent_key": "developer", "amount": 1}],
             "milestones": [{
                 "id": "m1",
                 "title": "Build",
-                "items": [{"id": "i1", "title": "Write it", "detail": "Create the deliverable", "acceptance": ["It exists"]}]
+                "items": [{"id": "i1", "title": "Write it", "detail": "Create the deliverable", "max_attempts": 1, "acceptance": ["It exists"]}]
             }]
         }), "_general").await.unwrap();
         groups
@@ -8363,7 +9310,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let groups = group_with_items(
             dir.path(),
-            json!([{"id": "i1", "title": "Write it", "detail": "Create the deliverable", "acceptance": [{"kind": "file_exists", "path": "proof.txt"}]}]),
+            json!([{"id": "i1", "title": "Write it", "detail": "Create the deliverable", "max_attempts": 1, "acceptance": [{"kind": "file_exists", "path": "proof.txt"}]}]),
         )
         .await;
         let item = groups.claim_next_ready("mock-run").await.unwrap().unwrap();
@@ -8384,7 +9331,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let groups = group_with_items(
             dir.path(),
-            json!([{"id": "i1", "title": "Write it", "detail": "Create the deliverable", "acceptance": [{"kind": "file_exists", "path": "proof.txt"}]}]),
+            json!([{"id": "i1", "title": "Write it", "detail": "Create the deliverable", "max_attempts": 1, "acceptance": [{"kind": "file_exists", "path": "proof.txt"}]}]),
         )
         .await;
         // The runner evaluates acceptance against the project folder.
@@ -8456,12 +9403,7 @@ mod tests {
                 .starts_with("Group: Write it")
         );
         let chat_id = chats[0]["id"].as_str().unwrap();
-        let expected = dir
-            .path()
-            .join("projects")
-            .join("mock-run")
-            .to_string_lossy()
-            .to_string();
+        let expected = dir.path().join("real-work").to_string_lossy().to_string();
         let actual = state.store.chat_workspace_path(chat_id).await.unwrap();
         assert_eq!(actual.as_deref(), Some(expected.as_str()));
     }
@@ -8709,6 +9651,7 @@ mod tests {
             runs: Arc::new(RunManager::default()),
             registry_cache: Arc::new(Mutex::new(None)),
             registry: WorkspaceRegistry::new(dir.path()),
+            groups: GroupStore::new(dir.path().join("projects")),
             pairing: Arc::new(PairingStore::new(dir.path())),
             ui_state_path: dir.path().join("ui_state.json"),
             harness_root: dir.path().to_path_buf(),
@@ -8771,6 +9714,107 @@ mod tests {
         let mut value = json!({});
         hydrate_plan(dir.path(), &mut value, Some("chat-1")).await;
         assert_eq!(value["plan"]["agent"][0]["step"], "inspect");
+    }
+
+    #[tokio::test]
+    async fn planner_creates_a_reviewable_plan_and_approval_executes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("plan-work");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join("proof.txt"), "proof").unwrap();
+        let state = group_test_state(dir.path(), group_provider(false).await).await;
+        let detail = state
+            .groups
+            .create(
+                &json!({
+                    "id": "planner-proof",
+                    "title": "Planner proof",
+                    "goal": "Prove planning",
+                    "workspace_path": work.to_string_lossy(),
+                    "members": [{"agent_key": "developer", "amount": 1}],
+                    "auto_plan": true,
+                    "plan_review": true,
+                    "milestones": []
+                }),
+                "_general",
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail["project"]["status"], "planning");
+        assert!(state.groups.claim_planning("planner-proof").await.unwrap());
+        run_group_planner(
+            state.clone(),
+            state.groups.clone(),
+            "planner-proof".to_string(),
+        )
+        .await;
+        let detail = state.groups.detail("planner-proof", 40).await.unwrap();
+        assert_eq!(detail["project"]["status"], "plan_ready");
+        assert_eq!(detail["milestones"].as_array().unwrap().len(), 1);
+        assert_eq!(detail["runs"][0]["kind"], "planning");
+        assert_eq!(detail["runs"][0]["status"], "complete");
+        assert!(
+            state
+                .groups
+                .claim_next_ready("planner-proof")
+                .await
+                .unwrap()
+                .is_none(),
+            "plan review gates execution"
+        );
+        state.groups.approve_plan("planner-proof").await.unwrap();
+        let item = state
+            .groups
+            .claim_next_ready("planner-proof")
+            .await
+            .unwrap()
+            .expect("approved plan dispatches");
+        run_group_item(
+            state.clone(),
+            state.groups.clone(),
+            "planner-proof".to_string(),
+            item,
+        )
+        .await;
+        let detail = state.groups.detail("planner-proof", 60).await.unwrap();
+        assert_eq!(detail["items"][0]["status"], "done");
+        assert!(detail["runs"].as_array().unwrap().len() >= 2);
+    }
+
+    #[tokio::test]
+    async fn create_group_handler_persists_workspace_members_and_schedule() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("endpoint-work");
+        std::fs::create_dir_all(&work).unwrap();
+        let state = group_test_state(dir.path(), "http://127.0.0.1:9".to_string()).await;
+        let request: CreateGroupRequest = serde_json::from_value(json!({
+            "title": "Endpoint project",
+            "goal": "Prove the endpoint",
+            "workspace_path": work.to_string_lossy(),
+            "members": [
+                {"agent_key": "developer", "amount": 2},
+                {"agent_key": "ui", "amount": 1}
+            ],
+            "auto_plan": false,
+            "milestones": [],
+            "start_mode": "manual",
+            "max_parallel": 2
+        }))
+        .unwrap();
+        let Json(created) = create_group_handler(State(state.clone()), Json(request))
+            .await
+            .expect("create group");
+        let id = created["id"].as_str().unwrap().to_string();
+        let detail = state.groups.detail(&id, 20).await.unwrap();
+        assert_eq!(detail["workspace_path"], work.to_string_lossy().to_string());
+        assert_eq!(detail["members"].as_array().unwrap().len(), 3);
+        assert_eq!(detail["project"]["status"], "draft");
+        assert_eq!(detail["project"]["max_parallel"], 2);
+        let pending: Vec<Value> = state.groups.trash_list().await;
+        assert!(pending.is_empty());
+        let trashed = state.groups.trash(&id).await.unwrap();
+        assert!(trashed["folder"].as_str().is_some());
+        assert!(work.join("endpoint-work").exists() || work.exists());
     }
 
     #[test]

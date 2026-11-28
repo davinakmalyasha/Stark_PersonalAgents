@@ -119,7 +119,35 @@ fn format_board(detail: &Value) -> String {
         detail["id"].as_str().unwrap_or(""),
         project["status"].as_str().unwrap_or("unknown")
     )];
+    lines.push(format!(
+        "title: {}",
+        project["title"].as_str().unwrap_or("")
+    ));
     lines.push(format!("goal: {}", project["goal"].as_str().unwrap_or("")));
+    lines.push(format!(
+        "cycle: {} · plan: {} · status: {}",
+        project["cycle"].as_i64().unwrap_or(1),
+        project["plan_status"].as_str().unwrap_or("none"),
+        project["status"].as_str().unwrap_or("unknown")
+    ));
+    if let Some(members) = detail["members"].as_array() {
+        let names = members
+            .iter()
+            .map(|member| {
+                format!(
+                    "{} ({}{})",
+                    member["display"].as_str().unwrap_or("Agent"),
+                    member["agent_key"].as_str().unwrap_or("developer"),
+                    member["current_item"]
+                        .as_str()
+                        .map(|item| format!(", working on {item}"))
+                        .unwrap_or_default()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!("team: {names}"));
+    }
     lines.push("milestones:".to_string());
     for milestone in detail["milestones"].as_array().into_iter().flatten() {
         lines.push(format!(
